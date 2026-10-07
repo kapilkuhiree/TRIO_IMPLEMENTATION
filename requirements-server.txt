@@ -13,8 +13,10 @@ pandas>=2.0.0
 numpy>=1.24.0
 
 # Technical indicators
-pandas-ta>=0.3.14b1
-ta>=0.11.0
+# pandas-ta 0.3.14b1 has no Python 3.11 wheel; unneeded anyway — indicators.py
+# uses only pandas/numpy. ta 0.11 still pins old numpy, so both are optional.
+# The full local requirement is requirements.txt; on the runner:
+#ta>=0.11.0
 
 # Sentiment (VADER)
 vaderSentiment>=3.3.2
