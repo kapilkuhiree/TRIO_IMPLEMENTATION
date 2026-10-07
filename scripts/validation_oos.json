@@ -1,0 +1,186 @@
+[
+  {
+    "config": "wide4.0_t0.5",
+    "train": {
+      "variant": "wide4.0_t0.5",
+      "trades": 96,
+      "win_rate": 77.1,
+      "profit_factor": 2.0,
+      "avg_win_pct": 4.05,
+      "avg_loss_pct": -6.81,
+      "expectancy_pct": 1.559,
+      "total_pct": 149.6
+    },
+    "test": {
+      "variant": "wide4.0_t0.5",
+      "trades": 37,
+      "win_rate": 67.6,
+      "profit_factor": 0.98,
+      "avg_win_pct": 3.98,
+      "avg_loss_pct": -8.46,
+      "expectancy_pct": -0.053,
+      "total_pct": -2.0
+    }
+  },
+  {
+    "config": "wide5.0_t0.4",
+    "train": {
+      "variant": "wide5.0_t0.4",
+      "trades": 88,
+      "win_rate": 85.2,
+      "profit_factor": 2.83,
+      "avg_win_pct": 3.96,
+      "avg_loss_pct": -8.09,
+      "expectancy_pct": 2.184,
+      "total_pct": 192.2
+    },
+    "test": {
+      "variant": "wide5.0_t0.4",
+      "trades": 36,
+      "win_rate": 69.4,
+      "profit_factor": 0.92,
+      "avg_win_pct": 4.09,
+      "avg_loss_pct": -10.05,
+      "expectancy_pct": -0.232,
+      "total_pct": -8.4
+    }
+  },
+  {
+    "config": "wide6.0_t0.3",
+    "train": {
+      "variant": "wide6.0_t0.3",
+      "trades": 86,
+      "win_rate": 88.4,
+      "profit_factor": 3.15,
+      "avg_win_pct": 3.55,
+      "avg_loss_pct": -8.56,
+      "expectancy_pct": 2.138,
+      "total_pct": 183.8
+    },
+    "test": {
+      "variant": "wide6.0_t0.3",
+      "trades": 35,
+      "win_rate": 71.4,
+      "profit_factor": 0.74,
+      "avg_win_pct": 3.6,
+      "avg_loss_pct": -12.14,
+      "expectancy_pct": -0.898,
+      "total_pct": -31.4
+    }
+  },
+  {
+    "config": "wide5.0_t0.6",
+    "train": {
+      "variant": "wide5.0_t0.6",
+      "trades": 75,
+      "win_rate": 82.7,
+      "profit_factor": 3.0,
+      "avg_win_pct": 5.68,
+      "avg_loss_pct": -9.03,
+      "expectancy_pct": 3.129,
+      "total_pct": 234.6
+    },
+    "test": {
+      "variant": "wide5.0_t0.6",
+      "trades": 28,
+      "win_rate": 57.1,
+      "profit_factor": 0.79,
+      "avg_win_pct": 5.67,
+      "avg_loss_pct": -9.54,
+      "expectancy_pct": -0.85,
+      "total_pct": -23.8
+    }
+  },
+  {
+    "config": "wide8.0_t0.25",
+    "train": {
+      "variant": "wide8.0_t0.25",
+      "trades": 84,
+      "win_rate": 91.7,
+      "profit_factor": 3.92,
+      "avg_win_pct": 3.91,
+      "avg_loss_pct": -10.99,
+      "expectancy_pct": 2.672,
+      "total_pct": 224.4
+    },
+    "test": {
+      "variant": "wide8.0_t0.25",
+      "trades": 34,
+      "win_rate": 70.6,
+      "profit_factor": 0.7,
+      "avg_win_pct": 4.06,
+      "avg_loss_pct": -13.87,
+      "expectancy_pct": -1.214,
+      "total_pct": -41.3
+    }
+  },
+  {
+    "config": "swing_t1.0",
+    "train": {
+      "variant": "swing_t1.0",
+      "trades": 112,
+      "win_rate": 62.5,
+      "profit_factor": 2.31,
+      "avg_win_pct": 4.04,
+      "avg_loss_pct": -2.92,
+      "expectancy_pct": 1.433,
+      "total_pct": 160.5
+    },
+    "test": {
+      "variant": "swing_t1.0",
+      "trades": 45,
+      "win_rate": 51.1,
+      "profit_factor": 1.19,
+      "avg_win_pct": 4.1,
+      "avg_loss_pct": -3.6,
+      "expectancy_pct": 0.34,
+      "total_pct": 15.3
+    }
+  },
+  {
+    "config": "swing_t1.5",
+    "train": {
+      "variant": "swing_t1.5",
+      "trades": 98,
+      "win_rate": 54.1,
+      "profit_factor": 2.1,
+      "avg_win_pct": 5.93,
+      "avg_loss_pct": -3.33,
+      "expectancy_pct": 1.679,
+      "total_pct": 164.5
+    },
+    "test": {
+      "variant": "swing_t1.5",
+      "trades": 40,
+      "win_rate": 42.5,
+      "profit_factor": 1.25,
+      "avg_win_pct": 6.25,
+      "avg_loss_pct": -3.69,
+      "expectancy_pct": 0.537,
+      "total_pct": 21.5
+    }
+  },
+  {
+    "config": "swing_trail3.0",
+    "train": {
+      "variant": "swing_trail3.0",
+      "trades": 103,
+      "win_rate": 46.6,
+      "profit_factor": 2.58,
+      "avg_win_pct": 7.11,
+      "avg_loss_pct": -2.41,
+      "expectancy_pct": 2.029,
+      "total_pct": 209.0
+    },
+    "test": {
+      "variant": "swing_trail3.0",
+      "trades": 42,
+      "win_rate": 35.7,
+      "profit_factor": 0.72,
+      "avg_win_pct": 3.41,
+      "avg_loss_pct": -2.65,
+      "expectancy_pct": -0.484,
+      "total_pct": -20.3
+    }
+  }
+]

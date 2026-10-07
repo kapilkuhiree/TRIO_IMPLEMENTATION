@@ -1,0 +1,122 @@
+[
+  {
+    "variant": "W_wide6_t0.3",
+    "trades": 117,
+    "win_rate": 84.6,
+    "profit_factor": 1.69,
+    "avg_win_pct": 3.6,
+    "avg_loss_pct": -11.71,
+    "expectancy_pct": 1.248,
+    "total_pct": 146.0
+  },
+  {
+    "variant": "W_wide5_t0.4",
+    "trades": 120,
+    "win_rate": 80.8,
+    "profit_factor": 1.72,
+    "avg_win_pct": 4.04,
+    "avg_loss_pct": -9.92,
+    "expectancy_pct": 1.368,
+    "total_pct": 164.2
+  },
+  {
+    "variant": "W_wide4_t0.5",
+    "trades": 129,
+    "win_rate": 75.2,
+    "profit_factor": 1.6,
+    "avg_win_pct": 4.1,
+    "avg_loss_pct": -7.76,
+    "expectancy_pct": 1.155,
+    "total_pct": 149.0
+  },
+  {
+    "variant": "S_t0.6",
+    "trades": 194,
+    "win_rate": 68.0,
+    "profit_factor": 1.5,
+    "avg_win_pct": 2.35,
+    "avg_loss_pct": -3.33,
+    "expectancy_pct": 0.533,
+    "total_pct": 103.5
+  },
+  {
+    "variant": "S_t0.8",
+    "trades": 175,
+    "win_rate": 64.6,
+    "profit_factor": 1.76,
+    "avg_win_pct": 3.13,
+    "avg_loss_pct": -3.25,
+    "expectancy_pct": 0.87,
+    "total_pct": 152.3
+  },
+  {
+    "variant": "S_t1.0",
+    "trades": 155,
+    "win_rate": 60.0,
+    "profit_factor": 1.91,
+    "avg_win_pct": 4.12,
+    "avg_loss_pct": -3.24,
+    "expectancy_pct": 1.173,
+    "total_pct": 181.9
+  },
+  {
+    "variant": "S_t1.2",
+    "trades": 142,
+    "win_rate": 54.9,
+    "profit_factor": 1.77,
+    "avg_win_pct": 5.11,
+    "avg_loss_pct": -3.51,
+    "expectancy_pct": 1.222,
+    "total_pct": 173.5
+  },
+  {
+    "variant": "S_t1.5",
+    "trades": 134,
+    "win_rate": 51.5,
+    "profit_factor": 1.77,
+    "avg_win_pct": 6.2,
+    "avg_loss_pct": -3.73,
+    "expectancy_pct": 1.384,
+    "total_pct": 185.5
+  },
+  {
+    "variant": "S_t2.0",
+    "trades": 129,
+    "win_rate": 45.0,
+    "profit_factor": 1.9,
+    "avg_win_pct": 8.29,
+    "avg_loss_pct": -3.57,
+    "expectancy_pct": 1.763,
+    "total_pct": 227.4
+  },
+  {
+    "variant": "T_trail3.5",
+    "trades": 141,
+    "win_rate": 38.3,
+    "profit_factor": 1.98,
+    "avg_win_pct": 7.9,
+    "avg_loss_pct": -2.48,
+    "expectancy_pct": 1.497,
+    "total_pct": 211.0
+  },
+  {
+    "variant": "T_trail4.5",
+    "trades": 128,
+    "win_rate": 36.7,
+    "profit_factor": 2.0,
+    "avg_win_pct": 9.98,
+    "avg_loss_pct": -2.9,
+    "expectancy_pct": 1.83,
+    "total_pct": 234.2
+  },
+  {
+    "variant": "S_t3.0",
+    "trades": 115,
+    "win_rate": 34.8,
+    "profit_factor": 1.77,
+    "avg_win_pct": 12.38,
+    "avg_loss_pct": -3.74,
+    "expectancy_pct": 1.869,
+    "total_pct": 214.9
+  }
+]

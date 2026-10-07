@@ -1,0 +1,266 @@
+[
+  {
+    "symbol": "RELIANCE.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 17,
+    "wins": 6,
+    "losses": 11,
+    "win_rate_pct": 35.3,
+    "profit_factor": 0.76,
+    "total_return_pct": -2.64,
+    "max_dd_pct": 6.62,
+    "sharpe": -0.43,
+    "avg_rr": 1.15,
+    "exit_reasons": {
+      "target_hit": 5,
+      "stop_hit": 11,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "TCS.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 22,
+    "wins": 8,
+    "losses": 14,
+    "win_rate_pct": 36.4,
+    "profit_factor": 0.87,
+    "total_return_pct": -1.73,
+    "max_dd_pct": 7.39,
+    "sharpe": -0.21,
+    "avg_rr": 1.14,
+    "exit_reasons": {
+      "stop_hit": 14,
+      "target_hit": 7,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "INFY.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 18,
+    "wins": 6,
+    "losses": 12,
+    "win_rate_pct": 33.3,
+    "profit_factor": 0.82,
+    "total_return_pct": -2.28,
+    "max_dd_pct": 7.06,
+    "sharpe": -0.23,
+    "avg_rr": 1.12,
+    "exit_reasons": {
+      "stop_hit": 12,
+      "target_hit": 5,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "HDFCBANK.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 16,
+    "wins": 10,
+    "losses": 6,
+    "win_rate_pct": 62.5,
+    "profit_factor": 1.32,
+    "total_return_pct": 2.51,
+    "max_dd_pct": 3.79,
+    "sharpe": 0.21,
+    "avg_rr": 1.22,
+    "exit_reasons": {
+      "stop_hit": 6,
+      "target_hit": 9,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "ICICIBANK.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 14,
+    "wins": 3,
+    "losses": 11,
+    "win_rate_pct": 21.4,
+    "profit_factor": 0.29,
+    "total_return_pct": -6.8,
+    "max_dd_pct": 7.08,
+    "sharpe": -0.89,
+    "avg_rr": 1.02,
+    "exit_reasons": {
+      "stop_hit": 11,
+      "target_hit": 2,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "SBIN.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 14,
+    "wins": 4,
+    "losses": 10,
+    "win_rate_pct": 28.6,
+    "profit_factor": 0.37,
+    "total_return_pct": -7.4,
+    "max_dd_pct": 8.7,
+    "sharpe": -0.79,
+    "avg_rr": 1.05,
+    "exit_reasons": {
+      "stop_hit": 10,
+      "target_hit": 3,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "ITC.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 16,
+    "wins": 8,
+    "losses": 8,
+    "win_rate_pct": 50.0,
+    "profit_factor": 1.54,
+    "total_return_pct": 3.5,
+    "max_dd_pct": 3.35,
+    "sharpe": 0.24,
+    "avg_rr": 1.19,
+    "exit_reasons": {
+      "stop_hit": 8,
+      "target_hit": 7,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "LT.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 7,
+    "wins": 6,
+    "losses": 1,
+    "win_rate_pct": 85.7,
+    "profit_factor": 370.83,
+    "total_return_pct": 8.67,
+    "max_dd_pct": 0.0,
+    "sharpe": 1.17,
+    "avg_rr": 1.26,
+    "exit_reasons": {
+      "target_hit": 6,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "AXISBANK.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 15,
+    "wins": 5,
+    "losses": 10,
+    "win_rate_pct": 33.3,
+    "profit_factor": 0.57,
+    "total_return_pct": -4.25,
+    "max_dd_pct": 4.24,
+    "sharpe": -0.44,
+    "avg_rr": 1.1,
+    "exit_reasons": {
+      "stop_hit": 9,
+      "target_hit": 5,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "MARUTI.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 16,
+    "wins": 7,
+    "losses": 9,
+    "win_rate_pct": 43.8,
+    "profit_factor": 0.88,
+    "total_return_pct": -1.0,
+    "max_dd_pct": 4.56,
+    "sharpe": -0.21,
+    "avg_rr": 1.15,
+    "exit_reasons": {
+      "target_hit": 6,
+      "stop_hit": 9,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "HINDUNILVR.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 6,
+    "wins": 3,
+    "losses": 3,
+    "win_rate_pct": 50.0,
+    "profit_factor": 1.71,
+    "total_return_pct": 1.85,
+    "max_dd_pct": 2.56,
+    "sharpe": 0.28,
+    "avg_rr": 1.07,
+    "exit_reasons": {
+      "target_hit": 3,
+      "stop_hit": 2,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "SUNPHARMA.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 14,
+    "wins": 4,
+    "losses": 10,
+    "win_rate_pct": 28.6,
+    "profit_factor": 0.68,
+    "total_return_pct": -2.4,
+    "max_dd_pct": 4.47,
+    "sharpe": -0.29,
+    "avg_rr": 1.07,
+    "exit_reasons": {
+      "target_hit": 4,
+      "stop_hit": 9,
+      "end_of_data": 1
+    }
+  },
+  {
+    "symbol": "KOTAKBANK.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 17,
+    "wins": 4,
+    "losses": 13,
+    "win_rate_pct": 23.5,
+    "profit_factor": 0.38,
+    "total_return_pct": -8.73,
+    "max_dd_pct": 9.62,
+    "sharpe": -0.82,
+    "avg_rr": 1.12,
+    "exit_reasons": {
+      "target_hit": 4,
+      "stop_hit": 13
+    }
+  },
+  {
+    "symbol": "WIPRO.NS",
+    "timeframe": "1d",
+    "period": "5y",
+    "trades": 10,
+    "wins": 4,
+    "losses": 6,
+    "win_rate_pct": 40.0,
+    "profit_factor": 1.07,
+    "total_return_pct": 0.47,
+    "max_dd_pct": 6.19,
+    "sharpe": -0.12,
+    "avg_rr": 1.16,
+    "exit_reasons": {
+      "stop_hit": 6,
+      "target_hit": 3,
+      "end_of_data": 1
+    }
+  }
+]

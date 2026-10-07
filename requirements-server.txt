@@ -1,0 +1,24 @@
+# TRIO — server/CI requirements (GitHub Actions)
+# Slim set: no torch/transformers/openai/PIL/matplotlib. VADER is the
+# default sentiment model and needs no heavy runtime.
+# ============================================================================
+
+# Core
+PyYAML>=6.0
+python-dotenv>=1.0.0
+
+# Data
+yfinance>=0.2.30
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical indicators
+pandas-ta>=0.3.14b1
+ta>=0.11.0
+
+# Sentiment (VADER)
+vaderSentiment>=3.3.2
+
+# HTTP (broker + alerts + news)
+requests>=2.31.0
+feedparser>=6.0.0

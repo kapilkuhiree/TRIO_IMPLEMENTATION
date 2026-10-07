@@ -1,0 +1,245 @@
+# ============================================================================
+# TRIO - Trading Intelligence and Optimization
+# Configuration file — all tunable parameters live here
+# DISCLAIMER: This software is for educational purposes only. Not financial advice.
+# ============================================================================
+
+general:
+  mode: "paper"                    # paper | live (live requires explicit enable)
+  log_level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  output_dir: "output"
+  export_format: "csv"             # csv | json | both
+
+# Audit trail: one JSON line per scan/screen/order/guard/close event.
+# Send output/trade_log.jsonl (.csv mirror auto-written at session end)
+# after any session for a full right/wrong audit.
+logging:
+  trade_log: "output/trade_log.jsonl"
+
+# Forward (paper) testing schedule. The loop only trades inside the NSE
+# session below. Daily (1d) scans work on the previous close any time;
+# intraday (15m) scans should run only inside this window — before the open
+# there are no prints and the signal engine has nothing fresh to score.
+forward_test:
+  market: "NSE"
+  session_start: "09:20"
+  session_end: "15:10"   # MIS square-off before broker auto-close (~15:15)
+  timezone: "Asia/Kolkata"
+  interval_seconds: 900
+  session_log_dir: "logs/paper_sessions"
+
+symbols:
+  # 15-name intraday watchlist: the 20-name list minus the 5 consistent
+  # losers from the 40-session walk-forward (blocks 15-25, ~Aug 26-Oct 05:
+  # 299 trades, 60.5% win, +9549.56). Removed: TATASTEEL (30.8%),
+  # INFY (33.3%), AXISBANK (50.0%, -145.90), TCS (53.3%, -135.41),
+  # KOTAKBANK (61.5% win but -96.83 — wins too small, losses too big).
+  # The screener ranks and takes max 3 per scan, so a cleaner list means
+  # fewer losing candidates competing for slots — not more trades.
+  - "RELIANCE.NS"
+  - "HDFCBANK.NS"
+  - "ICICIBANK.NS"
+  - "SBIN.NS"
+  - "ITC.NS"
+  - "LT.NS"
+  - "MARUTI.NS"
+  - "HINDUNILVR.NS"
+  - "SUNPHARMA.NS"
+  - "TITAN.NS"
+  - "ULTRACEMCO.NS"
+  - "ONGC.NS"
+  - "M&M.NS"
+  - "BAJFINANCE.NS"
+  - "HCLTECH.NS"
+
+# Trading account model. Shorts are currently ENABLED (allow_shorts: true).
+# All recent measurements were taken with shorts on: the 21-day NIFTY 15m
+# replay (+2963.61, 18 trades, 17 of them SELL) and the 21-day BANKNIFTY
+# replay (+993.27) both depend on the short path. The original 5y daily
+# validation was long-only pullback; the short side has 21 days of session
+# replay evidence, not 5 years — treat it as newer and thinner evidence.
+# CNC/delivery accounts CANNOT short: the paper loop still clips/skips SELL
+# without holdings (see settlement tests). Only enable this with an MIS
+# account where intraday shorting is genuinely possible.
+trading:
+  allow_shorts: true
+
+# Broker provider. "megabull" routes all fills to the MegaBull free paper
+# API (MIS intraday; account holds Rs5,00,000 virtual, key in .env as
+# MEGABULL_API_KEY — never paste it here). "paper" keeps the local
+# in-memory simulator (offline default for the test suite).
+broker:
+  provider: "megabull"
+  base_url: "https://api.megabull.in"
+
+# Screener: scan the basket, rank setups by quality, trade only the best.
+# rank = confidence x edge-in-ATR x setup-bonus (pullback-long 1.5,
+# composite-short 1.0, other 0.5). Entries inside 0.25 ATR of their stop
+# score zero. An empty screen (nothing met the bar) is normal.
+screener:
+  basket: "nifty50"          # basket name in src/screener.py, or a raw list
+  max_positions_to_open: 3
+  min_rank: 40.0
+  min_confidence: 60
+
+timeframes:
+  default: "15m"
+  available:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "1d"
+
+# Nightly universe for GitHub: NIFTY 100 premarket scan + session ticks.
+universe:
+  premarket: "nifty100"            # NIFTY100 (100 tickers, 1 batch download)
+  session: "nifty100"
+
+data_fetcher:
+  source: "yfinance"              # yfinance | alpha_vantage
+  use_batch_fetch: true           # one yf.download batch for many tickers
+  # History depth per timeframe. yfinance caps intraday history at ~60 days,
+  # so one "2y" setting breaks every 15m/5m/1m fetch with "range must be
+  # within the last 60 days". Daily scans need 2y for the 200-bar SMA;
+  # intraday scans take the longest window yfinance allows.
+  history_period: "2y"            # default for daily and slower bars
+  intraday_history_period: "59d"  # used for 1m/5m/15m/30m/1h bars
+  max_retries: 3
+  retry_backoff_base: 2           # exponential backoff base (seconds)
+  request_timeout: 30
+
+screenshot_analyzer:
+  vision_model: "openai"          # openai | gemini | local
+  openai_model: "gpt-4o"
+  gemini_model: "gemini-1.5-pro"
+  max_tokens: 1500
+  price_deviation_threshold: 1.0  # % — warn if screenshot price deviates more
+
+indicators:
+  trend:
+    sma_periods: [9, 21, 50, 200]
+    ema_periods: [9, 21, 50, 200]
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+  momentum:
+    rsi:
+      period: 14
+      overbought: 70
+      oversold: 30
+    stochastic:
+      k_period: 14
+      d_period: 3
+      overbought: 80
+      oversold: 20
+  volatility:
+    bollinger:
+      period: 20
+      std_dev: 2
+    atr:
+      period: 14
+  volume:
+    vwap: true
+    obv: true
+
+sentiment:
+  enabled: true
+  model: "vader"                  # vader | finbert
+  sources:
+    newsapi:
+      enabled: true
+      max_articles: 10
+      max_age_hours: 24
+    reddit:
+      enabled: false
+      subreddits: ["IndianStreetBets", "wallstreetbets"]
+      max_posts: 20
+    finnhub:
+      enabled: false
+  source_weights:
+    newsapi: 0.8
+    reddit: 0.4
+    finnhub: 0.7
+  recency_decay: 0.1              # weight decay per hour of age
+  cache_ttl_minutes: 15
+
+signal_engine:
+  weights:
+    technical: 0.55
+    sentiment: 0.15
+    screenshot_chart: 0.30
+  min_confirmations: 3
+  conflict_threshold: 0.4
+  buy_threshold: 0.3
+  sell_threshold: -0.3
+  trend_filter:
+    enabled: true
+    sma_period: 200
+  # Entry strategy validated out-of-sample on DAILY bars across 15 NSE large
+  # caps (5y): pullback entries in uptrends, stop below the swing low,
+  # 1.5R target. An intraday (15m, 50/20) variant was built by analogy and
+  # TESTED on 60d of 15m bars — every 15m config failed out-of-sample
+  # (train PF 0.4-0.8, test PF 0.04-0.55; evidence:
+  # scripts/validation_intraday.json). The intraday gate is therefore
+  # disabled: 15m scans report HOLD with the reason. Only "daily" trades.
+  entry_strategy: "pullback"
+  entry_variant: "daily"       # intraday variant FAILED validation; keep daily
+  pullback:
+    trend_sma: 200            # validated daily windows
+    pullback_sma: 50
+    require_macd_turn: true
+    require_rsi_below: 0   # 0 disables the RSI filter (tested: hurt expectancy)
+
+risk_management:
+  capital: 500000            # matches MegaBull's Rs5L virtual account;
+                             # 1.5%/trade + 20% exposure cap scale from this.
+  risk_per_trade_pct: 1.5
+  stop_loss:
+    method: "swing"
+    swing_buffer_pct: 0.25
+    atr_multiplier: 3.5
+    percentage: 3.0
+    min_stop_distance_pct: 1.0
+  take_profit:
+    min_risk_reward: 1.5         # measured config: all 21-day session
+                                # replays ran at 1.5R. 2.0R is untested here.
+  trailing_stop:
+    enabled: false
+    method: "atr"
+    atr_multiplier: 3.0
+    percentage: 2.0
+  max_daily_loss_pct: 5.0
+  max_open_positions: 5
+  max_exposure_per_symbol_pct: 20
+  max_exposure_per_sector_pct: 40
+  # Active Manager logic
+  breakeven_at_r: 1.0
+  partial_at_r: 1.0
+  partial_fraction: 0.5
+  resistance_atr: 1.0
+  resistance_rank_penalty: 0.5
+
+backtesting:
+  start_date: "2026-01-01"
+  end_date: "2026-10-01"
+  initial_capital: 500000
+  commission_pct: 0.03            # brokerage commission %
+  slippage_pct: 0.05
+
+alerts:
+  telegram:
+    enabled: true
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+    # Open broadcast: anyone who taps /start in the bot is appended here
+    # and gets every alert. .env single ID stays as seed/fallback.
+    subscriber_file: "output/subscribers.json"
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender_env: "EMAIL_SENDER"
+    password_env: "EMAIL_PASSWORD"
+    recipient_env: "EMAIL_RECIPIENT"

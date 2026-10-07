@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual env
+venv/
+.venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.local
+
+# Logs and outputs
+logs/
+*.log
+
+# The bot persists its audit trail back to the repo. Everything else in
+# output/ (caches, test sidecars, contaminated archives) stays ignored.
+output/*
+!output/plans/
+!output/trade_log.jsonl
+!output/trade_log.csv
+!output/dashboard_state.json
+output/plans/*
+!output/plans/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Historical yfinance caches (large)
+scripts/_data_cache*/
+

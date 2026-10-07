@@ -1,0 +1,36 @@
+﻿{
+    "capital_start":  500000,
+    "closed_fail":  0,
+    "equity":  500000,
+    "closed":  [
+
+               ],
+    "updated_at":  "2026-10-07T19:42:07.3412609+05:30",
+    "win_rate":  0,
+    "symbols":  [
+
+                ],
+    "last_scan":  null,
+    "orders":  [
+
+               ],
+    "closed_pass":  0,
+    "balance":  {
+                    "used_margin":  0,
+                    "total":  500000,
+                    "available":  500000
+                },
+    "pnl":  0,
+    "pnl_pct":  0,
+    "timeframe":  "15m",
+    "scans":  0,
+    "signals":  [
+
+                ],
+    "interval":  300,
+    "positions":  [
+
+                  ],
+    "provider":  "megabull",
+    "last_error":  null
+}

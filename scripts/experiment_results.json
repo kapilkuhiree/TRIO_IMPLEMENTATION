@@ -1,0 +1,92 @@
+[
+  {
+    "variant": "B_pullback_atr2.5_t1.5R",
+    "trades": 116,
+    "win_rate": 52.6,
+    "profit_factor": 1.61,
+    "avg_win_pct": 7.42,
+    "avg_loss_pct": -5.12,
+    "expectancy_pct": 1.475,
+    "total_pct": 171.1
+  },
+  {
+    "variant": "C_pullback_swingstop_t1.5R",
+    "trades": 134,
+    "win_rate": 51.5,
+    "profit_factor": 1.77,
+    "avg_win_pct": 6.2,
+    "avg_loss_pct": -3.73,
+    "expectancy_pct": 1.384,
+    "total_pct": 185.5
+  },
+  {
+    "variant": "E_pullback_rsi_swing_t1.5R",
+    "trades": 103,
+    "win_rate": 46.6,
+    "profit_factor": 1.55,
+    "avg_win_pct": 5.91,
+    "avg_loss_pct": -3.33,
+    "expectancy_pct": 0.978,
+    "total_pct": 100.7
+  },
+  {
+    "variant": "G_bb_bounce_swing_t1.5R",
+    "trades": 48,
+    "win_rate": 45.8,
+    "profit_factor": 1.34,
+    "avg_win_pct": 3.53,
+    "avg_loss_pct": -2.23,
+    "expectancy_pct": 0.407,
+    "total_pct": 19.5
+  },
+  {
+    "variant": "I_breakout_swing_trail",
+    "trades": 241,
+    "win_rate": 44.0,
+    "profit_factor": 1.52,
+    "avg_win_pct": 5.85,
+    "avg_loss_pct": -3.02,
+    "expectancy_pct": 0.879,
+    "total_pct": 211.8
+  },
+  {
+    "variant": "D_pullback_swing_trail",
+    "trades": 150,
+    "win_rate": 43.3,
+    "profit_factor": 2.18,
+    "avg_win_pct": 6.43,
+    "avg_loss_pct": -2.25,
+    "expectancy_pct": 1.511,
+    "total_pct": 226.7
+  },
+  {
+    "variant": "A_signal_count_atr35_t2R",
+    "trades": 169,
+    "win_rate": 42.0,
+    "profit_factor": 1.39,
+    "avg_win_pct": 13.7,
+    "avg_loss_pct": -7.16,
+    "expectancy_pct": 1.603,
+    "total_pct": 271.0
+  },
+  {
+    "variant": "F_pullback_rsi_swing_trail",
+    "trades": 108,
+    "win_rate": 38.0,
+    "profit_factor": 1.87,
+    "avg_win_pct": 7.02,
+    "avg_loss_pct": -2.29,
+    "expectancy_pct": 1.244,
+    "total_pct": 134.3
+  },
+  {
+    "variant": "H_bb_bounce_swing_trail",
+    "trades": 44,
+    "win_rate": 31.8,
+    "profit_factor": 2.4,
+    "avg_win_pct": 8.48,
+    "avg_loss_pct": -1.65,
+    "expectancy_pct": 1.572,
+    "total_pct": 69.2
+  }
+]

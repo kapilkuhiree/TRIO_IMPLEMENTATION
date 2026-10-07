@@ -1,0 +1,140 @@
+[
+  {
+    "config": "intra_pullback_swing_t1.5",
+    "train": {
+      "variant": "intra_pullback_swing_t1.5",
+      "trades": 29,
+      "win_rate": 24.1,
+      "profit_factor": 0.5,
+      "avg_win_pct": 0.58,
+      "avg_loss_pct": -0.37,
+      "expectancy_pct": -0.141,
+      "total_pct": -4.1
+    },
+    "test": {
+      "variant": "intra_pullback_swing_t1.5",
+      "trades": 15,
+      "win_rate": 33.3,
+      "profit_factor": 0.39,
+      "avg_win_pct": 0.35,
+      "avg_loss_pct": -0.46,
+      "expectancy_pct": -0.186,
+      "total_pct": -2.8
+    }
+  },
+  {
+    "config": "intra_pullback_swing_t1.0",
+    "train": {
+      "variant": "intra_pullback_swing_t1.0",
+      "trades": 29,
+      "win_rate": 31.0,
+      "profit_factor": 0.46,
+      "avg_win_pct": 0.38,
+      "avg_loss_pct": -0.37,
+      "expectancy_pct": -0.139,
+      "total_pct": -4.0
+    },
+    "test": {
+      "variant": "intra_pullback_swing_t1.0",
+      "trades": 15,
+      "win_rate": 40.0,
+      "profit_factor": 0.43,
+      "avg_win_pct": 0.29,
+      "avg_loss_pct": -0.45,
+      "expectancy_pct": -0.153,
+      "total_pct": -2.3
+    }
+  },
+  {
+    "config": "intra_pullback_swing_t2.0",
+    "train": {
+      "variant": "intra_pullback_swing_t2.0",
+      "trades": 29,
+      "win_rate": 17.2,
+      "profit_factor": 0.41,
+      "avg_win_pct": 0.73,
+      "avg_loss_pct": -0.38,
+      "expectancy_pct": -0.184,
+      "total_pct": -5.3
+    },
+    "test": {
+      "variant": "intra_pullback_swing_t2.0",
+      "trades": 15,
+      "win_rate": 26.7,
+      "profit_factor": 0.39,
+      "avg_win_pct": 0.47,
+      "avg_loss_pct": -0.44,
+      "expectancy_pct": -0.194,
+      "total_pct": -2.9
+    }
+  },
+  {
+    "config": "intra_pullback_atr_t1.5",
+    "train": {
+      "variant": "intra_pullback_atr_t1.5",
+      "trades": 27,
+      "win_rate": 22.2,
+      "profit_factor": 0.47,
+      "avg_win_pct": 1.17,
+      "avg_loss_pct": -0.71,
+      "expectancy_pct": -0.294,
+      "total_pct": -7.9
+    },
+    "test": {
+      "variant": "intra_pullback_atr_t1.5",
+      "trades": 15,
+      "win_rate": 26.7,
+      "profit_factor": 0.55,
+      "avg_win_pct": 1.14,
+      "avg_loss_pct": -0.76,
+      "expectancy_pct": -0.251,
+      "total_pct": -3.8
+    }
+  },
+  {
+    "config": "intra_rsi_pullback_t1.5",
+    "train": {
+      "variant": "intra_rsi_pullback_t1.5",
+      "trades": 12,
+      "win_rate": 16.7,
+      "profit_factor": 0.13,
+      "avg_win_pct": 0.28,
+      "avg_loss_pct": -0.43,
+      "expectancy_pct": -0.312,
+      "total_pct": -3.7
+    },
+    "test": {
+      "variant": "intra_rsi_pullback_t1.5",
+      "trades": 5,
+      "win_rate": 20.0,
+      "profit_factor": 0.04,
+      "avg_win_pct": 0.1,
+      "avg_loss_pct": -0.71,
+      "expectancy_pct": -0.549,
+      "total_pct": -2.7
+    }
+  },
+  {
+    "config": "intra_trendonly_t1.5",
+    "train": {
+      "variant": "intra_trendonly_t1.5",
+      "trades": 154,
+      "win_rate": 35.1,
+      "profit_factor": 0.78,
+      "avg_win_pct": 1.75,
+      "avg_loss_pct": -1.22,
+      "expectancy_pct": -0.178,
+      "total_pct": -27.5
+    },
+    "test": {
+      "variant": "intra_trendonly_t1.5",
+      "trades": 98,
+      "win_rate": 23.5,
+      "profit_factor": 0.42,
+      "avg_win_pct": 1.68,
+      "avg_loss_pct": -1.23,
+      "expectancy_pct": -0.545,
+      "total_pct": -53.4
+    }
+  }
+]

@@ -1,0 +1,62 @@
+TRIO — what we are doing, how, and what is done
+================================================
+Last updated: 2026-10-06 (evening: MegaBull default, 124/124, both dashboards)
+
+STATUS: MEGABULL DEFAULT (both dashboards running it)
+- 124 tests passed, all green (both folders), compile clean
+- Broker: megabull default (paper fallback via TRIO_BROKER_PROVIDER=paper)
+- Capital: 500000 (matches MegaBull Rs5L virtual)
+- LIVE :5000 + DEV :5001 — equity Rs500,000 from MegaBull ledger
+- TODO(tomorrow 09:20+ IST): market-hours smoke = first real MIS order +
+  exit alert on phone + reconcile /api/report/monthly/day/<date> vs trade log
+- Rotate MegaBull key (was in chat; shared account Shreyash Laddha)
+
+PHASES
+------
+[x] Phase 0 baseline
+[x] Phase 1 screenshot_analyzer
+[x] Phase 2 data_fetcher + indicators + cross_checker (tests added)
+[x] Phase 3 sentiment (VADER + FinBERT optional + cache)
+[x] Phase 4 signal_engine + risk_manager
+[x] Phase 5 backtester (synthetic tests)
+[x] Phase 6 paper_trader + paper broker (tests)
+[x] Phase 7 broker adapters (base + paper + zerodha stub)
+[x] Phase 8 MegaBull adapter default (mocked tests + config + docs)
+[x] Phase 9 live-session hardening: side-aware fills, true equity math,
+    hold-skip, EOD square-off, readings classifier, mode/broker log tags
+
+PHASES
+------
+[x] Phase 0 baseline
+[x] Phase 1 screenshot_analyzer
+[x] Phase 2 data_fetcher + indicators + cross_checker (tests added)
+[x] Phase 3 sentiment (VADER + FinBERT optional + cache)
+[x] Phase 4 signal_engine + risk_manager
+[x] Phase 5 backtester (synthetic tests)
+[x] Phase 6 paper_trader + paper broker (tests)
+[x] Phase 7 broker adapters (base + paper + zerodha stub)
+
+FILES
+-----
+Core: main.py, utils.py, data_fetcher.py, indicators.py, screenshot_analyzer.py, cross_checker.py, sentiment.py, signal_engine.py, risk_manager.py, backtester.py, paper_trader.py, alerts.py
+Broker: broker/base.py, broker/paper.py, broker/zerodha.py
+Tests: test_indicators, test_signal_engine, test_risk_manager, test_screenshot_analyzer, test_cross_checker, test_paper_broker, test_backtester (54 total)
+Config: config/config.yaml, .env.example
+Docs: README.md, PROJECT_STATE.md, MODEL_HANDOFF.md
+
+HOW TO RUN
+----------
+cd "C:\Users\Kapil Kuhire\Downloads\TRIO"
+python -m pytest tests -q
+python main.py scan --symbol RELIANCE.NS --timeframe 15m
+python main.py backtest --symbol RELIANCE.NS --timeframe 1d --period 365d
+python main.py paper --symbols RELIANCE.NS TCS.NS --interval 300 --max-iterations 1
+python main.py analyze --image path/to/screenshot.png (needs API keys)
+
+NOTES
+-----
+- Live orders disabled by default (paper is default)
+- API keys via .env only
+- Screenshot values treated as hints; cross-checked against live data
+- Risk halt blocks new signals until reset
+- No network calls in tests (backtester uses mocks)

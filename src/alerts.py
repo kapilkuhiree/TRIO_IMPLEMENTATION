@@ -1,0 +1,509 @@
+"""
+TRIO — Alerts
+
+Send trading signal notifications via Telegram or email.
+
+DISCLAIMER: Educational purposes only. Not financial advice.
+"""
+
+import json
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from src.utils import get_env, get_logger, ist_display, load_config
+
+logger = get_logger("alerts")
+
+
+# ---------------------------------------------------------------------------
+# Markdown escaping (Telegram legacy Markdown)
+# ---------------------------------------------------------------------------
+
+_MD_SPECIAL = set(r"_*[]()~`>#+-=|{}.!")
+
+
+def _md_escape(text: Any) -> str:
+    """Escape Telegram legacy-Markdown special chars in dynamic text.
+
+    Static markers (e.g. *TRIO BUY —*) are written by us and stay raw;
+    everything interpolated (symbols, prices, reasoning lines, setup
+    names) passes through here so a line like
+    ``8/15 technical indicators bullish (tech_score=0.40)`` cannot break
+    parsing with unbalanced underscores (that was a live 400 Bad Request).
+    """
+    s = "" if text is None else str(text)
+    return "".join(f"\\{ch}" if ch in _MD_SPECIAL else ch for ch in s)
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+def send_telegram(message: str, config_override: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Send a message via Telegram bot.
+
+    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.
+
+    Args:
+        message:         Text message to send.
+        config_override: Override alert config.
+
+    Returns:
+        True if sent successfully.
+    """
+    cfg = load_config()
+    tg_cfg = config_override or cfg.get("alerts", {}).get("telegram", {})
+
+    if not tg_cfg.get("enabled", False):
+        logger.debug("Telegram alerts disabled")
+        return False
+
+    token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+    chat_id = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+
+    if not token or not chat_id:
+        logger.warning("Telegram credentials not set")
+        return False
+
+    recipients = _subscriber_ids(chat_id)
+    if not recipients:
+        logger.warning("Telegram has no recipients (no subscribers file, no chat ID)")
+        return False
+
+    try:
+        import requests
+    except ImportError:
+        logger.error("requests not installed — cannot send Telegram alerts")
+        return False
+
+    ok_any = False
+    for cid in recipients:
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": cid,
+                "text": message,
+                "parse_mode": "Markdown",
+            }
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            _record_delivery(cid, ok=True)
+            ok_any = True
+        except Exception as exc:
+            # 403 = user blocked the bot. Track consecutive failures and
+            # auto-remove after 3 so one dead account can't slow the fan-out.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error("Telegram send failed for %s: %s", cid, exc)
+            _record_delivery(cid, ok=False, blocked=(status == 403))
+    if ok_any:
+        logger.info("Telegram alert sent to %d recipient(s)", len(recipients))
+    return ok_any
+
+
+# ---------------------------------------------------------------------------
+# Subscriber store + join handling (open broadcast)
+# ---------------------------------------------------------------------------
+
+def _subscriber_file() -> Path:
+    """Path to the subscriber JSON. Falls back to output/subscribers.json."""
+    try:
+        cfg = load_config()
+        p = cfg.get("alerts", {}).get("telegram", {}).get(
+            "subscriber_file", "output/subscribers.json")
+    except Exception:
+        p = "output/subscribers.json"
+    path = Path(p)
+    if not path.is_absolute():
+        from src.utils import PROJECT_ROOT
+        path = PROJECT_ROOT / p
+    return path
+
+
+def _load_subscribers() -> Dict[str, Any]:
+    """Read the subscriber store. Returns {} when missing/corrupt."""
+    try:
+        path = _subscriber_file()
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Subscriber store unreadable: %s", exc)
+    return {}
+
+
+def _save_subscribers(data: Dict[str, Any]) -> None:
+    """Atomic write of the subscriber store (tmp + rename)."""
+    path = _subscriber_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _subscriber_ids(fallback_chat_id: Optional[str]) -> List[str]:
+    """All chat IDs to fan out to. Falls back to the single .env ID."""
+    data = _load_subscribers()
+    chats = data.get("chats")
+    if isinstance(chats, list) and chats:
+        return [str(c) for c in chats]
+    if fallback_chat_id:
+        return [str(fallback_chat_id)]
+    return []
+
+
+def _record_delivery(chat_id: str, ok: bool, blocked: bool = False) -> None:
+    """Track consecutive failures; auto-remove after 3 (likely blocked)."""
+    if ok and not blocked:
+        # Clear any failure streak on success.
+        try:
+            data = _load_subscribers()
+            fails = data.get("failures", {})
+            if str(chat_id) in fails:
+                del fails[str(chat_id)]
+                data["failures"] = fails
+                _save_subscribers(data)
+        except Exception:
+            pass
+        return
+    try:
+        data = _load_subscribers()
+        fails = data.get("failures", {})
+        key = str(chat_id)
+        fails[key] = int(fails.get(key, 0)) + 1
+        if blocked or fails[key] >= 3:
+            chats = [str(c) for c in data.get("chats", []) if str(c) != key]
+            data["chats"] = chats
+            del fails[key]
+            logger.warning("Removed Telegram subscriber %s after %s failures",
+                           chat_id, "block" if blocked else "3")
+        data["failures"] = fails
+        _save_subscribers(data)
+    except Exception as exc:
+        logger.warning("Could not record delivery state: %s", exc)
+
+
+WELCOME_MESSAGE = """👋 *Welcome to TRIO alerts — you're subscribed.*
+
+From the next signal you'll get entries like this:
+
+🟢 *TRIO BUY — RELIANCE.NS*
+Confidence: 78%
+Entry: 1,180.00
+Stop: 1,160.00
+Target: 1,210.00
+Qty: 7  |  Risk: ₹140.00  |  R:R 1:1.5
+
+And exits like this:
+
+✅ *CLOSED PASS — RELIANCE.NS*
+P&L: ₹+210.00 (+2.54%)
+LONG 7 @ 1,180.00 → 1,210.00
+Why closed: target-hit
+
+_Educational only. Not financial advice._"""
+
+
+def _send_one(token: str, chat_id: str, text: str) -> bool:
+    """Send a single message. Returns True on success. Test-seam."""
+    import requests
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = requests.post(url, json={"chat_id": chat_id, "text": text,
+                                    "parse_mode": "Markdown"}, timeout=10)
+    resp.raise_for_status()
+    return True
+
+
+def handle_joins() -> List[str]:
+    """Poll getUpdates for new /start senders; subscribe + welcome them.
+
+    Returns the list of newly added chat IDs. Safe to call every ~30s:
+    uses the stored offset so each update is processed once.
+    """
+    cfg = load_config()
+    tg_cfg = cfg.get("alerts", {}).get("telegram", {})
+    if not tg_cfg.get("enabled", False):
+        return []
+    token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+    if not token:
+        return []
+
+    data = _load_subscribers()
+    # Seed from .env so the owner's alerts never depend on the store.
+    seed = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    chats: List[str] = [str(c) for c in data.get("chats", [])]
+    if seed and str(seed) not in chats:
+        chats.append(str(seed))
+        data["chats"] = chats
+        _save_subscribers(data)
+
+    offset = data.get("offset", 0)
+    try:
+        import requests
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": offset, "timeout": 0}, timeout=15)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+    except Exception as exc:
+        logger.warning("Telegram getUpdates failed: %s", exc)
+        return []
+
+    new_ids: List[str] = []
+    max_id = offset
+    for upd in updates:
+        max_id = max(max_id, int(upd.get("update_id", 0)) + 1)
+        msg = upd.get("message", {})
+        text = (msg.get("text") or "").strip()
+        chat = msg.get("chat", {})
+        cid = str(chat.get("id", ""))
+        if not cid or text != "/start":
+            continue
+        if cid not in chats:
+            chats.append(cid)
+            new_ids.append(cid)
+            try:
+                _send_one(token, cid, WELCOME_MESSAGE)
+                logger.info("Welcomed new Telegram subscriber %s", cid)
+            except Exception as exc:
+                logger.warning("Welcome message failed for %s: %s", cid, exc)
+    data["chats"] = chats
+    data["offset"] = max_id
+    _save_subscribers(data)
+    return new_ids
+
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def send_email(
+    subject: str,
+    body: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Send an email alert via SMTP.
+
+    Requires EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT environment variables.
+
+    Args:
+        subject:         Email subject line.
+        body:            Email body text.
+        config_override: Override alert config.
+
+    Returns:
+        True if sent successfully.
+    """
+    cfg = load_config()
+    em_cfg = config_override or cfg.get("alerts", {}).get("email", {})
+
+    if not em_cfg.get("enabled", False):
+        logger.debug("Email alerts disabled")
+        return False
+
+    sender = get_env(em_cfg.get("sender_env", "EMAIL_SENDER"))
+    password = get_env(em_cfg.get("password_env", "EMAIL_PASSWORD"))
+    recipient = get_env(em_cfg.get("recipient_env", "EMAIL_RECIPIENT"))
+
+    if not all([sender, password, recipient]):
+        logger.warning("Email credentials not fully set")
+        return False
+
+    smtp_server = em_cfg.get("smtp_server", "smtp.gmail.com")
+    smtp_port = em_cfg.get("smtp_port", 587)
+
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = recipient
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+
+        logger.info("Email alert sent to %s", recipient)
+        return True
+    except Exception as exc:
+        logger.error("Email send failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Signal formatter
+# ---------------------------------------------------------------------------
+
+def _fmt_num(v: Any, nd: int = 2) -> str:
+    """Format a price for Telegram: compact, no trailing noise."""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):,.{nd}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def format_signal_message(signal: Any) -> str:
+    """Format a TradeSignal into a Telegram-friendly alert.
+
+    Layout answers, in order: WHAT (action+symbol), WHERE (entry),
+    WHAT-IF-WRONG (stop), WHAT-IF-RIGHT (target), HOW MUCH (size/risk),
+    HOW SURE (confidence/rank/setup), and WHY (top reasons only —
+    Telegram cuts messages at ~4096 chars, so the full reasoning list
+    stays in the dashboard/terminal).
+    """
+    d = signal if isinstance(signal, dict) else signal.to_dict()
+
+    action = str(d.get("action", "HOLD")).upper()
+    emoji = {"BUY": "🟢", "SELL": "🔴"}.get(action, "⚪")
+    symbol = _md_escape(d.get("symbol", "N/A"))
+    conf = d.get("confidence", 0)
+
+    lines = [
+        f"{emoji} *TRIO {_md_escape(action)} — {symbol}*",
+        f"Time: {_md_escape(ist_display(d.get('generated_at')))}",
+        f"Confidence: {_md_escape(conf)}%",
+    ]
+
+    if action in ("BUY", "SELL"):
+        lines += [
+            f"Entry: {_md_escape(_fmt_num(d.get('entry_price')))}",
+            f"Stop: {_md_escape(_fmt_num(d.get('stop_loss')))}",
+            f"Target: {_md_escape(_fmt_num(d.get('target')))}",
+            f"Qty: {_md_escape(d.get('position_size', 0))}  |  "
+            f"Risk: ₹{_md_escape(_fmt_num(d.get('risk_amount')))}  |  "
+            f"R:R {_md_escape(d.get('risk_reward_ratio', '—'))}",
+        ]
+        if d.get("rank") is not None:
+            lines.append(
+                f"Rank: {_md_escape(d.get('rank'))}  |  "
+                f"Setup: {_md_escape(d.get('setup_name', '—'))}")
+    else:
+        lines.append("_No entry — guard refused. Reason below._")
+
+    reasons = d.get("reasoning", []) or []
+    if reasons:
+        lines.append("")
+        lines.append("*Why:*")
+        for reason in reasons[:6]:
+            # Strip the noisy per-indicator dump lines; keep verdicts.
+            r = str(reason).strip()
+            if "value=" in r and "tech_score=" not in r and "Composite" not in r:
+                continue
+            lines.append(f"• {_md_escape(r)}")
+        skipped = [r for r in reasons if "SKIP" in str(r).upper()
+                   or "NO PULLBACK" in str(r).upper()
+                   or "BLOCKED" in str(r).upper()]
+        for s in skipped[:2]:
+            esc = f"• {_md_escape(str(s).strip())}"
+            if esc not in lines:
+                lines.append(esc)
+
+    lines.append("")
+    lines.append("_Educational only. Not financial advice._")
+    return "\n".join(lines)
+
+
+def format_startup_message(status: Dict[str, Any]) -> str:
+    """Format the boot announcement for Telegram.
+
+    Sent once per process start, AFTER the readiness gate passes, so
+    "started" means verified-working. ``status`` keys: booted_at (ISO),
+    provider, equity, positions, symbols count, interval, session window,
+    capital_start, issues (list of gate failure strings, empty = clean).
+    """
+    issues = status.get("issues") or []
+    emoji = "🚀" if not issues else "⚠️"
+    head = "STARTED AND WORKING" if not issues else "STARTED WITH ISSUES"
+    lines = [
+        f"{emoji} *TRIO {head} — "
+        f"{_md_escape(ist_display(status.get('booted_at')))}*",
+        "Starting for Mr Kapil Kuhire Sir",
+        "",
+        f"Broker: {_md_escape(status.get('provider', '—'))}  |  "
+        f"Equity: ₹{_md_escape(_fmt_num(status.get('equity')))}",
+        f"Positions open: {_md_escape(status.get('positions', 0))}  |  "
+        f"Watching: {_md_escape(status.get('symbols', 0))} symbols, "
+        f"scan every {_md_escape(status.get('interval', 0))}s",
+        f"Session: {_md_escape(status.get('session', '—'))}  |  "
+        f"Capital base: ₹{_md_escape(_fmt_num(status.get('capital_start')))}",
+    ]
+    if issues:
+        lines.append("")
+        lines.append("*Issues found at boot:*")
+        for issue in issues[:5]:
+            lines.append(f"• {_md_escape(str(issue))}")
+    lines.append("")
+    lines.append("_Educational only. Not financial advice._")
+    return "\n".join(lines)
+
+
+def _fmt_held(minutes: Any) -> str:
+    """Human holding time: 45 -> '45m', 90 -> '1h 30m', None -> '—'."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return "—"
+    if m < 0:
+        return "—"
+    if m < 60:
+        return f"{m}m"
+    return f"{m // 60}h {m % 60:02d}m"
+
+
+def format_exit_message(trade: Dict[str, Any]) -> str:
+    """Format a closed-trade record (PASS/FAIL) for Telegram.
+
+    Answers the full audit question: WHAT (symbol/side/qty), WHERE
+    (entry -> exit), WHEN (entry/exit timestamps in IST, holding
+    duration), HOW MUCH (P&L), and WHY (close reason).
+    """
+    result = str(trade.get("result", "")).upper()
+    emoji = "✅" if result == "PASS" else "❌"
+    symbol = _md_escape(trade.get("symbol", "N/A"))
+    pnl = trade.get("pnl", 0)
+    try:
+        pnl_s = f"₹{float(pnl):+,.2f} ({float(trade.get('pnl_pct', 0)):+.2f}%)"
+    except (TypeError, ValueError):
+        pnl_s = str(pnl)
+    lines = [
+        f"{emoji} *CLOSED {_md_escape(result)} — {symbol}*",
+        f"P&L: {_md_escape(pnl_s)}",
+        f"{_md_escape(trade.get('side', ''))} "
+        f"{_md_escape(trade.get('quantity', ''))} @ "
+        f"{_md_escape(_fmt_num(trade.get('entry')))} → "
+        f"{_md_escape(_fmt_num(trade.get('exit')))}",
+        f"Entry: {_md_escape(ist_display(trade.get('entry_time')))}",
+        f"Exit: {_md_escape(ist_display(trade.get('closed_at')))}",
+        f"Held: {_md_escape(_fmt_held(trade.get('holding_minutes')))}",
+        f"Why closed: {_md_escape(trade.get('reason', '—'))}",
+    ]
+    lines.append("")
+    lines.append("_Educational only. Not financial advice._")
+    return "\n".join(lines)
+
+
+def send_signal_alert(signal: Any) -> None:
+    """Send a signal alert via all enabled channels."""
+    message = format_signal_message(signal)
+
+    send_telegram(message)
+    send_email(
+        subject=f"TRIO: {signal.action if hasattr(signal, 'action') else 'Signal'} — {signal.symbol if hasattr(signal, 'symbol') else ''}",
+        body=message,
+    )
+
+
+def send_exit_alert(trade: Dict[str, Any]) -> None:
+    """Send a closed-trade (PASS/FAIL) alert via all enabled channels."""
+    message = format_exit_message(trade)
+    send_telegram(message)
+    send_email(
+        subject=f"TRIO CLOSED {trade.get('result', '')} — {trade.get('symbol', '')} "
+                f"{trade.get('pnl', '')}",
+        body=message,
+    )
