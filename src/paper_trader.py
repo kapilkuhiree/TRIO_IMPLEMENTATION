@@ -804,7 +804,7 @@ class PaperTrader:
         logger.info("execute_plan: placed %d order(s).", len(placed))
         return placed
 
-def run_session(self, plan: Optional[Dict[str, Any]] = None,
+    def run_session(self, plan: Optional[Dict[str, Any]] = None,
                     interval_seconds: int = 60,
                     max_seconds: Optional[int] = None) -> None:
         """Session job: execute the plan once, then manage until EOD.
