@@ -1,6 +1,6 @@
 {
   "date": "2026-10-07",
-  "generated_at": "2026-10-07T14:29:50.594384+00:00",
+  "generated_at": "2026-10-07T16:25:31.416948+00:00",
   "universe": "nifty100",
   "timeframe": "1d",
   "scanned": 100,
@@ -29,13 +29,13 @@
         "  sma_200: bearish (value=10181.792436523438)",
         "  ema_9: bearish (value=10371.080941539542)",
         "  ema_21: bearish (value=10859.34490739067)",
-        "  ema_50: bearish (value=11102.838742584574)",
-        "  ema_200: bearish (value=10351.615490085902)",
+        "  ema_50: bearish (value=11102.838742584445)",
+        "  ema_200: bearish (value=10351.615489151163)",
         "  macd: bearish (value=-431.46425784121493)",
         "  rsi_14: bullish (value=10.662122687439137)",
         "  stoch: bullish (value=8.659680088251516)",
         "  adx_14: bullish (value=92.84178243651017)",
-        "  vwap: bullish (value=9124.489291462889)",
+        "  vwap: bullish (value=9124.489301473324)",
         "  obv: bearish (value=-429695.0)",
         "Composite score: -0.4286"
       ],
@@ -45,7 +45,7 @@
         "max_positions": 5,
         "halt_active": false
       },
-      "generated_at": "2026-10-07T14:29:40.168842+00:00",
+      "generated_at": "2026-10-07T16:25:22.669932+00:00",
       "disclaimer": "Educational only. Not financial advice.",
       "rank": 487.1,
       "edge_atr": 6.86,
@@ -68,16 +68,16 @@
         "  sma_9: bearish (value=8295.222222222223)",
         "  sma_21: bearish (value=8620.214285714286)",
         "  sma_50: bearish (value=8729.28248046875)",
-        "  sma_200: bearish (value=8057.623759765625)",
+        "  sma_200: bearish (value=8057.623757324219)",
         "  ema_9: bearish (value=8222.123111694184)",
-        "  ema_21: bearish (value=8480.365363207256)",
-        "  ema_50: bearish (value=8621.43130456414)",
-        "  ema_200: bearish (value=8219.379846546792)",
-        "  macd: bearish (value=-216.06148259169277)",
+        "  ema_21: bearish (value=8480.365363207253)",
+        "  ema_50: bearish (value=8621.431304561464)",
+        "  ema_200: bearish (value=8219.379848794199)",
+        "  macd: bearish (value=-216.06148259162)",
         "  rsi_14: bullish (value=24.60483149418431)",
         "  stoch: bullish (value=8.778173190984578)",
         "  adx_14: bullish (value=41.26894305937997)",
-        "  vwap: bullish (value=7474.4395040098825)",
+        "  vwap: bullish (value=7474.439511967593)",
         "  obv: bearish (value=2397374.0)",
         "Composite score: -0.4286"
       ],
@@ -87,7 +87,7 @@
         "max_positions": 5,
         "halt_active": false
       },
-      "generated_at": "2026-10-07T14:29:39.187221+00:00",
+      "generated_at": "2026-10-07T16:25:21.839950+00:00",
       "disclaimer": "Educational only. Not financial advice.",
       "rank": 417.9,
       "edge_atr": 5.89,
@@ -130,14 +130,12 @@
         "max_positions": 5,
         "halt_active": false
       },
-      "generated_at": "2026-10-07T14:29:37.185403+00:00",
+      "generated_at": "2026-10-07T16:25:20.134490+00:00",
       "disclaimer": "Educational only. Not financial advice.",
       "rank": 386.0,
       "edge_atr": 5.85,
       "setup_name": "composite-short"
     }
   ],
-  "executed": true,
-  "executed_at": "2026-10-07T14:36:07.644080+00:00",
-  "order_ids": []
+  "executed": false
 }
