@@ -1,6 +1,5 @@
 """
 TRIO — Risk Manager
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Handles position sizing, stop-loss / take-profit calculations,
 trailing stops, daily loss limits, exposure caps, and the trading halt switch.
@@ -26,9 +25,7 @@ logger = get_logger("risk_manager")
 
 @dataclass
 class RiskState:
-    """Tracks current risk state across the trading session.
-    Author: Kapil Kuhire
-    """
+    """Tracks current risk state across the trading session."""
     daily_pnl: float = 0.0
     open_positions: int = 0
     positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # symbol -> position info
@@ -374,9 +371,25 @@ def apply_risk_management(
     sl = calculate_stop_loss(entry, atr_value, action, swing_level=swing_level)
     signal.stop_loss = sl
 
-    # Take-profit
+    # Take-profit (ladder targets). Derive T1/T2/T3 from a single stop so
+    # the Active Manager can scale out: T1=0.8R (50% + breakeven), T2=1.5R
+    # (30% + trail), T3=2.5R runner — see ladder_targets(). T2/T3 are
+    # armed but the manager shadow-logs them until a sweep validates.
     tp = calculate_take_profit(entry, sl, action)
     signal.target = tp
+    # Ladder levels derived from configured t*_at_r; full ladder always
+    # stored so forward paper + sweeps can measure T2/T3.
+    ladder_cfg = cfg.get("ladder", {}) if isinstance(cfg.get("ladder"), dict) else {}
+    t1_r = ladder_cfg.get("t1_at_r", rm_cfg.get("partial_at_r", 0.8))
+    t2_r = ladder_cfg.get("t2_at_r", 1.5)
+    t3_r = ladder_cfg.get("t3_at_r", 2.5)
+    ladder = ladder_targets(entry, sl, action, t1_r=t1_r, t2_r=t2_r, t3_r=t3_r)
+    signal.target_t1 = ladder["T1"]
+    signal.target_t2 = ladder["T2"]
+    signal.target_t3 = ladder["T3"]
+    signal.ladder = ladder
+    # Legacy single partial target (kept for existing tests/digest)
+    signal.target_t1_legacy = calculate_take_profit(entry, sl, action, min_rr=t1_r)
 
     # Risk-reward ratio
     risk = abs(entry - sl)
@@ -409,6 +422,24 @@ def apply_risk_management(
     )
 
     return signal
+
+
+def ladder_targets(entry_price: float, stop_loss: float, action: str,
+                 t1_r: float = 0.8, t2_r: float = 1.5, t3_r: float = 2.5
+                 ) -> Dict[str, float]:
+    """Derive intraday ladder levels T1/T2/T3 from a single stop.
+
+    Your idea: T1 (0.8R) entry→breakeven, T2 (1.5R)→T1, T3 (2.5R).
+    Scaled exits reduce \"356 mins to flat at EOD\" on a 1.5R miss.
+    """
+    risk = abs(entry_price - stop_loss)
+    if action == "BUY":
+        return {"T1": round(entry_price + risk * t1_r, 2),
+                "T2": round(entry_price + risk * t2_r, 2),
+                "T3": round(entry_price + risk * t3_r, 2)}
+    return {"T1": round(entry_price - risk * t1_r, 2),
+            "T2": round(entry_price - risk * t2_r, 2),
+            "T3": round(entry_price - risk * t3_r, 2)}
 
 
 def _daily_loss_remaining() -> float:

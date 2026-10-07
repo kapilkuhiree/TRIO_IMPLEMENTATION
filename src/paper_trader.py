@@ -368,61 +368,133 @@ class PaperTrader:
                 logger.error("Error managing %s: %s", sym, exc)
 
     def _guard_open_positions(self) -> List[Dict[str, Any]]:
-        """Re-score open positions for Active Management: breakeven/partial exits.
-        
-        Runs every `guard_interval` seconds, much faster than entry scans.
-        Checks: price vs SL/target (close), price vs entry (breakeven),
-        price vs +1R (partial exit).
+        """Active Manager — Ladder (Phase 1 + Phase 2).
+
+        Phase 1 (always): T1 at +0.8R — close 50%, move rest to breakeven.
+        Phase 2 (shadow until ladder.enabled_phase2): T2 at +1.5R — close
+        30% of original, arm the trailing stop on the 20% runner; T3 is
+        the runner's trailing exit. Shadow logs are emitted without acting
+        so forward paper can measure them vs the breakeven hold.
+
+        Runs every `guard_interval` seconds. Stops/targets stay in
+        _manage_open_positions for the slow scan; this guard only arms
+        the scale-outs.
         """
         exited: List[Dict[str, Any]] = []
+        try:
+            provider = getattr(self, "broker_name", "paper")
+        except Exception:
+            provider = "paper"
+        if provider != "paper":
+            return exited
         if not self.broker.positions:
             return exited
 
         cfg = load_config()
         rm_cfg = cfg.get("risk_management", {})
-        be_r = rm_cfg.get("breakeven_at_r", 1.0)
-        pt_r = rm_cfg.get("partial_at_r", 1.0)
-        frac = rm_cfg.get("partial_fraction", 0.5)
+        ladder_cfg = rm_cfg.get("ladder", {}) if isinstance(
+            rm_cfg.get("ladder"), dict) else {}
+        t1_at_r = ladder_cfg.get("t1_at_r", rm_cfg.get("partial_at_r", 0.8))
+        t2_at_r = ladder_cfg.get("t2_at_r", 1.5)
+        t1_frac = ladder_cfg.get("t1_fraction",
+                                  rm_cfg.get("partial_fraction", 0.5))
+        t2_frac = ladder_cfg.get("t2_fraction", 0.30)
+        phase2 = bool(ladder_cfg.get("enabled_phase2", False))
+        trail_mult = float(((ladder_cfg.get("trailing_after_t2") or {}).get(
+            "atr_multiplier")) or 3.0)
+
+        def _atr() -> Optional[float]:
+            try:
+                md = fetch_market_data(sym, self.timeframe)
+                rd = compute_indicators(md.ohlcv, sym, self.timeframe)
+                for k, ind in rd.indicators.items():
+                    if k.startswith("atr_") and ind.value:
+                        return float(ind.value)
+            except Exception:
+                pass
+            return None
 
         for sym in list(self.broker.positions.keys()):
             pos = self.broker.positions.get(sym)
             if pos is None: continue
-            
+
             try:
                 md = fetch_market_data(sym, self.timeframe)
                 price = md.latest_price
                 if price is None: continue
                 self.broker.update_position(sym, price)
 
-                # Fetch parameters from the original filling order.
-                sl = None
-                tgt = None
-                for order in self.broker.orders.values():
-                    if order.symbol == sym and order.status == "FILLED":
-                        sl = order.stop_loss
-                        tgt = order.target
-                
-                if not sl or not tgt: continue                
-                
-                # Active Management: Breakeven / Partial
-                risk = abs(pos.avg_price - sl)
-                if risk > 0:
-                    rr = (price - pos.avg_price) / risk if pos.side=="LONG" else (pos.avg_price - price) / risk
+                order = next((o for o in reversed(list(
+                    self.broker.orders.values()))
+                    if o.symbol == sym and o.status == "FILLED"), None)
+                if order is None or not order.stop_loss: continue
+                sl = order.stop_loss
 
-                    # 1. Partial exit + Breakeven
-                    if rr >= pt_r and not pos.halved:
-                        rec = self.broker.close_position(sym, price, "partial@+1R", fraction=frac)
+                risk = abs(pos.avg_price - sl)
+                if risk <= 0: continue
+                rr = ((price - pos.avg_price) / risk if pos.side == "LONG"
+                      else (pos.avg_price - price) / risk)
+
+                # Ladder T1: 50% at +0.8R, rest to breakeven (risk-free)
+                if rr >= t1_at_r and not pos.halved:
+                    rec = self.broker.close_position(
+                        sym, price, "partial@T1-0.8R", fraction=t1_frac)
+                    if rec:
+                        logger.info("LADDER T1 %s @ %.2f (%.1f%%) — "
+                                    "half closed, stop to breakeven",
+                                    sym, price, rec["pnl_pct"])
+                        self._log_event("guard", {"symbol": sym,
+                                                  "price": price,
+                                                  "rr": round(rr, 2),
+                                                  "decision": "partial@T1-0.8R",
+                                                  "record": rec})
+                    order.stop_loss = pos.avg_price
+                    pos.halved = True
+                    setattr(pos, "ladder_t1_hit", True)
+
+                if not getattr(pos, "ladder_t1_hit", False):
+                    # Still eligible for shadow T1 invalidation check
+                    pass
+                else:
+                    # SHADOW: T2 at +1.5R (30% scale + trail), runner T3 trailing.
+                    pass  # handled next block; fallthrough keeps rr check
+
+                # Ladder Phase 2: handled here (shadow unless enabled).
+                # T1 must have fired before T2/T3 are eligible — the runner
+                # without breakeven breaks the risk-free invariant.
+                if getattr(pos, "ladder_t1_hit", False) \
+                        and rr >= t2_at_r and not getattr(
+                            pos, "ladder_t2_hit", False):
+                    if phase2:
+                        # Live: 30% at T2, then arm the trailing stop on the 20% runner.
+                        rec = self.broker.close_position(
+                            sym, price, "partial@T2-1.5R", fraction=t2_frac)
                         if rec:
-                            logger.info("PARTIAL EXIT %s @ %.2f (%.1f%% PnL)", sym, price, rec["pnl_pct"])
-                            self._log_event("guard", {"symbol": sym, "price": price,
+                            logger.info("LADDER T2 %s @ %.2f (%.1f%%) — "
+                                        "trailing armed",
+                                        sym, price, rec["pnl_pct"])
+                            self._log_event("guard", {"symbol": sym,
+                                                      "price": price,
                                                       "rr": round(rr, 2),
-                                                      "decision": "partial@+1R",
+                                                      "decision": "partial@T2-1.5R",
                                                       "record": rec})
-                        # Reset stop to entry for the remaining position
-                        for order in self.broker.orders.values():
-                           if order.symbol == sym and order.status == "FILLED":
-                               order.stop_loss = pos.avg_price
-                        pos.halved = True
+                        setattr(pos, "ladder_t2_hit", True)
+                        try:
+                            atr_v = _atr()
+                            if atr_v:
+                                trail = (price - atr_v * trail_mult
+                                         if pos.side == "LONG"
+                                         else price + atr_v * trail_mult)
+                                order.stop_loss = float(trail)
+                        except Exception:
+                            pass
+                    else:
+                        self._log_event("shadow-exit", {
+                            "symbol": sym, "side": pos.side,
+                            "entry": pos.avg_price, "price": price,
+                            "rr": round(rr, 2),
+                            "reason": "ladder-T2", "would_be": "partial@T2-1.5R",
+                        })
 
                     # 2. Shadow invalidation (log-only; never closes)
                     try:

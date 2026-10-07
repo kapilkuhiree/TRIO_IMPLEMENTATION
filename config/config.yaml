@@ -1,5 +1,4 @@
 # ============================================================================
-# Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 # TRIO - Trading Intelligence and Optimization
 # Configuration file — all tunable parameters live here
 # DISCLAIMER: This software is for educational purposes only. Not financial advice.
@@ -24,7 +23,7 @@ logging:
 forward_test:
   market: "NSE"
   session_start: "09:20"
-  session_end: "15:10"   # MIS square-off before broker auto-close (~15:15)
+  session_end: "15:15"
   timezone: "Asia/Kolkata"
   interval_seconds: 900
   session_log_dir: "logs/paper_sessions"
@@ -92,14 +91,8 @@ timeframes:
     - "1h"
     - "1d"
 
-# Nightly universe for GitHub: NIFTY 100 premarket scan + session ticks.
-universe:
-  premarket: "nifty100"            # NIFTY100 (100 tickers, 1 batch download)
-  session: "nifty100"
-
 data_fetcher:
   source: "yfinance"              # yfinance | alpha_vantage
-  use_batch_fetch: true           # one yf.download batch for many tickers
   # History depth per timeframe. yfinance caps intraday history at ~60 days,
   # so one "2y" setting breaks every 15m/5m/1m fetch with "range must be
   # within the last 60 days". Daily scans need 2y for the 200-bar SMA;
@@ -215,10 +208,24 @@ risk_management:
   max_open_positions: 5
   max_exposure_per_symbol_pct: 20
   max_exposure_per_sector_pct: 40
-  # Active Manager logic
-  breakeven_at_r: 1.0
-  partial_at_r: 1.0
+  # Active Manager logic — Ladder (Phase 1: T1=0.8R 50%+BE; Phase 2:
+  # T2=1.5R 30%+trail, T3=2.5R runner — shadow-logged until sweep validates).
+  # T1at0.8R fixed the "355 mins flat to EOD" ghost — T2/T3 are measured
+  # before acting (enable_ladder_phase2 flips live). Keep partial_* as
+  # legacy aliases so digest/backtest stay readable.
+  breakeven_at_r: 0.8
+  partial_at_r: 0.8
   partial_fraction: 0.5
+  ladder:
+    enabled_phase2: false             # shadow-log T2/T3; sweep must win first
+    t1_at_r: 0.8                      # T1: 50% + breakeven (risk-free)
+    t2_at_r: 1.5                      # T2: 30% scale + trail
+    t3_at_r: 2.5                      # T3: remaining runner
+    t1_fraction: 0.5
+    t2_fraction: 0.30                  # 30% of original at T2
+    trailing_after_t2:
+      method: "atr"
+      atr_multiplier: 3.0
   resistance_atr: 1.0
   resistance_rank_penalty: 0.5
 
