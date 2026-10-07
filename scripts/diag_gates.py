@@ -1,4 +1,6 @@
-"""Diagnose which gate kills signals: trend / pullback / macd / composite / sizing."""
+"""Diagnose which gate kills signals: trend / pullback / macd / composite / sizing.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+"""
 import sys
 from pathlib import Path
 import logging

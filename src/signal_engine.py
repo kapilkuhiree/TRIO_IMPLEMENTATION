@@ -1,5 +1,6 @@
 """
 TRIO — Signal Engine
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Combines technical indicator readings, sentiment scores, and screenshot
 chart analysis into a weighted composite signal: BUY / SELL / HOLD with
@@ -26,7 +27,9 @@ logger = get_logger("signal_engine")
 
 @dataclass
 class TradeSignal:
-    """Generated trade signal with full reasoning."""
+    """Generated trade signal with full reasoning.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     action: str = "HOLD"              # BUY / SELL / HOLD
     entry_price: Optional[float] = None

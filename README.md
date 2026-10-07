@@ -1,4 +1,6 @@
 # TRIO — Trading Intelligence and Optimization
+**Author:** Kapil Kuhire <kapilkuhire89@gmail.com>
+![Author](https://img.shields.io/badge/author-Kapil%20Kuhire-2ea44f)
 
 > **DISCLAIMER:** This software is for **educational purposes only**. It does
 > not constitute financial advice. Trading involves substantial risk of loss.

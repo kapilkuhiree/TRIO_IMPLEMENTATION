@@ -1,4 +1,6 @@
-"""Aggregate walk-forward blocks: totals, exits, per-symbol, per-block table."""
+"""Aggregate walk-forward blocks: totals, exits, per-symbol, per-block table.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+"""
 import json, glob
 
 fs = sorted(glob.glob("output/walkforward/block_*.json"))

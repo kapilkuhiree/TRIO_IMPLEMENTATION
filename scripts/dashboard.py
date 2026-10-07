@@ -1,5 +1,6 @@
 """
 TRIO — Paper Trading Dashboard (local web app, no login, no platform).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 What this is
 ------------

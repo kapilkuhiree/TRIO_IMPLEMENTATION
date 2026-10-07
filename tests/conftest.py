@@ -1,5 +1,6 @@
 """
 TRIO — shared pytest configuration.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Pins the broker provider to the local in-memory simulator so the suite
 is deterministic and offline, regardless of config.yaml (which defaults

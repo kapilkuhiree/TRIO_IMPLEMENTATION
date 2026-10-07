@@ -1,5 +1,6 @@
 """
 TRIO — Cross Checker Tests
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

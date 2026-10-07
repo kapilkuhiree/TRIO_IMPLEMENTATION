@@ -1,5 +1,6 @@
 """
 TRIO — Data Fetcher
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Fetches live and historical OHLCV data for configurable symbols and timeframes.
 Primary source: yfinance (free, no key required).
@@ -25,7 +26,9 @@ logger = get_logger("data_fetcher")
 
 @dataclass
 class MarketData:
-    """Container for fetched OHLCV market data."""
+    """Container for fetched OHLCV market data.
+    Author: Kapil Kuhire
+    """
     symbol: str
     timeframe: str
     ohlcv: pd.DataFrame  # columns: Open, High, Low, Close, Volume

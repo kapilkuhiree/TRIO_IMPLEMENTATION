@@ -1,5 +1,6 @@
 """
 TRIO — MegaBull adapter tests (all HTTP mocked: no network, no key).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import csv
@@ -28,7 +29,9 @@ class _Resp:
 
 
 class FakeSession:
-    """Records requests, replays canned MegaBull responses."""
+    """Records requests, replays canned MegaBull responses.
+    Author: Kapil Kuhire
+    """
 
     def __init__(self):
         self.posts = []

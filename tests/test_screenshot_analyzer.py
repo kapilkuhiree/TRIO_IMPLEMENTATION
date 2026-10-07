@@ -1,5 +1,6 @@
 """
 TRIO — Tests for Screenshot Analyzer
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

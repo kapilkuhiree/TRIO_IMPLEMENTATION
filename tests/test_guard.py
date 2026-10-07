@@ -1,5 +1,6 @@
 """
 TRIO — Unit tests for the Active Manager (Guard logic).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

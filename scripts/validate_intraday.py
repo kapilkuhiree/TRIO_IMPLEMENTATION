@@ -1,5 +1,6 @@
 """
 TRIO — Intraday (15m) variant validation.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Problem: the daily pullback setup (200/50 SMAs) was validated out-of-sample
 on 5y of daily bars. The intraday variant (50/20 SMAs on 15m bars) was built

@@ -1,5 +1,6 @@
 """
 TRIO — Risk Manager
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Handles position sizing, stop-loss / take-profit calculations,
 trailing stops, daily loss limits, exposure caps, and the trading halt switch.
@@ -25,7 +26,9 @@ logger = get_logger("risk_manager")
 
 @dataclass
 class RiskState:
-    """Tracks current risk state across the trading session."""
+    """Tracks current risk state across the trading session.
+    Author: Kapil Kuhire
+    """
     daily_pnl: float = 0.0
     open_positions: int = 0
     positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # symbol -> position info

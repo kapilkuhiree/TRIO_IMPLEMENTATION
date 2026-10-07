@@ -1,4 +1,6 @@
-"""Sweep TIME_STOP_BARS on the 21-day NIFTY 15m replay; report P&L per setting."""
+"""Sweep TIME_STOP_BARS on the 21-day NIFTY 15m replay; report P&L per setting.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+"""
 import sys
 from pathlib import Path
 import logging

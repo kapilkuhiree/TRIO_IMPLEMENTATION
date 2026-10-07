@@ -1,5 +1,6 @@
 """
 TRIO — Out-of-sample validation for the wide-stop/small-target family.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Why this exists: the sweep found configurations with ~80% win rate AND a
 profit factor above 1. Those were selected by looking at the whole 5y sample,

@@ -1,5 +1,6 @@
 """
 TRIO — Intraday session replay with end-of-day P&L.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 What this does
 --------------

@@ -1,5 +1,6 @@
 """
 TRIO — Telegram alert tests (no network: send_telegram is mocked).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

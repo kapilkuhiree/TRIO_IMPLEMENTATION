@@ -1,5 +1,6 @@
 """
 TRIO — Daily audit digest (GitHub Actions, after close)
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Reads the trade log, summarizes today's (IST) session and sends it to
 Telegram. This is the evening review loop: what traded, PASS/FAIL, win

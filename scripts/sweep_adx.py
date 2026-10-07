@@ -1,4 +1,5 @@
 """Sweep ADX regime-filter threshold on the 21-day NIFTY 15m replay.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 The regime gate (min_adx) refuses entries when ADX trend-strength is
 below threshold — Sep 10-11 style losses came from trading chop.

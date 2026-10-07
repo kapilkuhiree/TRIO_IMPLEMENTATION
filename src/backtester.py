@@ -1,5 +1,6 @@
 """
 TRIO — Backtester
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Runs the trading strategy on historical data and reports key metrics:
 win rate, profit factor, max drawdown, Sharpe ratio, and total return.
@@ -35,7 +36,9 @@ logger = get_logger("backtester")
 
 @dataclass
 class BacktestTrade:
-    """Record of a single backtest trade."""
+    """Record of a single backtest trade.
+    Author: Kapil Kuhire
+    """
     entry_idx: int = 0
     exit_idx: int = 0
     action: str = ""           # BUY or SELL
@@ -51,7 +54,9 @@ class BacktestTrade:
 
 @dataclass
 class BacktestResult:
-    """Aggregated backtest results."""
+    """Aggregated backtest results.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     timeframe: str = ""
     period: str = ""

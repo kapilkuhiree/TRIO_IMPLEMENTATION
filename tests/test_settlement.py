@@ -1,5 +1,6 @@
 """
 TRIO — Settlement-rule tests (no naked shorts on a CNC-style account).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

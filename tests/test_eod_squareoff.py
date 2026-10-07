@@ -1,5 +1,6 @@
 """
 TRIO — EOD square-off tests (2026-10-06 regression).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 On 2026-10-06 the trading loop kept 2 positions open 25 minutes past
 the 15:15 IST close: no exit, no PASS/FAIL record, no Telegram alert —

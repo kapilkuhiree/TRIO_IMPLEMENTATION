@@ -1,5 +1,6 @@
 """
 TRIO — Trade Plan I/O
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 The overnight premarket job ranks the universe on daily bars and writes one
 plan per trading day. The session job reads that plan at the open and places

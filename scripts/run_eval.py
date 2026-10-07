@@ -1,5 +1,6 @@
 """
 TRIO — real-data evaluation harness (temporary diagnostic script).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Runs the backtester over a set of symbols/timeframes and dumps metrics to JSON
 so results can be inspected without terminal formatting noise.

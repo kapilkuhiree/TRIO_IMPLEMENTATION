@@ -1,5 +1,6 @@
 """
 TRIO — Cross Checker
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Verifies that values extracted from a screenshot (price, trend, indicators)
 match live market data. Produces a trust score.
@@ -24,7 +25,9 @@ logger = get_logger("cross_checker")
 
 @dataclass
 class CrossCheckResult:
-    """Result of cross-checking screenshot context against live data."""
+    """Result of cross-checking screenshot context against live data.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     price_match: bool = True
     price_deviation_pct: float = 0.0

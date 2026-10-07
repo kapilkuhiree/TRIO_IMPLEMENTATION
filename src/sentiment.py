@@ -1,5 +1,6 @@
 """
 TRIO — Sentiment Analysis
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Fetches financial news and social media posts, scores sentiment using
 VADER (lightweight) or FinBERT (accurate), and aggregates into a single
@@ -60,7 +61,9 @@ def _set_cache(symbol: str, data: Dict[str, Any]) -> None:
 
 @dataclass
 class SentimentSource:
-    """A single sentiment data point from one source."""
+    """A single sentiment data point from one source.
+    Author: Kapil Kuhire
+    """
     source: str = ""          # newsapi, reddit, finnhub
     text: str = ""            # headline or post
     score: float = 0.0        # -1 to +1
@@ -73,7 +76,9 @@ class SentimentSource:
 
 @dataclass
 class SentimentResult:
-    """Aggregated sentiment result for a symbol."""
+    """Aggregated sentiment result for a symbol.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     score: float = 0.0        # -1 to +1 weighted aggregate
     label: str = "neutral"    # very_negative, negative, neutral, positive, very_positive

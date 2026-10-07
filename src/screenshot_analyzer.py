@@ -1,5 +1,6 @@
 """
 TRIO — Screenshot Analyzer
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Uses a vision model (OpenAI GPT-4o, Google Gemini, etc.) to extract trading
 context from a market chart screenshot.
@@ -27,7 +28,9 @@ logger = get_logger("screenshot_analyzer")
 
 @dataclass
 class ScreenshotContext:
-    """Structured output from vision model analysis of a chart screenshot."""
+    """Structured output from vision model analysis of a chart screenshot.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     timeframe: str = ""
     current_price: Optional[float] = None

@@ -1,5 +1,6 @@
 """
 TRIO — Screener tests.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 The screener ranks sized signals and returns only the best. Tests use
 hand-built signals so no network is needed.

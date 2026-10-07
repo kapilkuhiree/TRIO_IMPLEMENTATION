@@ -1,5 +1,6 @@
 """
 TRIO — Unit tests for the signal engine.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 These tests use config_override so they do not depend on config.yaml weights.
 """

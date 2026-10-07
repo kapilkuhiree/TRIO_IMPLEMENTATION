@@ -1,5 +1,6 @@
 """
 TRIO — Session job (GitHub Actions)
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Runs during the NSE session. Reads today's plan (written by the premarket
 job), places the plan at the open, rebuilds stop/target state, then manages

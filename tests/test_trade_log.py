@@ -1,5 +1,6 @@
 """
 TRIO — Trade-log tests: every audit event lands in the JSONL file.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import json

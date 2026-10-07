@@ -1,4 +1,5 @@
 """Aggregate ONLY blocks 15-25 (one consistent 60-day calendar).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Blocks 1-14 were computed on an older 36-session calendar; blocks 15-25 on
 the newer 49-session calendar. Mixing them double-counts overlapping dates.

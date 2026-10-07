@@ -1,5 +1,6 @@
 """
 TRIO — Screener
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Scans a basket of symbols, scores every setup by quality, and returns only
 the best candidates. The paper trader executes the top N; everything else
@@ -133,7 +134,9 @@ def resolve_basket(spec: Any) -> List[str]:
 
 @dataclass
 class RankedCandidate:
-    """An actionable signal with its rank score and sizing attached."""
+    """An actionable signal with its rank score and sizing attached.
+    Author: Kapil Kuhire
+    """
     rank: float = 0.0
     signal: Optional[TradeSignal] = None
     edge_atr: float = 0.0          # entry-to-stop distance in ATR units

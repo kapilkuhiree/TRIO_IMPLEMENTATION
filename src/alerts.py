@@ -1,5 +1,6 @@
 """
 TRIO — Alerts
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Send trading signal notifications via Telegram or email.
 

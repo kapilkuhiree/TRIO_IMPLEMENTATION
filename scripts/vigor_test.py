@@ -1,5 +1,6 @@
 """
 TRIO — Robust Backtest Evaluator
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 Runs the verified strategy (daily pullback) on 2yr history.
 """
 

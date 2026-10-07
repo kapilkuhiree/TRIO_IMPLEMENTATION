@@ -1,5 +1,6 @@
 """
 TRIO — Technical Indicators
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Calculates trend, momentum, volatility, and volume indicators on OHLCV data.
 All parameters are configurable via config.yaml.
@@ -27,7 +28,9 @@ logger = get_logger("indicators")
 
 @dataclass
 class IndicatorReading:
-    """Single indicator value and its signal."""
+    """Single indicator value and its signal.
+    Author: Kapil Kuhire
+    """
     value: Any = None
     signal: str = "neutral"  # bullish / bearish / neutral / info
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -39,7 +42,9 @@ class IndicatorReading:
 
 @dataclass
 class TechnicalReadings:
-    """Complete set of technical indicator readings for a symbol."""
+    """Complete set of technical indicator readings for a symbol.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     timeframe: str = ""
     computed_at: str = ""

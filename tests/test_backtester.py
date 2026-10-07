@@ -1,5 +1,6 @@
 """
 TRIO — Backtester Tests (synthetic data)
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import sys

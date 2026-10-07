@@ -1,4 +1,5 @@
 """TRIO — 60-day walk-forward harness: trade 2 days, analyse, repeat.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 YOUR plan, enforced by code:
   Phase 1 (days 1-20, blocks 1-10): run each 2-day block, write a per-block

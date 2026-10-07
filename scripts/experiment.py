@@ -1,5 +1,6 @@
 """
 TRIO — Strategy experiment harness (diagnostic tool, not part of the app).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Purpose: stop guessing at parameters. Cache market data once, then evaluate
 several strategy variants on identical data so results are comparable.

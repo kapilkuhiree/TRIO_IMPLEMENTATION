@@ -1,5 +1,6 @@
 """
 TRIO — Zerodha Kite Broker Adapter (Stub)
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 This is a placeholder for the Zerodha Kite Connect integration.
 Real order execution is DISABLED by default and requires explicit
@@ -27,6 +28,7 @@ class ZerodhaBroker(BaseBroker):
 
     WARNING: This adapter can place real orders with real money.
     Only enable live_trading=True after thorough testing.
+    Author: Kapil Kuhire
     """
 
     def __init__(self, live_trading: bool = False):

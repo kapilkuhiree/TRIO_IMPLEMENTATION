@@ -1,5 +1,6 @@
 """
 TRIO — Session-hours guard tests.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 The paper loop must not open NEW positions outside 09:20–15:10 IST
 (the live 21:23 SELL filled on stale candles; 15:10 gives MIS margin

@@ -1,5 +1,6 @@
 """
 TRIO — Abstract Broker Interface
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Defines the contract that all broker adapters must implement.
 This ensures any broker (paper, Zerodha, Alpaca, IBKR, etc.) can be
@@ -15,7 +16,9 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class BrokerOrder:
-    """Represents a broker order."""
+    """Represents a broker order.
+    Author: Kapil Kuhire
+    """
     order_id: str = ""
     symbol: str = ""
     side: str = ""                # BUY or SELL
@@ -36,7 +39,9 @@ class BrokerOrder:
 
 @dataclass
 class Position:
-    """Represents an open position."""
+    """Represents an open position.
+    Author: Kapil Kuhire
+    """
     symbol: str = ""
     side: str = ""
     quantity: int = 0
@@ -56,6 +61,7 @@ class BaseBroker(ABC):
     Abstract base class for all broker adapters.
 
     Any broker integration must implement these methods.
+    Author: Kapil Kuhire
     """
 
     @abstractmethod

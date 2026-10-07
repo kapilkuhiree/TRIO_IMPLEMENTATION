@@ -1,5 +1,6 @@
 """
 TRIO — Premarket job (GitHub Actions)
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Run after the NSE close (cron), Mon–Fri. Ranks the configured universe on
 daily bars, writes output/plans/YYYY-MM-DD.json for the next session, and

@@ -1,5 +1,6 @@
 """
 TRIO — Paper Trader
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Runs the full signal pipeline in a loop at configurable intervals,
 generating signals and simulating trades via the paper broker.
@@ -34,6 +35,7 @@ class PaperTrader:
     Usage:
         trader = PaperTrader(symbols=["RELIANCE.NS", "TCS.NS"])
         trader.run(interval_seconds=300)
+    Author: Kapil Kuhire
     """
 
     def __init__(

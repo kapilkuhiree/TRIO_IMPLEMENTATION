@@ -1,5 +1,6 @@
 """
 TRIO — Open-broadcast tests (no network: requests + store mocked).
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import json

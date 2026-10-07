@@ -1,5 +1,6 @@
 """
 TRIO — Unit tests for the risk manager.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Tests pass an explicit config_override wherever a numeric threshold matters, so
 they verify behaviour rather than the current contents of config.yaml.

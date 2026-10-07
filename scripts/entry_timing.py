@@ -1,4 +1,5 @@
 """Measure WHERE in the session entries come from and what they make.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 For each trade in the 21-day NIFTY 15m replay: entry bar index (0 = 09:15),
 exit reason, P&L. Then bucket by entry-bar to see if early-session entries

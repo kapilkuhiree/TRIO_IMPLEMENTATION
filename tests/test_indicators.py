@@ -1,5 +1,6 @@
 """
 TRIO — Unit tests for indicators module.
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
 
 import numpy as np
