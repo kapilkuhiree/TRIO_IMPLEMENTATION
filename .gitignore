@@ -36,10 +36,13 @@ logs/
 
 # The bot persists its audit trail back to the repo. Everything else in
 # output/ (caches, test sidecars, contaminated archives) stays ignored.
+# NOTE: trade_log.jsonl/csv + dashboard_state.json are tracked ONLY because
+# the bot commits its own state (Dec 2026 fix pending to move state off the
+# repo entirely). Local dev sessions must never grow them — run pytest with
+# --basetemp outside the repo (done in CI) and never main.py loops locally
+# without TRIO_TEST_MODE=1.
 output/*
 !output/plans/
-!output/trade_log.jsonl
-!output/trade_log.csv
 !output/dashboard_state.json
 output/plans/*
 !output/plans/*.json
