@@ -866,6 +866,7 @@ class PaperTrader:
                                     "rank": cand.get("rank"),
                                     "setup": cand.get("setup_name"),
                                     "shadow": True,
+                                    "venue": "local-sim",
                                 }
                                 placed.append(record)
                                 self._log_event("order", record)
@@ -888,6 +889,8 @@ class PaperTrader:
                     "order_id": order.order_id,
                     "rank": cand.get("rank"),
                     "setup": cand.get("setup_name"),
+                    "venue": getattr(
+                        opt_broker, "provider_name", "options_paper"),
                 }
                 placed.append(record)
                 self._log_event("order", record)

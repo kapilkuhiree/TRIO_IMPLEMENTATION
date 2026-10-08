@@ -207,9 +207,38 @@ def main() -> None:
                 if which == "megabull":
                     logger.info("Options broker: local paper sim "
                                 "(MegaBull legs rejected — shadow only).")
-            trader.execute_option_plan(plan, opt_broker=opt_broker)
+            placed_opt = trader.execute_option_plan(plan,
+                                                      opt_broker=opt_broker)
             # expose to the guard loop below
             trader.opt_broker = opt_broker
+            # Loud routing verdict for Telegram: the user asked whether
+            # MegaBull really holds the NIFTY spread, so say WHERE each
+            # spread landed — remote (with the MegaBull umbrella order id)
+            # or local shadow (with the refusal reason). Never silent.
+            try:
+                from src.alerts import send_telegram as _tg
+                _opt_status = []
+                for _r in placed_opt or []:
+                    _venue = str(_r.get("venue", ""))
+                    if _r.get("shadow") or "paper" in _venue.lower():
+                        _opt_status.append(
+                            f"🧪 {_r.get('symbol')}: "
+                            f"{_r.get('strategy')} shadow LOCAL SIM "
+                            f"(MegaBull refused legs) "
+                            f"debit {_r.get('net_debit')} lots "
+                            f"{_r.get('lots')}")
+                    else:
+                        _opt_status.append(
+                            f"🎯 {_r.get('symbol')}: "
+                            f"{_r.get('strategy')} ON MEGABULL PAPER "
+                            f"{_r.get('order_id')} debit "
+                            f"{_r.get('net_debit')} lots {_r.get('lots')} "
+                            f"— check the MegaBull app")
+                if _opt_status:
+                    _tg("*Options routing — where the NIFTY spread sits:*\n"
+                        + "\n".join(_opt_status))
+            except Exception as _tg_exc:
+                logger.warning("Options routing alert failed: %s", _tg_exc)
     except Exception as exc:
         logger.warning("Options overlay failed: %s", exc)
 
