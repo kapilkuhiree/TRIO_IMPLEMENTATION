@@ -1,5 +1,6 @@
 """
 TRIO — Alerts
+Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Send trading signal notifications via Telegram or email.
 
@@ -8,6 +9,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import json
 import logging
+import os
 import smtplib
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -55,6 +57,14 @@ def send_telegram(message: str, config_override: Optional[Dict[str, Any]] = None
     Returns:
         True if sent successfully.
     """
+    # Unit/smoke tests must NEVER ping the real bot. conftest sets
+    # TRIO_TEST_MODE=1 for the whole suite; combined with the sidecar
+    # trade ledger this keeps the suite hermetic (2026-10-08: a local
+    # pytest run sent live entry/exit Telegram messages).
+    if os.environ.get("TRIO_TEST_MODE") == "1" and config_override is None:
+        logger.debug("Telegram suppressed in test mode")
+        return False
+
     cfg = load_config()
     tg_cfg = config_override or cfg.get("alerts", {}).get("telegram", {})
 
@@ -297,6 +307,10 @@ def send_email(
     Returns:
         True if sent successfully.
     """
+    if os.environ.get("TRIO_TEST_MODE") == "1" and config_override is None:
+        logger.debug("Email suppressed in test mode")
+        return False
+
     cfg = load_config()
     em_cfg = config_override or cfg.get("alerts", {}).get("email", {})
 

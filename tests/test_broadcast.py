@@ -76,7 +76,8 @@ def test_broadcast_reaches_all_ids(tmp_path):
 
     with patch("src.alerts.load_config", return_value=_cfg(sub)), \
          patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "T",
-                                   "TELEGRAM_CHAT_ID": "111"}), \
+                                   "TELEGRAM_CHAT_ID": "111",
+                                   "TRIO_TEST_MODE": ""}), \
          patch("requests.post", side_effect=fake_post):
         assert alerts.send_telegram("hello") is True
     assert sorted(calls) == ["111", "222"]
@@ -99,7 +100,8 @@ def test_blocked_recipient_does_not_break_others(tmp_path):
 
     with patch("src.alerts.load_config", return_value=_cfg(sub)), \
          patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "T",
-                                   "TELEGRAM_CHAT_ID": "111"}), \
+                                   "TELEGRAM_CHAT_ID": "111",
+                                   "TRIO_TEST_MODE": ""}), \
          patch("requests.post", side_effect=fake_post):
         assert alerts.send_telegram("hello") is True
     # 222 blocked (403): removed immediately, 111 unaffected.
@@ -125,7 +127,8 @@ def test_three_strikes_removes_id(tmp_path):
 
     with patch("src.alerts.load_config", return_value=_cfg(sub)), \
          patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "T",
-                                   "TELEGRAM_CHAT_ID": "111"}), \
+                                   "TELEGRAM_CHAT_ID": "111",
+                                   "TRIO_TEST_MODE": ""}), \
          patch("requests.post", side_effect=fake_post):
         alerts.send_telegram("hello")
     assert "222" not in json.loads(Path(sub).read_text(encoding="utf-8"))["chats"]
@@ -143,7 +146,8 @@ def test_missing_store_falls_back_to_env_single_id(tmp_path):
 
     with patch("src.alerts.load_config", return_value=_cfg(missing)), \
          patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "T",
-                                   "TELEGRAM_CHAT_ID": "999"}), \
+                                   "TELEGRAM_CHAT_ID": "999",
+                                   "TRIO_TEST_MODE": ""}), \
          patch("requests.post", side_effect=fake_post):
         assert alerts.send_telegram("hello") is True
     assert sent == ["999"]

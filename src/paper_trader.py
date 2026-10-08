@@ -822,10 +822,10 @@ class PaperTrader:
                     confidence=int(opt.get("confidence")
                                    or cand.get("confidence") or 0))
                 risk_amt = float(cand.get("risk_amount") or 0.0)
+                lot_sz = int(load_config().get("options", {}).get(
+                    "lot_size", 50))
                 lots = 1
                 if pick.net_debit > 0 and risk_amt > 0:
-                    lot_sz = int(load_config().get("options", {}).get(
-                        "lot_size", 50))
                     lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
                 order = opt_broker.open_spread(pick, lots=lots,
                                                reason="options-plan")
@@ -834,6 +834,51 @@ class PaperTrader:
                         "symbol": cand.get("symbol"), "asset": "options",
                         "strategy": pick.strategy,
                         "reason": f"rejected: {order.error}"})
+                    # MegaBull silently rejects option legs (endpoint
+                    # refused lots=1/units=50/75 on 2026-10-08). When the
+                    # remote broker is selected but a leg can't fill, keep
+                    # the LOCAL paper sim as the shadow book so the
+                    # overlay's P&L/marking stays testable and the equity
+                    # session is never blocked.
+                    if "megabull" in str(
+                            getattr(opt_broker, "provider_name", "")).lower():
+                        try:
+                            from src.broker.options_paper import (
+                                OptionsPaperBroker)
+                            shadow = OptionsPaperBroker(
+                                initial_capital=self.broker.capital
+                                if hasattr(self.broker, "capital")
+                                else 500000.0,
+                                lot_size=lot_sz)
+                            s_order = shadow.open_spread(
+                                pick, lots=lots, reason="options-shadow")
+                            if s_order.status == "FILLED":
+                                record = {
+                                    "symbol": cand.get("symbol"),
+                                    "asset": "options",
+                                    "strategy": pick.strategy,
+                                    "expiry": pick.expiry,
+                                    "net_debit": pick.net_debit,
+                                    "lots": lots,
+                                    "maxLoss": pick.maxLoss,
+                                    "maxGain": pick.maxGain,
+                                    "order_id": s_order.order_id,
+                                    "rank": cand.get("rank"),
+                                    "setup": cand.get("setup_name"),
+                                    "shadow": True,
+                                }
+                                placed.append(record)
+                                self._log_event("order", record)
+                                if not hasattr(self, "_opt_shadows"):
+                                    self._opt_shadows = []
+                                self._opt_shadows.append((shadow, s_order))
+                                logger.info(
+                                    "options-shadow booked locally for %s "
+                                    "(MegaBull leg rejected).",
+                                    cand.get("symbol"))
+                        except Exception as sh_exc:
+                            logger.warning(
+                                "Options shadow fallback failed: %s", sh_exc)
                     continue
                 record = {
                     "symbol": cand.get("symbol"), "asset": "options",

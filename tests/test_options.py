@@ -114,6 +114,120 @@ def test_options_paper_open_close():
     assert rec["asset"] == "options"
 
 
+def test_megabull_option_symbol_mapping():
+    """Leg -> MegaBull trading symbol, proven from their live instrument
+    list (1070 NIFTY rows): NIFTY13OCT22250PE is 'NIFTY26O1322250PE'."""
+    from src.broker.megabull_options import option_symbol
+    assert option_symbol("NIFTY", "13-Oct-2026", 22250, "PE") == \
+        "NIFTY26O1322250PE"
+    assert option_symbol("NIFTY", "13-Oct-2026", 22000, "PE") == \
+        "NIFTY26O1322000PE"
+    assert option_symbol("NIFTY", "13-Oct-2026", 22250, "CE") == \
+        "NIFTY26O1322250CE"
+    assert option_symbol("NIFTY", "27-Oct-2026", 23000, "CE") == \
+        "NIFTY26O2723000CE"
+
+
+class _MegaStub:
+    """Offline stand-in for MegaBullBroker (no network, no key)."""
+
+    def __init__(self, fail_all=False):
+        self.positions = {}
+        self.orders = {}
+        self.fail_all = fail_all
+        self.posts = []
+        self.capital = 500000.0
+        self.provider_name = "megabull"
+
+    def token_for(self, symbol):
+        if self.fail_all:
+            raise RuntimeError("sim refused option orders")
+        return "9" + str(abs(hash(symbol)) % 10**7)
+
+    def place_order(self, symbol, side, quantity, order_type="MKT",
+                    price=None, reason="order", **kw):
+        self.posts.append({"symbol": symbol, "side": side,
+                           "qty": quantity})
+        if self.fail_all:
+            from src.broker.base import BrokerOrder
+            return BrokerOrder(order_id="rej", symbol=symbol, side=side,
+                               quantity=quantity, status="REJECTED",
+                               broker="megabull", error="sim refused")
+        from src.broker.base import BrokerOrder, Position
+        from src.utils import utc_now
+        o = BrokerOrder(order_id=f"mb_{len(self.posts)}", symbol=symbol,
+                        side=side, quantity=quantity, status="FILLED",
+                        broker="megabull", placed_at=utc_now(),
+                        filled_at=utc_now())
+        self.orders[o.order_id] = o
+        self.positions[symbol] = Position(
+            symbol=symbol, side="LONG" if side == "BUY" else "SHORT",
+            quantity=quantity, avg_price=price or 0.0,
+            current_price=price or 0.0)
+        return o
+
+    def close_position(self, symbol, price, reason="close", fraction=1.0):
+        pos = self.positions.pop(symbol, None)
+        if pos is None:
+            return {}
+        return {"symbol": symbol, "qty": pos.quantity, "exit": price}
+
+
+def test_megabull_options_opens_both_legs(tmp_path):
+    """Happy path on the fake remote: both legs placed by MegaBull symbol."""
+    from src.broker.megabull_options import MegaBullOptionsBroker
+    sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
+                      confidence=80)
+    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    mega = _MegaStub()
+    b = MegaBullOptionsBroker(mega, lot_size=50)
+    o = b.open_spread(pick, lots=1)
+    assert o.status == "FILLED"
+    syms = [p["symbol"] for p in mega.posts]
+    assert len(syms) == 2
+    assert all(s.startswith("NIFTY26O30") and
+               (s.endswith("CE") or s.endswith("PE")) for s in syms)
+    sid = list(b.positions.keys())[0]
+    b.mark_spread(sid, pick.net_debit + 10.0)
+    rec = b.close_spread(sid, pick.net_debit + 10.0, "test")
+    assert rec["result"] == "PASS" and rec["asset"] == "options"
+    assert not mega.positions, "remote legs must flatten on close"
+
+
+def test_megabull_options_rejects_without_network(tmp_path):
+    """The 2026-10-08 silent-fallback: when MegaBull refuses option legs
+    (endpoint rejects all lots/units variants), open_spread reports
+    REJECTED and leaves NO orphan leg behind — the session then books the
+    local shadow sim and keeps running."""
+    from src.broker.megabull_options import MegaBullOptionsBroker
+    from src.paper_trader import PaperTrader
+    from src.broker.paper import PaperBroker
+    sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
+                      confidence=80)
+    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+
+    mega = _MegaStub(fail_all=True)
+    b = MegaBullOptionsBroker(mega, lot_size=50)
+    o = b.open_spread(pick, lots=1)
+    assert o.status == "REJECTED"
+    assert not b.positions, "partial spread must not linger"
+
+    # full session wiring: remote rejects -> local shadow books the P&L
+    trader = PaperTrader(symbols=["NIFTY"], test_mode=False)
+    trader.trade_log_path = tmp_path / "trade_log.jsonl"
+    trader.broker = PaperBroker(initial_capital=500000.0)
+    trader.broker_name = "paper"
+    plan = _bear_plan()
+    placed = trader.execute_option_plan(plan, opt_broker=b)
+    shadows = [r for r in placed if r.get("shadow")]
+    assert len(shadows) == 1
+    assert len(getattr(trader, "_opt_shadows", [])) == 1
+    lines = [json.loads(x) for x in
+             (tmp_path / "trade_log.jsonl").read_text().splitlines() if x]
+    orders = [r for r in lines if r.get("event") == "order"]
+    assert any(o.get("asset") == "options" for o in orders)
+
+
 def _bear_plan(cand_symbol="NIFTY"):
     """One candidate carrying a real bear-put option_legs block."""
     sig = TradeSignal(symbol=cand_symbol, action="SELL",

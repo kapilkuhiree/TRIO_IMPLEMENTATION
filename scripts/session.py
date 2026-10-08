@@ -162,26 +162,56 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Startup good-morning alert failed: %s", exc)
 
-    # Options paper overlay (shadow until proven): place spreads for
-    # candidates carrying option_legs, on the options paper broker only.
-    # Equity flow below is untouched. Spreads are marked to the live chain
-    # mid on every guard tick and squared off at EOD alongside equities.
+    # Options overlay (shadow until proven): place spreads for candidates
+    # carrying option_legs. Broker comes from config `options.broker`:
+    # "paper" (default) keeps the local options_paper sim; "megabull"
+    # routes both legs to the MegaBull remote paper account so the user
+    # can SEE the NIFTY spread in the MegaBull app. Equity flow below is
+    # untouched either way. Until MegaBull accepts option orders (their
+    # buysell rejected every lots/units variant on 2026-10-08) the
+    # MegaBull leg failures skip SILENTLY — the local paper sim still
+    # books the P&L, so the overlay never blocks the equity session.
+    # Spreads are marked to the live chain mid on every guard tick and
+    # squared off at EOD alongside equities.
     opt_broker = None
     try:
         opt_cfg = cfg.get("options", {}) or {}
         if opt_cfg.get("enabled", True) and plan is not None and any(
                 (c.get("option_legs") or {}).get("strategy") not in
                 (None, "", "none") for c in plan.get("candidates", []) or []):
-            from src.broker.options_paper import OptionsPaperBroker
-            opt_broker = OptionsPaperBroker(
-                initial_capital=(cfg.get("risk_management", {}) or {}).get(
-                    "capital", 500000),
-                lot_size=int(opt_cfg.get("lot_size", 50)))
+            which = str(opt_cfg.get("broker", "paper")).strip().lower()
+            opt_lot = int(opt_cfg.get("lot_size", 50))
+            if which == "megabull":
+                try:
+                    from src.broker.megabull_options import (
+                        MegaBullOptionsBroker)
+                    eq = getattr(trader, "broker", None)
+                    if "megabull" not in str(
+                            getattr(eq, "provider_name", "")).lower():
+                        raise RuntimeError(
+                            "equity broker is not MegaBull; remote option "
+                            "legs need the MegaBull account")
+                    opt_broker = MegaBullOptionsBroker(eq, lot_size=opt_lot)
+                    logger.info("Options broker: MegaBull remote paper.")
+                except Exception as exc:
+                    logger.warning(
+                        "MegaBull options broker unavailable (%s) — "
+                        "falling back to local paper sim.", exc)
+                    opt_broker = None
+            if opt_broker is None:
+                from src.broker.options_paper import OptionsPaperBroker
+                opt_broker = OptionsPaperBroker(
+                    initial_capital=(cfg.get("risk_management", {}) or {}).get(
+                        "capital", 500000),
+                    lot_size=opt_lot)
+                if which == "megabull":
+                    logger.info("Options broker: local paper sim "
+                                "(MegaBull legs rejected — shadow only).")
             trader.execute_option_plan(plan, opt_broker=opt_broker)
             # expose to the guard loop below
             trader.opt_broker = opt_broker
     except Exception as exc:
-        logger.warning("Options paper overlay failed: %s", exc)
+        logger.warning("Options overlay failed: %s", exc)
 
     # run_session places the plan, restores SL/TP state, and loops guards.
     # The options overlay marks live-chain mid every tick and EOD-squares
@@ -248,23 +278,34 @@ def _chain_mid_for(spread_id: str, legs: list, expiry: str,
 
 
 def _manage_options(trader, opt_broker, cfg) -> None:
-    """Mark every open spread to live-chain mid (theta captured intraday)."""
-    if opt_broker is None:
-        return
-    try:
-        positions = list(getattr(opt_broker, "positions", {}).keys())
-    except Exception:
-        return
-    for sid in positions:
+    """Mark every open spread to live-chain mid (theta captured intraday).
+
+    Includes the local shadow book (kept when MegaBull legs reject) so
+    shadow spreads track the same mid and square off at EOD with the
+    rest — one mark loop, both books.
+    """
+    brokers = [b for b in [opt_broker] +
+               list(getattr(trader, "_opt_shadows", []) or [])
+               if b is not None]
+    # _opt_shadows holds (broker, order) tuples; unwrap to brokers.
+    flat = []
+    for b in brokers:
+        flat.append(b[0] if isinstance(b, tuple) else b)
+    for br in dict.fromkeys(flat):
         try:
-            detail = (getattr(opt_broker, "spreads", {}) or {}).get(sid) or {}
-            legs = detail.get("legs") or []
-            expiry = detail.get("expiry", "")
-            mid = _chain_mid_for(sid, legs, expiry)
-            if mid is not None:
-                opt_broker.mark_spread(sid, mid)
+            positions = list(getattr(br, "positions", {}).keys())
         except Exception:
             continue
+        for sid in positions:
+            try:
+                detail = (getattr(br, "spreads", {}) or {}).get(sid) or {}
+                legs = detail.get("legs") or []
+                expiry = detail.get("expiry", "")
+                mid = _chain_mid_for(sid, legs, expiry)
+                if mid is not None:
+                    br.mark_spread(sid, mid)
+            except Exception:
+                continue
 
 
 def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
@@ -283,16 +324,30 @@ def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
         sids = list(getattr(opt_broker, "positions", {}).keys())
     except Exception:
         return 0
-    for sid in sids:
+    # main book plus local shadows (MegaBull legs rejected)
+    brokers = [opt_broker]
+    if trader is not None:
+        for item in list(getattr(trader, "_opt_shadows", []) or []):
+            brokers.append(item[0] if isinstance(item, tuple) else item)
+    sids_all = []
+    for br in brokers:
+        if br is None:
+            continue
         try:
-            detail = (getattr(opt_broker, "spreads", {}) or {}).get(sid) or {}
+            for sid in list(getattr(br, "positions", {}).keys()):
+                sids_all.append((br, sid))
+        except Exception:
+            continue
+    for br, sid in sids_all:
+        try:
+            detail = (getattr(br, "spreads", {}) or {}).get(sid) or {}
             legs = detail.get("legs") or []
             mid = _chain_mid_for(sid, legs, detail.get("expiry", ""))
             if mid is None:
                 # stale chain: close at last mark
-                pos = opt_broker.positions.get(sid)
+                pos = br.positions.get(sid)
                 mid = float(pos.current_price or pos.avg_price or 0.0)
-            rec = opt_broker.close_spread(sid, mid, reason)
+            rec = br.close_spread(sid, mid, reason)
             if rec:
                 n += 1
                 if trader is not None:

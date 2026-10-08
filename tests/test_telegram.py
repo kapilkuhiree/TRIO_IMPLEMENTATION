@@ -109,7 +109,10 @@ def test_exit_message_pass_fail():
     assert "FAIL" in msg2 and "-10" in msg2
 
 
-def test_send_signal_alert_calls_telegram():
+def test_send_signal_alert_calls_telegram(monkeypatch):
+    # conftest pins TRIO_TEST_MODE=1; the suppression must yield to an
+    # explicit live call in these tests, which simulate production.
+    monkeypatch.delenv("TRIO_TEST_MODE", raising=False)
     with patch("src.alerts.send_telegram", return_value=True) as tg, \
          patch("src.alerts.send_email", return_value=True):
         send_signal_alert(_sig())
@@ -118,7 +121,8 @@ def test_send_signal_alert_calls_telegram():
     assert "RELIANCE" in text and "BUY" in text
 
 
-def test_send_exit_alert_calls_telegram():
+def test_send_exit_alert_calls_telegram(monkeypatch):
+    monkeypatch.delenv("TRIO_TEST_MODE", raising=False)
     trade = {"symbol": "TCS.NS", "side": "LONG", "quantity": 5,
              "entry": 2000.0, "exit": 2030.0, "pnl": 150.0,
              "pnl_pct": 1.5, "reason": "target-hit", "result": "PASS"}
@@ -127,6 +131,19 @@ def test_send_exit_alert_calls_telegram():
         send_exit_alert(trade)
     assert tg.call_count == 1
     assert "TCS" in tg.call_args[0][0]
+
+
+def test_alerts_suppressed_in_test_mode(monkeypatch):
+    """No test path may ping the real bot (2026-10-08: a pytest run sent
+    live entry/exit Telegram messages)."""
+    monkeypatch.setenv("TRIO_TEST_MODE", "1")
+    from src.alerts import send_telegram, send_email
+    with patch("requests.post") as post:
+        assert send_telegram("hello") is False
+        post.assert_not_called()
+    with patch("smtplib.SMTP") as smtp:
+        assert send_email("s", "b") is False
+        smtp.assert_not_called()
 
 
 def test_exit_message_has_entry_exit_time_and_held():

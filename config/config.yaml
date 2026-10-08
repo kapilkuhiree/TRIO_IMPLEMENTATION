@@ -100,6 +100,17 @@ screener:
 # Live Kite fills need the Kite Connect plan (~Rs500/mo) + keys in Secrets.
 options:
   enabled: true               # attach option_legs to screened candidates
+  # Which book the index spreads execute on:
+  #   "paper"    -> local options_paper sim (chain-mid fills; legacy)
+  #   "megabull" -> MegaBull remote paper so the NIFTY spread is VISIBLE
+  #                 in the MegaBull app. Probed live 2026-10-08: their
+  #                 buysell rejected every options variant (MIS lot-size
+  #                 error, NRML 500), so if a leg can't fill the overlay
+  #                 unwinds any sister leg and books a LOCAL SHADOW sim
+  #                 instead. Equity flow is never blocked. Revert to
+  #                 "paper" if MegaBull keeps rejecting and you just want
+  #                 the quiet local sim.
+  broker: "megabull"
   underlying: "NIFTY"         # index only (liquid chain, tightest spreads)
   lot_size: 50                # read from Kite NFO at runtime; fallback only
   delta_atm: 0.50             # long leg ~ATM
