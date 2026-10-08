@@ -78,9 +78,14 @@ broker:
 # score zero. An empty screen (nothing met the bar) is normal.
 screener:
   basket: "nifty50"          # basket name in src/screener.py, or a raw list
-  max_positions_to_open: 3
-  min_rank: 40.0
-  min_confidence: 60
+  max_positions_to_open: 2   # sure-only: 2 parallel positions, not 3
+  min_rank: 60.0             # was 40 — filters weak edge
+  min_confidence: 70         # was 60 — requires high conviction; yesterday's 3 had 71/71/66 so only top-2 passed
+  # Shadow thresholds (log-only): compare sure-only vs old and extreme
+  shadow_thresholds:
+    - { name: "legacy_60_40", min_confidence: 60, min_rank: 40 }
+    - { name: "tight_80_100", min_confidence: 80, min_rank: 100 }
+  max_positions_to_open_shadow: 3
 
 timeframes:
   default: "15m"

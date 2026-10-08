@@ -31,9 +31,9 @@ best-first, capped at `max_positions_to_open`.
 
 Config (config.yaml -> screener):
     basket: nifty50            # name in baskets below, or a raw list
-    max_positions_to_open: 3
-    min_rank: 40.0
-    min_confidence: 60
+    max_positions_to_open: 2   # sure-only: was 3, now 2
+    min_rank: 60.0             # was 40
+    min_confidence: 70         # was 60 — yesterday's 3 had 71/71/66
 
 Baskets
 -------
@@ -257,11 +257,11 @@ def screen(symbols: Optional[List[str]] = None,
     if timeframe is None:
         timeframe = cfg.get("timeframes", {}).get("default", "15m")
     if top_n is None:
-        top_n = sc_cfg.get("max_positions_to_open", 3)
+        top_n = sc_cfg.get("max_positions_to_open", 2)
     if min_rank is None:
-        min_rank = sc_cfg.get("min_rank", 40.0)
+        min_rank = sc_cfg.get("min_rank", 60.0)
     if min_confidence is None:
-        min_confidence = sc_cfg.get("min_confidence", 60)
+        min_confidence = sc_cfg.get("min_confidence", 70)
     if use_batch_fetch is None:
         df_cfg = cfg.get("data_fetcher", {})
         use_batch_fetch = df_cfg.get("use_batch_fetch", True) is not False
@@ -297,9 +297,25 @@ def screen(symbols: Optional[List[str]] = None,
                 sig = apply_risk_management(sig, atr_v, swing_level=swing)
                 if sig.action not in ("BUY", "SELL") or not sig.position_size:
                     continue
+                # Ladder targets already set by risk_manager (t1/t2/t3)
                 cand = rank_signal(sig, readings)
                 if cand.rank >= min_rank:
                     scored.append(cand)
+            # Shadow comparison: what would old (60/40) and tight (80/100) have picked?
+            for sh in sc_cfg.get("shadow_thresholds", []) or []:
+                try:
+                    s_name = sh.get("name", "?")
+                    s_min_rank = float(sh.get("min_rank", 40))
+                    s_min_conf = int(sh.get("min_confidence", 60))
+                    s_top = int(sh.get("max_positions_to_open",
+                                        sh.get("top_n", top_n)))
+                    s_picks = [c for c in scored
+                               if c.signal.confidence >= s_min_conf and c.rank >= s_min_rank][:s_top]
+                    logger.info("SHADOW %s: %d would have been picked (conf>=%d rank>=%.0f top%d) — %s",
+                                s_name, len(s_picks), s_min_conf, s_min_rank, s_top,
+                                ", ".join(f"{c.signal.symbol}:{c.signal.action}:{c.rank}" for c in s_picks) or "none")
+                except Exception:
+                    pass
             scored.sort(key=lambda c: c.rank, reverse=True)
             picked = scored[:top_n]
             logger.info("Screen %s %s: %d scanned, %d failed, %d actionable, %d picked",
