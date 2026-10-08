@@ -1,6 +1,5 @@
 """
 TRIO — Paper Trading Broker Adapter
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Simulates order placement and position management in memory.
 This is the DEFAULT broker — no real orders are placed.
@@ -25,7 +24,6 @@ class PaperBroker(BaseBroker):
     Usage:
         broker = PaperBroker(initial_capital=100000)
         order = broker.place_order("RELIANCE.NS", "BUY", 10, price=2845.0)
-    Author: Kapil Kuhire
     """
 
     def __init__(self, initial_capital: float = 100000):

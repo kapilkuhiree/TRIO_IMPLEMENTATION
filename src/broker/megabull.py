@@ -1,6 +1,5 @@
 """
 TRIO — MegaBull Paper Trading Broker Adapter
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Executes TRIO signals on MegaBull's free paper-trading REST API
 (base https://api.megabull.in, auth header `api-key`).
@@ -44,9 +43,7 @@ RETRIES = 2
 
 
 class MegaBullBroker(BaseBroker):
-    """Paper fills executed remotely on the MegaBull simulator.
-    Author: Kapil Kuhire
-    """
+    """Paper fills executed remotely on the MegaBull simulator."""
 
     provider_name = "megabull"
 
@@ -602,9 +599,7 @@ class MegaBullBroker(BaseBroker):
 
 
 class _QuietSession:
-    """Thin wrapper so tests can inject a fake without importing requests.
-    Author: Kapil Kuhire
-    """
+    """Thin wrapper so tests can inject a fake without importing requests."""
 
     def __init__(self) -> None:
         self._s = requests.Session()

@@ -180,6 +180,30 @@ def replay_day(session: pd.DataFrame, symbol: str, tf: str,
         if sig.action not in ("BUY", "SELL"):
             continue
 
+        # SHORT SHADOW (log-only, no fill): records what a short signal
+        # would have done so the 21-day replay can validate the short side
+        # without risking live P&L. Shorts currently flow through the same
+        # composite path as longs when allow_shorts is on. Configured via
+        # config short_shadow.only flag (default False = trade normally).
+        _is_short_shadow = (sig.action == "SELL")
+        if _is_short_shadow:
+            try:
+                import src.utils as _u2
+                _shadow_only = bool(_u2.load_config().get(
+                    "short_shadow", {}).get("only", False))
+            except Exception:
+                _shadow_only = False
+            if _shadow_only:
+                # Record intent; do not open a position.
+                try:
+                    _DBG["n"] += 1
+                    if _DBG["n"] <= 5:
+                        _DBG["lines"].append(
+                            f"short-shadow: {symbol} SELL @ {close:.1f}")
+                except Exception:
+                    pass
+                continue
+
         atr_tup = next((v.value for k, v in readings.indicators.items()
                         if k.startswith("atr_")), None)
         swing = (readings.swing_low if sig.action == "BUY"

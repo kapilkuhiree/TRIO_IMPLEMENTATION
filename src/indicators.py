@@ -251,6 +251,57 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> IndicatorReading:
 
     atr = tr.rolling(window=period).mean()
     val = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else None
+    return IndicatorReading(value=val, signal="info")
+
+
+def calc_iv_rank(df: pd.DataFrame, lookback: int = 252) -> IndicatorReading:
+    """IV-rank proxy from historical volatility percentile (0-100).
+
+    Uses Parkinson (high-low) realized volatility over a rolling window and
+    reports the current HV percentile within `lookback` bars. High IV-rank
+    (>80) means options expensive → filter directional entries. Low IV-rank
+    (<20) means cheap premium → prefer debit spreads.
+
+    Falls back to close-to-close HV if High/Low unavailable.
+    Returns signal "info" always (gate logic lives in screener).
+    """
+    try:
+        n = len(df)
+        if n < 22:
+            return IndicatorReading(value=None, signal="info")
+        window = min(lookback, n)
+        if "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
+            hl = (df["High"] / df["Low"].replace(0, float("nan"))).apply(
+                lambda x: (float(x) if x is not None and x == x and x > 0 else float("nan")))
+            # Parkinson: ln(H/L)
+            import math as _math
+            parkinson = df.apply(
+                lambda r: (_math.log(r["High"] / r["Low"]) ** 2
+                           if r["Low"] and r["Low"] > 0 and r["High"] and r["High"] > 0
+                           else float("nan")), axis=1)
+            hv_series = (parkinson.rolling(21).mean() * 252) ** 0.5 * 100
+        else:
+            rets = df["Close"].pct_change()
+            hv_series = rets.rolling(21).std() * (252 ** 0.5) * 100
+        hv_series = hv_series.dropna()
+        if len(hv_series) < 2:
+            return IndicatorReading(value=None, signal="info")
+        current = float(hv_series.iloc[-1])
+        hist = hv_series.iloc[-window:]
+        lo = float(hist.min())
+        hi = float(hist.max())
+        if hi <= lo:
+            rank = 50.0
+        else:
+            rank = float((current - lo) / (hi - lo) * 100)
+        rank = max(0.0, min(100.0, rank))
+        return IndicatorReading(
+            value=round(rank, 1), signal="info",
+            extra={"hv_current": round(current, 2),
+                   "hv_min": round(lo, 2), "hv_max": round(hi, 2),
+                   "lookback": window})
+    except Exception:
+        return IndicatorReading(value=None, signal="info")
 
     return IndicatorReading(value=val, signal="info")
 
@@ -555,6 +606,13 @@ def compute_indicators(
     atr_period = atr_cfg.get("period", 14)
     if len(df) >= atr_period:
         indicators[f"atr_{atr_period}"] = calc_atr(df, atr_period)
+
+    # --- IV-rank proxy (HV percentile, options-aware gating) ---
+    iv_cfg = vol_cfg.get("iv_rank", {})
+    if iv_cfg.get("enabled", True):
+        lookback = int(iv_cfg.get("lookback", 252))
+        if len(df) >= 22:
+            indicators["iv_rank"] = calc_iv_rank(df, lookback=lookback)
 
     # --- Volume ---
     vol_ind_cfg = ind_cfg.get("volume", {})

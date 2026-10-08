@@ -1,10 +1,8 @@
 """
 TRIO — Session-hours guard tests.
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
-The paper loop must not open NEW positions outside 09:20–15:10 IST
-(the live 21:23 SELL filled on stale candles; 15:10 gives MIS margin
-before the broker's ~15:15 auto square-off). Open positions still get
+The paper loop must not open NEW positions outside 09:20–15:15 IST
+(the live 21:23 SELL filled on stale candles). Open positions still get
 stop/target management — only entries stop. The history-replay tool
 bypasses scan_once entirely, so it is unaffected by design.
 """
@@ -39,8 +37,8 @@ def test_session_open_boundaries():
     assert t._session_open(dtime(9, 19)) is False
     assert t._session_open(dtime(9, 20)) is True
     assert t._session_open(dtime(12, 0)) is True
-    assert t._session_open(dtime(15, 10)) is True
-    assert t._session_open(dtime(15, 11)) is False
+    assert t._session_open(dtime(15, 15)) is True
+    assert t._session_open(dtime(15, 16)) is False
     assert t._session_open(dtime(21, 23)) is False  # the live incident
 
 

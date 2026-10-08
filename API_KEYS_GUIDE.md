@@ -82,7 +82,21 @@ config `broker.provider: "megabull"` (flip with `TRIO_BROKER_PROVIDER=paper`).
   MIS + LIMIT/MKT/SL. No brackets — stop/target exits are our loop's job.
 - Pre smoke checklist (market hours): 1-qty MIS order -> confirm in
   `/api/order/my` + `/api/position/my` -> close -> remote position zero +
-  Telegram exit alert -> reconcile `/api/report/monthly/day/<date>` with log. 
+  Telegram exit alert -> reconcile `/api/report/monthly/day/<date>` with log.
+
+## Ladder scaled exits — Phase 1 live (T1 @ 0.8R)
+Your idea: one winner, three exits. T1 locks half, entry becomes breakeven,
+T2 (1.5R) locks more, T3 (2.5R) rides the run. Scaled exits reduce
+"355 mins to flat at EOD" on a 1.5R miss (today 11/13 flat).
+- Risk: `ladder_targets(entry, stop, action)` -> {T1:0.8R,T2:1.5R,T3:2.5R}.
+  Entry alert: `T1: ... (50% + breakeven) | Full: ...` wiring in `alerts.py`.
+- Trade: Guard @`partial_at_r: 0.8` closes 50% (`partial_fraction: 0.5`) at
+  `partial@T1-0.8R`, moves the rest to breakeven (risk-free). Future phases
+  add T2->T1 and T3 to the same guard. Guard skips MegaBull mirrors.
+- Telegram: `🔹 PARTIAL 50% — ... stop → breakeven` mid-session.
+- Verify 09:20+ entry alerts show the `T1:` line; a 0.8R hit sends the
+  partial alert before the full `CLOSED` one — e.g. ULTRACEMCO held 355m
+  flat would have locked T1 today instead of EOD. 
 
 ## Backtest fully & improve success rate
 We have a working backtester (synthetic-tested). To improve realistically:

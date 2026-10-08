@@ -1,15 +1,24 @@
 TRIO — what we are doing, how, and what is done
 ================================================
-Last updated: 2026-10-06 (evening: MegaBull default, 124/124, both dashboards)
+Last updated: 2026-10-07 (Ladder T1 live, 138/138, today +4569.87)
 
-STATUS: MEGABULL DEFAULT (both dashboards running it)
-- 124 tests passed, all green (both folders), compile clean
-- Broker: megabull default (paper fallback via TRIO_BROKER_PROVIDER=paper)
-- Capital: 500000 (matches MegaBull Rs5L virtual)
-- LIVE :5000 + DEV :5001 — equity Rs500,000 from MegaBull ledger
-- TODO(tomorrow 09:20+ IST): market-hours smoke = first real MIS order +
-  exit alert on phone + reconcile /api/report/monthly/day/<date> vs trade log
-- Rotate MegaBull key (was in chat; shared account Shreyash Laddha)
+STATUS: LADDER T1 LIVE (DEV: TRIO_IMPLEMENTATION_NEW) — synced to MAIN tomorrow
+- 138 tests passed, all green (both folders), compile clean
+- LIVE TRIO_IMPLEMENTATION:5000 was the winner today (+4569.87, 61.5% win, 92 scans)
+  — closed file state is archived; restart required for tomorrow
+- DEV TRIO_IMPLEMENTATION_NEW: ladder Phase 1 built (T1 0.8R 50%+breakeven)
+- Tomorrow before 9 AM: cd TRIO_IMPLEMENTATION; python scripts/dashboard.py --port 5000
+
+DECIDED & BUILT
+---------------
+[x] MegaBull default (megabull.py, 11 mocked tests, CSV 6076, MKT-price fix,
+    fill/exit id-row confirmation, fail-fast 401, real key wired)
+[x] Live-session hardening: side-aware fills, true equity math, hold-skip,
+    EOD square-off, readings classifier, mode/broker log tags
+[x] Ladder Phase 1: T1 @ 0.8R = 50% partial + stop->breakeven (risk-free)
+    Config breakeven_at_r/partial_at_r 1.0 -> 0.8; ladder_targets(); guard
+    semaphores; partial alert 🔹; tests: partial+breakeven, targets
+[ ] Ladder Phase 2 (future): T2 (1.5R->T1) + T3 (2.5R) after 21-day sweep
 
 PHASES
 ------
@@ -17,46 +26,24 @@ PHASES
 [x] Phase 1 screenshot_analyzer
 [x] Phase 2 data_fetcher + indicators + cross_checker (tests added)
 [x] Phase 3 sentiment (VADER + FinBERT optional + cache)
-[x] Phase 4 signal_engine + risk_manager
+[x] Phase 4 signal_engine + risk_manager (ladder targets)
 [x] Phase 5 backtester (synthetic tests)
-[x] Phase 6 paper_trader + paper broker (tests)
+[x] Phase 6 paper_trader + paper broker (guard ladder)
 [x] Phase 7 broker adapters (base + paper + zerodha stub)
 [x] Phase 8 MegaBull adapter default (mocked tests + config + docs)
-[x] Phase 9 live-session hardening: side-aware fills, true equity math,
-    hold-skip, EOD square-off, readings classifier, mode/broker log tags
+[x] Phase 9 live-session hardening + ladder Phase 1
 
-PHASES
-------
-[x] Phase 0 baseline
-[x] Phase 1 screenshot_analyzer
-[x] Phase 2 data_fetcher + indicators + cross_checker (tests added)
-[x] Phase 3 sentiment (VADER + FinBERT optional + cache)
-[x] Phase 4 signal_engine + risk_manager
-[x] Phase 5 backtester (synthetic tests)
-[x] Phase 6 paper_trader + paper broker (tests)
-[x] Phase 7 broker adapters (base + paper + zerodha stub)
-
-FILES
------
-Core: main.py, utils.py, data_fetcher.py, indicators.py, screenshot_analyzer.py, cross_checker.py, sentiment.py, signal_engine.py, risk_manager.py, backtester.py, paper_trader.py, alerts.py
-Broker: broker/base.py, broker/paper.py, broker/zerodha.py
-Tests: test_indicators, test_signal_engine, test_risk_manager, test_screenshot_analyzer, test_cross_checker, test_paper_broker, test_backtester (54 total)
-Config: config/config.yaml, .env.example
-Docs: README.md, PROJECT_STATE.md, MODEL_HANDOFF.md
-
-HOW TO RUN
-----------
-cd "C:\Users\Kapil Kuhire\Downloads\TRIO"
-python -m pytest tests -q
-python main.py scan --symbol RELIANCE.NS --timeframe 15m
-python main.py backtest --symbol RELIANCE.NS --timeframe 1d --period 365d
-python main.py paper --symbols RELIANCE.NS TCS.NS --interval 300 --max-iterations 1
-python main.py analyze --image path/to/screenshot.png (needs API keys)
+TOMORROW MORNING (restart required — dashboard != trader)
+----------------------------------------------------------
+cd "C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION"
+python scripts\dashboard.py --port 5000
+# leave window open; browser http://127.0.0.1:5000
+# At 09:20 entry alerts now show T1: ... (50% + breakeven);
+# a T1 hit sends 🔹 PARTIAL 50% — ... breakeven mid-session.
+# Verify first close has P&L+reason+exit time on both brokers.
 
 NOTES
 -----
-- Live orders disabled by default (paper is default)
-- API keys via .env only
-- Screenshot values treated as hints; cross-checked against live data
-- Risk halt blocks new signals until reset
-- No network calls in tests (backtester uses mocks)
+- .env MEGABULL_API_KEY in both folders (real key, shared account — rotate monthly)
+- MegaBull dashboard trade log is the truth after sync; keep the day's +4569.87 archived
+- Main == TRIO_IMPLEMENTATION (LIVE:5000); New == TRIO_IMPLEMENTATION_NEW (DEV, T1 lab)

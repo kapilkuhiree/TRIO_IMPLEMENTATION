@@ -64,6 +64,13 @@ symbols:
 trading:
   allow_shorts: true
 
+# Short-shadow validation: when only=true, day_session replay *skips*
+# SELL entries (records them as short-shadow intent in the debug ledger)
+# so the short side's P&L can be measured without live risk. Flip to
+# false / remove to trade shorts normally in replay.
+short_shadow:
+  only: false
+
 # Broker provider. "megabull" routes all fills to the MegaBull free paper
 # API (MIS intraday; account holds Rs5,00,000 virtual, key in .env as
 # MEGABULL_API_KEY — never paste it here). "paper" keeps the local
@@ -139,6 +146,11 @@ indicators:
       std_dev: 2
     atr:
       period: 14
+    iv_rank:
+      enabled: true
+      lookback: 252          # 1y HV percentile; gate entries when rich
+      max_iv_rank: 80        # block entries when IV-rank > 80 (overpriced vol)
+      shadow_log: true       # log what would've traded without gating
   volume:
     vwap: true
     obv: true

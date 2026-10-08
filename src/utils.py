@@ -1,6 +1,5 @@
 """
 TRIO — Utility functions: logging setup, config loading, retry logic, helpers.
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 DISCLAIMER: Educational purposes only. Not financial advice.
 """

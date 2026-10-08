@@ -277,8 +277,14 @@ def screen(symbols: Optional[List[str]] = None,
             md_map = None
         else:
             scored: List[RankedCandidate] = []
+            scored_shadow_iv: List[RankedCandidate] = []
             scanned = len(md_map or {})
             failed = max(0, len(symbols) - scanned)
+            # IV-rank gate (options-aware): block entries when vol overpriced.
+            ind_cfg = cfg.get("indicators", {}).get("volatility", {}).get("iv_rank", {})
+            iv_enabled = bool(ind_cfg.get("enabled", True))
+            iv_max = float(ind_cfg.get("max_iv_rank", 80))
+            iv_shadow = bool(ind_cfg.get("shadow_log", True))
             for sym, md in (md_map or {}).items():
                 try:
                     readings = compute_indicators(md.ohlcv, sym, timeframe)
@@ -291,6 +297,11 @@ def screen(symbols: Optional[List[str]] = None,
                     continue
                 if sig.action not in ("BUY", "SELL") or sig.confidence < min_confidence:
                     continue
+                # IV-rank gate: cheap vol preferred for debit spreads.
+                iv_read = readings.indicators.get("iv_rank")
+                iv_val = (iv_read.value if iv_read and iv_read.value is not None
+                          else None)
+                iv_blocked = (iv_enabled and iv_val is not None and iv_val > iv_max)
                 atr_v = next((v.value for k, v in readings.indicators.items()
                               if k.startswith("atr_")), None)
                 swing = readings.swing_low if sig.action == "BUY" else readings.swing_high
@@ -300,7 +311,18 @@ def screen(symbols: Optional[List[str]] = None,
                 # Ladder targets already set by risk_manager (t1/t2/t3)
                 cand = rank_signal(sig, readings)
                 if cand.rank >= min_rank:
+                    if iv_blocked:
+                        # Shadow-log what IV-rank filtered (no order)
+                        if iv_shadow:
+                            scored_shadow_iv.append(cand)
+                            logger.info("SHADOW iv_rank_blocked: %s %s conf=%d rank=%.1f iv=%.1f>%.0f — would have traded",
+                                        sym, sig.action, sig.confidence, cand.rank,
+                                        iv_val, iv_max)
+                        continue
                     scored.append(cand)
+            if scored_shadow_iv:
+                logger.info("SHADOW iv_rank: %d blocked by IV-rank>%.0f (log-only, no orders)",
+                            len(scored_shadow_iv), iv_max)
             # Shadow comparison: what would old (60/40) and tight (80/100) have picked?
             for sh in sc_cfg.get("shadow_thresholds", []) or []:
                 try:
@@ -341,6 +363,18 @@ def screen(symbols: Optional[List[str]] = None,
         if sig.action not in ("BUY", "SELL"):
             continue
         if sig.confidence < min_confidence:
+            continue
+
+        # IV-rank gate (per-symbol fallback path, mirrors batch path)
+        _ind_cfg = cfg.get("indicators", {}).get("volatility", {}).get("iv_rank", {})
+        _iv_max = float(_ind_cfg.get("max_iv_rank", 80))
+        _iv_en = bool(_ind_cfg.get("enabled", True))
+        _iv_read = readings.indicators.get("iv_rank")
+        _iv_val = (_iv_read.value if _iv_read and _iv_read.value is not None else None)
+        if _iv_en and _iv_val is not None and _iv_val > _iv_max:
+            if bool(_ind_cfg.get("shadow_log", True)):
+                logger.info("SHADOW iv_rank_blocked: %s %s conf=%d iv=%.1f>%.0f",
+                            symbol, sig.action, sig.confidence, _iv_val, _iv_max)
             continue
 
         atr_v = next((v.value for k, v in readings.indicators.items()
