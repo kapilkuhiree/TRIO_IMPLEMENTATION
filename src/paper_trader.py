@@ -708,7 +708,8 @@ class PaperTrader:
                         rows.append(_json.loads(line))
             if not rows:
                 return
-            keys = ["ts", "event", "mode", "broker", "symbol", "action", "entry", "stop",
+            keys = ["ts", "event", "mode", "broker", "asset", "strategy",
+                    "symbol", "action", "entry", "stop",
                     "target", "qty", "rank", "setup", "confidence",
                     "exit", "pnl", "pnl_pct", "reason", "result",
                     "price", "rr", "decision", "scanned", "candidates",

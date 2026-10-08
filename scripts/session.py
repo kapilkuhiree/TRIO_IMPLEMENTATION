@@ -131,17 +131,32 @@ def main() -> None:
     try:
         from src.alerts import send_telegram
         _cand_lines = []
+        _opt_lines = []
         for _c in (plan or {}).get("candidates", []) or []:
             _cand_lines.append(
                 f"{_c.get('symbol')} {_c.get('action')} "
                 f"@{_c.get('entry_price')} SL {_c.get('stop_loss')} "
                 f"TP {_c.get('target')} qty {_c.get('position_size')}")
+            _opt = _c.get("option_legs") or {}
+            if _opt.get("strategy") and _opt.get("strategy") != "none":
+                _legs = " + ".join(
+                    f"{_l.get('side')} {_l.get('strike')}{_l.get('kind')}"
+                    f"@{_l.get('premium')}"
+                    for _l in (_opt.get("legs") or []))
+                _opt_lines.append(
+                    f"  + {_c.get('symbol')}: {_opt.get('strategy')} {_legs} "
+                    f"debit {_opt.get('net_debit')} "
+                    f"maxLoss {_opt.get('maxLoss')}")
         _msg = ["☀️ *Good morning, Mr Kapil Kuhire Sir!*",
                 f"TRIO session started — {date}.",
                 f"Plan: {len((plan or {}).get('candidates', []))} candidate(s)."]
         if _cand_lines:
+            _msg.append("*Equity:*")
             _msg.append("\n".join(_cand_lines))
-        else:
+        if _opt_lines:
+            _msg.append("*Options (paper spreads, same open):*")
+            _msg.append("\n".join(_opt_lines))
+        if not _cand_lines and not _opt_lines:
             _msg.append("No candidates in today's plan — manage-only mode.")
         send_telegram("\n".join(_msg))
     except Exception as exc:
@@ -179,7 +194,7 @@ def main() -> None:
                                trader, opt_broker, cfg)))
     finally:
         try:
-            _squareoff_options(opt_broker, "eod-squareoff")
+            _squareoff_options(opt_broker, "eod-squareoff", trader=trader)
         except Exception as exc:
             logger.warning("Options EOD square-off failed: %s", exc)
         if plan is not None and not plan.get("executed"):
@@ -252,8 +267,15 @@ def _manage_options(trader, opt_broker, cfg) -> None:
             continue
 
 
-def _squareoff_options(opt_broker, reason: str = "eod-squareoff") -> int:
-    """Close every open spread at live mid. Returns closed count."""
+def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
+                       trader=None) -> int:
+    """Close every open spread at live mid. Returns closed count.
+
+    Every close is ALSO appended to the shared trade ledger via
+    ``trader._log_event("close", rec)`` (plus the CSV mirror) so options
+    P&L shows in the evening digest alongside equities. Without this the
+    options broker's private ``closed_trades`` list dies with the runner.
+    """
     if opt_broker is None:
         return 0
     n = 0
@@ -273,8 +295,18 @@ def _squareoff_options(opt_broker, reason: str = "eod-squareoff") -> int:
             rec = opt_broker.close_spread(sid, mid, reason)
             if rec:
                 n += 1
+                if trader is not None:
+                    try:
+                        trader._log_event("close", rec)
+                    except Exception:
+                        pass
         except Exception:
             continue
+    if trader is not None and n:
+        try:
+            trader._write_trade_log_csv()
+        except Exception:
+            pass
     return n
 
 
