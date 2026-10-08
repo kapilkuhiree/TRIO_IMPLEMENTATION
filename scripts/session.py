@@ -67,6 +67,28 @@ def main() -> None:
     logger.info("Session job: plan=%s candidates=%d",
                 date, len((plan or {}).get("candidates", [])))
 
+    # Startup "Good morning" Telegram: tells Mr Kapil Kuhire the job woke up,
+    # which plan it loaded, and the broker mirror status — sent BEFORE the
+    # trading loop starts so a silent boot is never mistaken for a dead bot.
+    try:
+        from src.alerts import send_telegram
+        _cand_lines = []
+        for _c in (plan or {}).get("candidates", []) or []:
+            _cand_lines.append(
+                f"{_c.get('symbol')} {_c.get('action')} "
+                f"@{_c.get('entry_price')} SL {_c.get('stop_loss')} "
+                f"TP {_c.get('target')} qty {_c.get('position_size')}")
+        _msg = ["☀️ *Good morning, Mr Kapil Kuhire Sir!*",
+                f"TRIO session started — {date}.",
+                f"Plan: {len((plan or {}).get('candidates', []))} candidate(s)."]
+        if _cand_lines:
+            _msg.append("\n".join(_cand_lines))
+        else:
+            _msg.append("No candidates in today's plan — manage-only mode.")
+        send_telegram("\n".join(_msg))
+    except Exception as exc:
+        logger.warning("Startup good-morning alert failed: %s", exc)
+
     # run_session places the plan, restores SL/TP state, and loops guards.
     try:
         trader.run_session(plan=plan, interval_seconds=args.interval,

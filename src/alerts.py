@@ -1,6 +1,5 @@
 """
 TRIO — Alerts
-Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
 Send trading signal notifications via Telegram or email.
 
@@ -369,6 +368,13 @@ def format_signal_message(signal: Any) -> str:
         f"Time: {_md_escape(ist_display(d.get('generated_at')))}",
         f"Confidence: {_md_escape(conf)}%",
     ]
+    # Ladder levels (Phase 1: only T1 is armed; T2/T3 converge to target).
+    if action in ("BUY", "SELL") and d.get("target_t1"):
+        t1 = d.get("target_t1"); t = d.get("target")
+        rr = t1 if t1 else None
+        t1_s = f"T1:{_md_escape(_fmt_num(t1))} (50% + breakeven)"
+        lines.append(t1_s + (f"  |  Full:{_md_escape(_fmt_num(t))}"
+                             if t else ""))
 
     if action in ("BUY", "SELL"):
         lines += [
@@ -465,6 +471,11 @@ def format_exit_message(trade: Dict[str, Any]) -> str:
     """
     result = str(trade.get("result", "")).upper()
     emoji = "✅" if result == "PASS" else "❌"
+    # Partial half-exits (ladder T1) use their own marker so the final
+    # full exit is unmistakable.
+    if str(trade.get("reason", "")).startswith("partial"):
+        emoji = "🔹"
+        result += " (PARTIAL 50%)"
     symbol = _md_escape(trade.get("symbol", "N/A"))
     pnl = trade.get("pnl", 0)
     try:
