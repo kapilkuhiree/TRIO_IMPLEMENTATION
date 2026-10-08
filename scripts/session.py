@@ -46,27 +46,68 @@ def main() -> None:
     date = args.date or today_ist_str()
     cfg = load_config()
 
+    # Load today's plan; if missing fall back to the most recent one so the
+    # session never sits idle — exactly like the manual daily scans you ran
+    # before automation. Yesterday's plan's signals are still valid for today
+    # (they were ranked on yesterday's close), and the live fallback also
+    # refreshes them from today's bars.
     plan = None if args.no_plan else load_plan(date)
     if plan is None and not args.no_plan:
-        # No plan for today (2026-10-08 hit this — only 2026-10-07 existed).
-        # Fall back to a live intraday scan so the session never sits idle.
-        logger.warning("No plan for %s — running live scan to generate one.",
-                       date)
-        try:
-            from scripts.premarket import build_plan
-            from src.plan import save_plan as _save_plan
-            cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
-            # Live fallback uses daily bars, same as the overnight job, so
-            # the signal/risk path is identical — no intraday-variant drift.
-            plan = build_plan(cfg_universe, "1d",
-                              cfg.get("screener", {}).get("max_positions_to_open", 3))
-            plan["date"] = date  # tag it to today even though it was built now
-            _save_plan(plan, date=date)
-            logger.info("Live fallback plan built: %d candidate(s) for %s.",
-                        len(plan.get("candidates", [])), date)
-        except Exception as exc:
-            logger.error("Live fallback scan failed: %s — manage-only.", exc)
-            plan = None
+        from src.plan import find_latest_plan
+
+        latest = find_latest_plan()
+        if latest is not None:
+            latest_date = latest.get("date", "?")
+            logger.warning(
+                "No plan for %s — using latest plan (%s) with %d candidate(s).",
+                date, latest_date, len(latest.get("candidates", [])))
+            plan = latest
+            # Also build a fresh scan for today in parallel — the session
+            # trades the latest (yesterday) plan now and the fresh plan's
+            # candidates will be available next loop after _save_plan.
+            try:
+                from scripts.premarket import build_plan
+                from src.plan import save_plan as _save_plan
+                cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
+                fresh = build_plan(cfg_universe, "1d",
+                                   cfg.get("screener", {}).get("max_positions_to_open", 3))
+                fresh["date"] = date
+                _save_plan(fresh, date=date)
+                logger.info("Fresh today's plan also built: %d candidate(s) for %s.",
+                            len(fresh.get("candidates", [])), date)
+                # Trade the union but dedupe by symbol — fresh intraday scan
+                # wins when the same symbol appears with a newer signal.
+                seen = {c.get("symbol") for c in fresh.get("candidates", [])}
+                merged = list(fresh.get("candidates", []))
+                for c in latest.get("candidates", []) or []:
+                    if c.get("symbol") not in seen:
+                        merged.append(c)
+                # Keep ranking order and cap to top_n
+                top_n = cfg.get("screener", {}).get("max_positions_to_open", 3)
+                merged.sort(key=lambda x: x.get("rank", 0), reverse=True)
+                plan = dict(fresh)
+                plan["candidates"] = merged[: top_n * 2]  # small headroom for union
+                plan["merged_from"] = latest_date
+            except Exception as exc:
+                logger.warning("Fresh today's scan failed: %s — trading latest plan only.", exc)
+        else:
+            # No plan at all on disk — build today's from scratch so the
+            # session never sits idle, same as the manual scans we did before.
+            logger.warning("No plan for %s and no prior plan — running live scan.",
+                           date)
+            try:
+                from scripts.premarket import build_plan
+                from src.plan import save_plan as _save_plan
+                cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
+                plan = build_plan(cfg_universe, "1d",
+                                  cfg.get("screener", {}).get("max_positions_to_open", 3))
+                plan["date"] = date
+                _save_plan(plan, date=date)
+                logger.info("Live fallback plan built: %d candidate(s) for %s.",
+                            len(plan.get("candidates", [])), date)
+            except Exception as exc:
+                logger.error("Live fallback scan failed: %s — manage-only.", exc)
+                plan = None
 
     # Session uses the plan's symbols so position data can be fetched.
     symbols = list(plan.get("symbols", [])) if plan else []

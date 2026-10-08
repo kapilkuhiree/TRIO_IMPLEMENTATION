@@ -72,6 +72,27 @@ def load_plan(date: Optional[str] = None,
         return None
 
 
+def find_latest_plan(plan_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Return the most recent (lexically latest YYYY-MM-DD) plan on disk.
+
+    Used when today's plan hasn't been written yet — the session should
+    keep trading yesterday's signals (still ranked on yesterday's close)
+    rather than sitting idle until the overnight job catches up.
+    """
+    d = plan_dir or PLAN_DIR
+    if not d.exists():
+        return None
+    json_files = sorted(d.glob("*.json"))
+    if not json_files:
+        return None
+    # YYYY-MM-DD sorts lexically == chronologically
+    latest_file = json_files[-1]
+    try:
+        return json.loads(latest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def mark_executed(payload: Dict[str, Any], order_ids: List[str],
                   date: Optional[str] = None,
                   plan_dir: Optional[Path] = None) -> Path:
