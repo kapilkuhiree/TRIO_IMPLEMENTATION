@@ -48,8 +48,25 @@ def main() -> None:
 
     plan = None if args.no_plan else load_plan(date)
     if plan is None and not args.no_plan:
-        logger.warning("No plan for %s — session will MANAGE only "
-                       "(no new entries).", date)
+        # No plan for today (2026-10-08 hit this — only 2026-10-07 existed).
+        # Fall back to a live intraday scan so the session never sits idle.
+        logger.warning("No plan for %s — running live scan to generate one.",
+                       date)
+        try:
+            from scripts.premarket import build_plan
+            from src.plan import save_plan as _save_plan
+            cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
+            # Live fallback uses daily bars, same as the overnight job, so
+            # the signal/risk path is identical — no intraday-variant drift.
+            plan = build_plan(cfg_universe, "1d",
+                              cfg.get("screener", {}).get("max_positions_to_open", 3))
+            plan["date"] = date  # tag it to today even though it was built now
+            _save_plan(plan, date=date)
+            logger.info("Live fallback plan built: %d candidate(s) for %s.",
+                        len(plan.get("candidates", [])), date)
+        except Exception as exc:
+            logger.error("Live fallback scan failed: %s — manage-only.", exc)
+            plan = None
 
     # Session uses the plan's symbols so position data can be fetched.
     symbols = list(plan.get("symbols", [])) if plan else []
