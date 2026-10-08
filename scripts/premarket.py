@@ -28,14 +28,70 @@ load_env()
 logger = get_logger("premarket")
 
 
-def build_plan(universe: str, timeframe: str, top_n: int) -> Dict[str, Any]:
-    """Run the daily screen and return the plan payload."""
+def build_plan(universe: str, timeframe: str, top_n: int,
+               with_options: bool = True) -> Dict[str, Any]:
+    """Run the daily screen and return the plan payload.
+
+    When config `options.enabled` is true, each candidate also carries
+    `option_legs` (the defined-risk NIFTY expression picked by
+    options_selector from the live chain / BS sim). Stock fields stay
+    untouched so the equity path never depends on options.
+    """
     cfg = load_config()
     sc_cfg = cfg.get("screener", {})
     symbols = resolve_basket(universe)
 
     candidates = screen(symbols=symbols, timeframe=timeframe, top_n=top_n)
     cand_dicts = [c.to_dict() for c in candidates]
+
+    # Options overlay (shadow until proven): attach legs per candidate.
+    opt_cfg = cfg.get("options", {}) or {}
+    options_on = with_options and bool(opt_cfg.get("enabled", True))
+    if options_on and cand_dicts:
+        try:
+            from src.options_chain import fetch_chain, nearest_expiry
+            from src.options_selector import select
+            chain = fetch_chain(str(opt_cfg.get("underlying", "NIFTY")))
+            if chain is not None:
+                expiry = nearest_expiry(chain) or ""
+                for i, c in enumerate(cand_dicts):
+                    try:
+                        from src.signal_engine import TradeSignal
+                        from src.data_fetcher import fetch_market_data
+                        from src.indicators import compute_indicators
+                        sig = TradeSignal(
+                            symbol=c.get("symbol", ""),
+                            action=c.get("action", "HOLD"),
+                            entry_price=c.get("entry_price"),
+                            confidence=int(c.get("confidence") or 0))
+                        adx_v = None
+                        ivr = None
+                        try:
+                            _md = fetch_market_data(
+                                c.get("symbol", ""), "1d")
+                            _rd = compute_indicators(
+                                _md.ohlcv, c.get("symbol", ""), "1d")
+                            for _k, _v in _rd.indicators.items():
+                                if _k.startswith("adx_") and _v.value:
+                                    adx_v = float(_v.value)
+                                    break
+                            _ivr = _rd.indicators.get("iv_rank")
+                            if _ivr is not None and _ivr.value is not None:
+                                ivr = float(_ivr.value)
+                        except Exception:
+                            pass
+                        if ivr is None:
+                            ivr = c.get("iv_rank")
+                        pick = select(sig, chain, expiry=expiry,
+                                      iv_rank=ivr, adx=adx_v)
+                        c["option_legs"] = pick.to_dict()
+                        c["iv_rank"] = ivr
+                        c["adx"] = adx_v
+                    except Exception as exc:
+                        logger.warning("Options overlay failed for %s: %s",
+                                       c.get("symbol"), exc)
+        except Exception as exc:
+            logger.warning("Options overlay unavailable: %s", exc)
 
     return {
         "date": today_ist_str(),
@@ -49,6 +105,7 @@ def build_plan(universe: str, timeframe: str, top_n: int) -> Dict[str, Any]:
         "min_confidence": sc_cfg.get("min_confidence", 60),
         "candidates": cand_dicts,
         "executed": False,
+        "asset": "equity+options",
     }
 
 
@@ -69,6 +126,15 @@ def format_summary(plan: Dict[str, Any]) -> str:
             f"target {c.get('target')} qty {c.get('position_size')} "
             f"conf {c.get('confidence')} rank {c.get('rank')} "
             f"({c.get('setup_name')})")
+        opt = c.get("option_legs") or {}
+        if opt.get("strategy") and opt.get("strategy") != "none":
+            legs = " + ".join(
+                f"{l.get('side')} {l.get('strike')}{l.get('kind')}@{l.get('premium')}"
+                for l in (opt.get("legs") or []))
+            lines.append(
+                f"  + {opt.get('strategy')} {legs} "
+                f"debit {opt.get('net_debit')} "
+                f"maxLoss {opt.get('maxLoss')}")
     return "\n".join(lines)
 
 

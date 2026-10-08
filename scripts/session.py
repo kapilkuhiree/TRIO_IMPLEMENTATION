@@ -147,15 +147,135 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Startup good-morning alert failed: %s", exc)
 
+    # Options paper overlay (shadow until proven): place spreads for
+    # candidates carrying option_legs, on the options paper broker only.
+    # Equity flow below is untouched. Spreads are marked to the live chain
+    # mid on every guard tick and squared off at EOD alongside equities.
+    opt_broker = None
+    try:
+        opt_cfg = cfg.get("options", {}) or {}
+        if opt_cfg.get("enabled", True) and plan is not None and any(
+                (c.get("option_legs") or {}).get("strategy") not in
+                (None, "", "none") for c in plan.get("candidates", []) or []):
+            from src.broker.options_paper import OptionsPaperBroker
+            opt_broker = OptionsPaperBroker(
+                initial_capital=(cfg.get("risk_management", {}) or {}).get(
+                    "capital", 500000),
+                lot_size=int(opt_cfg.get("lot_size", 50)))
+            trader.execute_option_plan(plan, opt_broker=opt_broker)
+            # expose to the guard loop below
+            trader.opt_broker = opt_broker
+    except Exception as exc:
+        logger.warning("Options paper overlay failed: %s", exc)
+
     # run_session places the plan, restores SL/TP state, and loops guards.
+    # The options overlay marks live-chain mid every tick and EOD-squares
+    # alongside equities (see _manage_options below) so spreads never sit
+    # open past 15:10 IST.
     try:
         trader.run_session(plan=plan, interval_seconds=args.interval,
-                           max_seconds=args.max_seconds)
+                           max_seconds=args.max_seconds,
+                           tick_hook=(lambda: _manage_options(
+                               trader, opt_broker, cfg)))
     finally:
+        try:
+            _squareoff_options(opt_broker, "eod-squareoff")
+        except Exception as exc:
+            logger.warning("Options EOD square-off failed: %s", exc)
         if plan is not None and not plan.get("executed"):
             mark_executed(plan, [])
         logger.info("Session job finished at %s",
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
+
+
+def _chain_mid_for(spread_id: str, legs: list, expiry: str,
+                   underlying: str = "NIFTY",
+                   hv_proxy: float = 0.20) -> Optional[float]:
+    """Net mid for one spread from the live chain (fallback BS sim)."""
+    try:
+        from src.options_chain import fetch_chain
+        from src.options_pricing import bs_price
+        from datetime import datetime, timezone as _tz
+        chain = fetch_chain(underlying)
+        if chain is None:
+            return None
+        rows = {r["strike"]: r for r in
+                (chain.get("by_expiry", {}).get(expiry, []) or [])}
+        if not rows:
+            return None
+        try:
+            days = max((datetime.strptime(expiry, "%d-%b-%Y").replace(
+                tzinfo=_tz.utc) - datetime.now(_tz.utc)).days, 1)
+        except ValueError:
+            days = 7
+        t_yrs = days / 365.0
+        spot = float(chain.get("underlying") or 0.0)
+        net = 0.0
+        for leg in legs or []:
+            row = rows.get(float(leg.get("strike") or 0))
+            if row is None:
+                return None
+            q = (row.get(leg.get("kind", "CE")) or {})
+            bid = float(q.get("bidPrice") or 0.0)
+            ask = float(q.get("askPrice") or 0.0)
+            if bid > 0 and ask > 0:
+                px = (bid + ask) / 2.0
+            elif float(q.get("lastPrice") or 0.0) > 0:
+                px = float(q.get("lastPrice"))
+            else:
+                sigma = max(float(q.get("iv") or 0.0) / 100.0, hv_proxy)
+                px = bs_price(spot, float(leg.get("strike") or 0.0),
+                              t_yrs, sigma, leg.get("kind", "CE"))
+            net += px if leg.get("side") == "BUY" else -px
+        return round(max(net, 0.0), 2)
+    except Exception:
+        return None
+
+
+def _manage_options(trader, opt_broker, cfg) -> None:
+    """Mark every open spread to live-chain mid (theta captured intraday)."""
+    if opt_broker is None:
+        return
+    try:
+        positions = list(getattr(opt_broker, "positions", {}).keys())
+    except Exception:
+        return
+    for sid in positions:
+        try:
+            detail = (getattr(opt_broker, "spreads", {}) or {}).get(sid) or {}
+            legs = detail.get("legs") or []
+            expiry = detail.get("expiry", "")
+            mid = _chain_mid_for(sid, legs, expiry)
+            if mid is not None:
+                opt_broker.mark_spread(sid, mid)
+        except Exception:
+            continue
+
+
+def _squareoff_options(opt_broker, reason: str = "eod-squareoff") -> int:
+    """Close every open spread at live mid. Returns closed count."""
+    if opt_broker is None:
+        return 0
+    n = 0
+    try:
+        sids = list(getattr(opt_broker, "positions", {}).keys())
+    except Exception:
+        return 0
+    for sid in sids:
+        try:
+            detail = (getattr(opt_broker, "spreads", {}) or {}).get(sid) or {}
+            legs = detail.get("legs") or []
+            mid = _chain_mid_for(sid, legs, detail.get("expiry", ""))
+            if mid is None:
+                # stale chain: close at last mark
+                pos = opt_broker.positions.get(sid)
+                mid = float(pos.current_price or pos.avg_price or 0.0)
+            rec = opt_broker.close_spread(sid, mid, reason)
+            if rec:
+                n += 1
+        except Exception:
+            continue
+    return n
 
 
 if __name__ == "__main__":

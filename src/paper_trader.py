@@ -777,6 +777,81 @@ class PaperTrader:
                         restored)
         return restored
 
+    def execute_option_plan(self, plan: Optional[Dict[str, Any]],
+                              opt_broker: Any = None) -> List[Dict[str, Any]]:
+        """Place today's option legs (paper) for candidates carrying them.
+
+        Uses the attached ``option_legs`` (spread/condor picked by
+        options_selector) on the options paper broker — never touches the
+        equity broker. Lots sized by ``risk_amount / net_debit`` capped at
+        one spread per candidate. Shadow until proven: the caller decides.
+        Returns the list of placed spread records.
+        """
+        if not plan:
+            return []
+        if opt_broker is None:
+            try:
+                from src.broker.options_paper import OptionsPaperBroker
+                opt_broker = OptionsPaperBroker(
+                    initial_capital=(load_config().get(
+                        "risk_management", {}) or {}).get("capital", 500000))
+            except Exception as exc:
+                logger.warning("execute_option_plan: no options broker: %s", exc)
+                return []
+        placed: List[Dict[str, Any]] = []
+        for cand in plan.get("candidates", []) or []:
+            opt = cand.get("option_legs") or {}
+            if not opt or opt.get("strategy") in (None, "", "none"):
+                continue
+            try:
+                from src.options_selector import OptionTradeCandidate, OptionLeg
+                legs = [OptionLeg(**{k: l.get(k, v) for k, v in
+                                      OptionLeg().__dict__.items()})
+                        for l in (opt.get("legs") or [])]
+                pick = OptionTradeCandidate(
+                    strategy=opt.get("strategy", ""),
+                    underlying=opt.get("underlying", "NIFTY"),
+                    spot=float(opt.get("spot") or 0.0),
+                    expiry=str(opt.get("expiry") or ""),
+                    legs=legs, net_debit=float(opt.get("net_debit") or 0.0),
+                    maxLoss=float(opt.get("maxLoss") or 0.0),
+                    maxGain=float(opt.get("maxGain") or 0.0),
+                    breakeven=float(opt.get("breakeven") or 0.0),
+                    rank=float(opt.get("rank") or 0.0),
+                    confidence=int(opt.get("confidence")
+                                   or cand.get("confidence") or 0))
+                risk_amt = float(cand.get("risk_amount") or 0.0)
+                lots = 1
+                if pick.net_debit > 0 and risk_amt > 0:
+                    lot_sz = int(load_config().get("options", {}).get(
+                        "lot_size", 50))
+                    lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
+                order = opt_broker.open_spread(pick, lots=lots,
+                                               reason="options-plan")
+                if order.status != "FILLED":
+                    self._log_event("skip", {
+                        "symbol": cand.get("symbol"), "asset": "options",
+                        "strategy": pick.strategy,
+                        "reason": f"rejected: {order.error}"})
+                    continue
+                record = {
+                    "symbol": cand.get("symbol"), "asset": "options",
+                    "strategy": pick.strategy, "expiry": pick.expiry,
+                    "net_debit": pick.net_debit, "lots": lots,
+                    "maxLoss": pick.maxLoss, "maxGain": pick.maxGain,
+                    "order_id": order.order_id,
+                    "rank": cand.get("rank"),
+                    "setup": cand.get("setup_name"),
+                }
+                placed.append(record)
+                self._log_event("order", record)
+            except Exception as exc:
+                logger.error("execute_option_plan failed for %s: %s",
+                             cand.get("symbol"), exc)
+        if placed:
+            logger.info("execute_option_plan: placed %d spread(s).", len(placed))
+        return placed
+
     def execute_plan(self, plan: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Place today's premarket candidates on the broker.
 
@@ -880,7 +955,8 @@ class PaperTrader:
 
     def run_session(self, plan: Optional[Dict[str, Any]] = None,
                     interval_seconds: int = 60,
-                    max_seconds: Optional[int] = None) -> None:
+                    max_seconds: Optional[int] = None,
+                    tick_hook: Any = None) -> None:
         """Session job: execute the plan once, then manage until EOD.
 
         Designed for a single GitHub Actions job (09:15–15:10 IST). Places
@@ -889,6 +965,10 @@ class PaperTrader:
         every ``interval_seconds`` until the session closes (EOD square-off
         fires inside ``scan_once`` when the window shuts) or ``max_seconds``
         elapses. New entries only come from the plan.
+
+        ``tick_hook`` (optional callable, no args) runs at the END of every
+        guard tick — used by scripts/session.py to mark option spreads to
+        the live chain mid. Never raises out of this loop.
         """
         if self._session_open():
             self.execute_plan(plan)
@@ -914,6 +994,12 @@ class PaperTrader:
                 self._log_event("scan", {
                     "session_open": self._session_open(),
                     "positions": len(self.broker.positions)})
+                if tick_hook is not None:
+                    try:
+                        tick_hook()
+                    except Exception as hook_exc:
+                        logger.warning("run_session tick_hook failed: %s",
+                                       hook_exc)
             except Exception as exc:
                 logger.error("run_session tick failed: %s", exc)
             # Session closed after open -> final square-off and exit.

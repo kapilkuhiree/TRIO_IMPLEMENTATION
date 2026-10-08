@@ -94,6 +94,24 @@ screener:
     - { name: "tight_80_100", min_confidence: 80, min_rank: 100 }
   max_positions_to_open_shadow: 3
 
+# NIFTY 50 options expression (index spreads, defined risk).
+# Spot view comes from the validated engine; options only replace HOW a
+# BUY/SELL is held. Paper fills via options_paper (live mid / LTP / BS sim).
+# Live Kite fills need the Kite Connect plan (~Rs500/mo) + keys in Secrets.
+options:
+  enabled: true               # attach option_legs to screened candidates
+  underlying: "NIFTY"         # index only (liquid chain, tightest spreads)
+  lot_size: 50                # read from Kite NFO at runtime; fallback only
+  delta_atm: 0.50             # long leg ~ATM
+  delta_otm: 0.30             # short leg ~OTM
+  min_oi: 1000                # skip wing when OI below this (illiquid)
+  max_iv_rank: 80             # rich vol: penalty 0.5 on option rank
+  chain_cache_minutes: 15     # NSE chain TTL intraday
+  risk_free_rate: 0.065       # BS fallback only
+  max_premium_pct: 5.0        # skip spread when debit > 5% of spot (junk)
+  expiry_preference: "weekly" # weekly tactical + monthly swing (both swept)
+  paper_only: true            # live Kite place_order stays OFF until proven
+
 timeframes:
   default: "15m"
   available:
