@@ -125,6 +125,15 @@ def main() -> None:
     logger.info("Session job: plan=%s candidates=%d",
                 date, len((plan or {}).get("candidates", [])))
 
+    # Check for any new /start subscribers right at startup so everyone receives today's alerts.
+    try:
+        from src.alerts import handle_joins
+        _new = handle_joins()
+        if _new:
+            logger.info("Found %d new Telegram subscriber(s) at session boot.", len(_new))
+    except Exception as exc:
+        logger.warning("Startup subscriber check failed: %s", exc)
+
     # Startup "Good morning" Telegram: tells Mr Kapil Kuhire the job woke up,
     # which plan it loaded, which broker platforms are selected, and that it is
     # waiting for the 09:15 NSE market open before firing entries.

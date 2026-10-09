@@ -139,6 +139,13 @@ def format_summary(plan: Dict[str, Any]) -> str:
 
 
 def main() -> None:
+    # Check for any new /start subscribers before sending the premarket plan
+    try:
+        from src.alerts import handle_joins
+        handle_joins()
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="TRIO premarket plan builder")
     parser.add_argument("--universe", default=None,
                         help="Basket name (nifty100) or comma list; "

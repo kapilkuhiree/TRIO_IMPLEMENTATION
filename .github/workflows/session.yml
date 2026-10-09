@@ -49,7 +49,7 @@ jobs:
         run: |
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
-          git add -A output/dashboard_state.json output/plans
+          git add -A output/dashboard_state.json output/plans output/subscribers.json
           git diff --cached --quiet || git commit -m "session state $(date -u +%F)"
           git pull --rebase --autostash || true
           # State files append JSON lines; merge upstream instead of
