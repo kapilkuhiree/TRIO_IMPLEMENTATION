@@ -54,28 +54,36 @@ class OptionsPaperBroker(BaseBroker):
 
     def open_spread(self, candidate: Any, lots: int = 1,
                     reason: str = "options-plan") -> BrokerOrder:
-        """Open one spread from an OptionTradeCandidate. Returns a FILLED
-        umbrella order (legs recorded in the order's error field as JSON
-        would be hacky — legs live in self.spreads keyed by symbol)."""
+        """Open one spread (or single long) from an OptionTradeCandidate.
+
+        Returns a FILLED umbrella order (legs recorded in the order's
+        error field as JSON would be hacky — legs live in self.spreads
+        keyed by symbol). Single-leg longs (long-call/long-put) are
+        supported: risk = premium, no short leg."""
         try:
             d = candidate.to_dict() if hasattr(candidate, "to_dict") \
                 else dict(candidate)
         except Exception as exc:
             return self._reject("?", 0, 0.0, f"bad candidate: {exc}")
         legs = d.get("legs", []) or []
-        if len(legs) < 2:
+        strat = str(d.get("strategy") or "spread")
+        single = (len(legs) == 1 and strat in ("long-call", "long-put"))
+        if len(legs) < 2 and not single:
             return self._reject(d.get("strategy", "?"), 0, 0.0,
                                 "spread needs 2 legs")
         longs = [l for l in legs if l.get("side") == "BUY"]
         shorts = [l for l in legs if l.get("side") == "SELL"]
-        if not longs or not shorts:
+        if single:
+            if not longs:
+                return self._reject(d.get("strategy", "?"), 0, 0.0,
+                                    "long needs a BUY leg")
+        elif not longs or not shorts:
             return self._reject(d.get("strategy", "?"), 0, 0.0,
                                 "spread needs long+short")
         long_k = float(longs[0].get("strike") or 0)
-        short_k = float(shorts[0].get("strike") or 0)
+        short_k = float(shorts[0].get("strike") or 0) if shorts else 0.0
         net = float(d.get("net_debit") or 0.0)
         expiry = str(d.get("expiry") or "")
-        strat = str(d.get("strategy") or "spread")
         sid = _spread_id(strat, expiry, long_k, short_k)
         if sid in self.positions:
             return self._reject(sid, lots, net,

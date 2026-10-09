@@ -69,20 +69,108 @@ def test_spread_metrics():
 
 
 def test_selector_bull_call():
+    # style from config: default test config is spread mode
+    from unittest.mock import patch
     sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
                       confidence=80)
-    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "spread",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
     assert pick.strategy == "bull-call-spread"
     assert len(pick.legs) == 2
     assert pick.maxLoss > 0 and pick.rank > 0
 
 
 def test_selector_bear_put():
+    from unittest.mock import patch
     sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
                       confidence=80)
-    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "spread",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
     assert pick.strategy == "bear-put-spread"
     assert len(pick.legs) == 2
+
+
+def test_selector_long_call_itm():
+    """Buy-only long mode: single ITM BUY leg, no shorts."""
+    from unittest.mock import patch
+    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
+    assert pick.strategy == "long-call"
+    assert len(pick.legs) == 1
+    assert pick.legs[0].side == "BUY" and pick.legs[0].kind == "CE"
+    assert pick.legs[0].strike <= 25000.0  # ITM
+    assert pick.maxLoss > 0 and pick.rank > 0
+
+
+def test_selector_long_put_itm():
+    from unittest.mock import patch
+    sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
+    assert pick.strategy == "long-put"
+    assert len(pick.legs) == 1
+    assert pick.legs[0].side == "BUY" and pick.legs[0].kind == "PE"
+    assert pick.legs[0].strike >= 25000.0  # ITM
+    assert pick.maxLoss > 0
+
+
+def test_selector_long_chop_sits_out():
+    """Long-only book never sells premium: chop -> none."""
+    from unittest.mock import patch
+    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=10.0)
+    assert pick.strategy == "none"
+
+
+def test_selector_index_only_guard():
+    """Non-NIFTY underlying is refused outright."""
+    from unittest.mock import patch
+    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "BANKNIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
+    assert pick.strategy == "none"
 
 
 def test_selector_hold_is_none():
@@ -175,10 +263,18 @@ class _MegaStub:
 
 def test_megabull_options_opens_both_legs(tmp_path):
     """Happy path on the fake remote: both legs placed by MegaBull symbol."""
+    from unittest.mock import patch
     from src.broker.megabull_options import MegaBullOptionsBroker
     sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
                       confidence=80)
-    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "spread",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
     mega = _MegaStub()
     b = MegaBullOptionsBroker(mega, lot_size=50)
     o = b.open_spread(pick, lots=1)
@@ -192,6 +288,31 @@ def test_megabull_options_opens_both_legs(tmp_path):
     rec = b.close_spread(sid, pick.net_debit + 10.0, "test")
     assert rec["result"] == "PASS" and rec["asset"] == "options"
     assert not mega.positions, "remote legs must flatten on close"
+
+
+def test_megabull_options_single_long(tmp_path):
+    """Single-leg long on the fake remote: one BUY, books premium risk."""
+    from unittest.mock import patch
+    from src.broker.megabull_options import MegaBullOptionsBroker
+    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
+    assert pick.strategy == "long-call" and len(pick.legs) == 1
+    mega = _MegaStub()
+    b = MegaBullOptionsBroker(mega, lot_size=50)
+    o = b.open_spread(pick, lots=1)
+    assert o.status == "FILLED"
+    assert len(mega.posts) == 1 and mega.posts[0]["side"] == "BUY"
+    sid = list(b.positions.keys())[0]
+    rec = b.close_spread(sid, pick.net_debit + 10.0, "test")
+    assert rec["result"] == "PASS" and rec["asset"] == "options"
 
 
 def test_megabull_options_rejects_without_network(tmp_path):

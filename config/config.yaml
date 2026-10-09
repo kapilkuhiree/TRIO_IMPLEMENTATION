@@ -94,15 +94,15 @@ screener:
     - { name: "tight_80_100", min_confidence: 80, min_rank: 100 }
   max_positions_to_open_shadow: 3
 
-# NIFTY 50 options expression (index spreads, defined risk).
+# NIFTY 50 options expression (index only, buy-only, defined risk).
 # Spot view comes from the validated engine; options only replace HOW a
 # BUY/SELL is held. Paper fills via options_paper (live mid / LTP / BS sim).
 # Live Kite fills need the Kite Connect plan (~Rs500/mo) + keys in Secrets.
 options:
   enabled: true               # attach option_legs to screened candidates
-  # Which book the index spreads execute on:
+  # Which book the index options execute on:
   #   "paper"    -> local options_paper sim (chain-mid fills; legacy)
-  #   "megabull" -> MegaBull remote paper so the NIFTY spread is VISIBLE
+  #   "megabull" -> MegaBull remote paper so the NIFTY position is VISIBLE
   #                 in the MegaBull app. Probed live 2026-10-08: their
   #                 buysell rejected every options variant (MIS lot-size
   #                 error, NRML 500), so if a leg can't fill the overlay
@@ -113,17 +113,24 @@ options:
   broker: "megabull"
   underlying: "NIFTY"         # index only (liquid chain, tightest spreads)
   lot_size: 50                # read from Kite NFO at runtime; fallback only
-  max_spreads_per_session: 4  # hard cap: one spread id per session max,
+  max_spreads_per_session: 4  # hard cap: one position id per session max,
                               # so repeated execute_option_plan passes
                               # (startup + live re-scans) can never stack
                               # the same loss twice (2026-10-09: 8x booking)
-  delta_atm: 0.50             # long leg ~ATM
-  delta_otm: 0.30             # short leg ~OTM
+  # Strategy style: "spread" (debit spreads) or "long" (naked ITM longs).
+  # "long" = BUY-only, no SELL legs. Simpler fills, less margin, higher
+  # leverage. Recommended for NIFTY index testing.
+  style: "long"               # spread | long
+  delta_atm: 0.50             # long leg ~ATM (spread mode)
+  delta_otm: 0.30             # short leg ~OTM (spread mode only)
+  delta_long: 0.65            # long-only mode: target delta for ITM strike
+                              # (0.60-0.70 = slightly ITM, best balance of
+                              #  delta vs theta for intraday holds)
   min_oi: 1000                # skip wing when OI below this (illiquid)
   max_iv_rank: 80             # rich vol: penalty 0.5 on option rank
   chain_cache_minutes: 15     # NSE chain TTL intraday
   risk_free_rate: 0.065       # BS fallback only
-  max_premium_pct: 5.0        # skip spread when debit > 5% of spot (junk)
+  max_premium_pct: 5.0        # skip when premium > 5% of spot (junk)
   expiry_preference: "weekly" # weekly tactical + monthly swing (both swept)
   paper_only: true            # live Kite place_order stays OFF until proven
 

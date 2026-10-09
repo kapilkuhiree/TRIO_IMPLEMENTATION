@@ -5,10 +5,16 @@ Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 Turns a spot TradeSignal (+ ADX regime + IV-rank) into a defined-risk NIFTY
 options expression. Strategy table (proven-first):
 
-  trending + pullback BUY  -> Bull Call Spread (long ATM Δ~0.5, short OTM Δ~0.3)
-  trending bear + MACD SELL -> Bear Put Spread (long ATM put, short OTM put)
-  chop (ADX < 25)           -> Iron Condor 16Δ wings, ~7 DTE, 50% MPE exit
-  IV-rank > 80 + ATR spike  -> Long Straddle ATM, 30% trailing exit
+  SPREAD MODE (default):
+    trending + pullback BUY  -> Bull Call Spread (long ATM Δ~0.5, short OTM Δ~0.3)
+    trending bear + MACD SELL -> Bear Put Spread (long ATM put, short OTM put)
+    chop (ADX < 25)           -> Iron Condor 16Δ wings, ~7 DTE, 50% MPE exit
+    IV-rank > 80 + ATR spike  -> Long Straddle ATM, 30% trailing exit
+
+  LONG MODE (buy-only, config style="long"):
+    BUY signal  -> Long Call (ITM Δ~0.65, single leg, no short)
+    SELL signal -> Long Put (ITM Δ~0.65, single leg, no short)
+    chop/HOLD   -> none (no naked shorts, no premium selling)
 
 Quote preference per leg: live chain (bid/ask mid) -> chain LTP -> BS sim
 with HV proxy. A leg is skipped when bid == 0 or OI < floor (config) so an
@@ -149,6 +155,13 @@ def _pick_by_delta(rows: List[Dict[str, Any]], spot: float, kind: str,
                 continue
             if kind == "PE" and k > spot:
                 continue
+        elif side_prefer == "ITM":
+            # long-only mode: slightly ITM (CE: strike <= spot,
+            # PE: strike >= spot) for higher delta, slower theta bleed.
+            if kind == "CE" and k > spot:
+                continue
+            if kind == "PE" and k < spot:
+                continue
         elif side_prefer == "ATM":
             # long leg may sit slightly ITM so the spread has real debit
             pass
@@ -182,11 +195,19 @@ def select(signal: Any, chain: Dict[str, Any],
     if not cfg.get("enabled", True):
         return OptionTradeCandidate(strategy="none",
                                     reasoning=["options disabled in config"])
-    underlying = str(cfg.get("underlying", "NIFTY"))
+    # NIFTY index ONLY — never stock options. Explicit guard: if config
+    # drifts to anything else, refuse rather than trade the wrong book.
+    underlying = str(cfg.get("underlying", "NIFTY")).strip().upper()
+    if underlying != "NIFTY":
+        return OptionTradeCandidate(strategy="none", underlying=underlying,
+                                    reasoning=[f"index-only guard: {underlying} "
+                                               "blocked, NIFTY only"])
     lot_size = int(cfg.get("lot_size", 50))
     oi_floor = int(cfg.get("min_oi", 1000))
     d_atm = float(cfg.get("delta_atm", 0.50))
     d_otm = float(cfg.get("delta_otm", 0.30))
+    d_long = float(cfg.get("delta_long", 0.65))
+    style = str(cfg.get("style", "spread")).strip().lower()
     iv_cap = float(cfg.get("max_iv_rank", 80))
 
     spot = float(chain.get("underlying") or 0.0)
@@ -280,6 +301,66 @@ def select(signal: Any, chain: Dict[str, Any],
                 f"{strat} {long_row['strike']}/{short_row['strike']} "
                 f"debit {m['net_debit']} maxLoss {m['maxLoss']} "
                 f"maxGain {m['maxGain']} RR {m['RR']}"])
+
+    def build_long(kind: str) -> OptionTradeCandidate:
+        """Naked ITM long: single BUY leg, no short. Defined risk = premium.
+
+        Targets delta_long (default 0.65 = slightly ITM): higher delta
+        tracks the index better and bleeds less theta than ATM over an
+        intraday hold, at the cost of a higher premium per lot.
+        """
+        row = _pick_by_delta(rows, spot, kind, d_long, side_prefer="ITM")
+        if row is None:
+            return OptionTradeCandidate(strategy="none",
+                                        reasoning=["no ITM leg"])
+        q = _leg_quote(row, kind, t, spot, hv_proxy)
+        if q["premium"] <= 0:
+            return OptionTradeCandidate(strategy="none",
+                                        reasoning=["ITM leg unpriced"])
+        if not _liquid(q, oi_floor):
+            reasoning.append("thin ITM liquidity — sim-priced, size capped")
+        premium = q["premium"]
+        max_loss = round(premium * lot_size, 2)
+        strat = "long-call" if kind == "CE" else "long-put"
+        legs = [
+            OptionLeg(strike=row["strike"], expiry=expiry or "",
+                      kind=kind, side="BUY", premium=premium,
+                      premium_src=q["src"], delta=q["delta"], bid=q["bid"],
+                      ask=q["ask"], oi=q["oi"], volume=q["volume"]),
+        ]
+        iv_pen = 1.0
+        if iv_rank is not None and iv_rank > iv_cap:
+            iv_pen = 0.5
+        liq = 1.0 if _liquid(q, oi_floor) else 0.5
+        rank = round(conf * iv_pen * liq, 1)
+        return OptionTradeCandidate(
+            strategy=strat, underlying=underlying, spot=spot,
+            expiry=expiry or "", legs=legs, net_debit=premium,
+            maxLoss=max_loss, maxGain=0.0,
+            breakeven=round(row["strike"] + premium
+                            if kind == "CE"
+                            else row["strike"] - premium, 2),
+            margin=max_loss, rank=rank, confidence=conf,
+            reasoning=reasoning + [
+                f"{strat} {row['strike']} ITM premium {premium} "
+                f"maxLoss {max_loss}"])
+
+    # LONG MODE (buy-only): single ITM leg, never a short. Chop/HOLD -> none
+    # (no premium selling, no naked shorts — buy-only book sits out chop).
+    if style == "long":
+        if chop:
+            return OptionTradeCandidate(strategy="none", underlying=underlying,
+                                        spot=spot, expiry=expiry or "",
+                                        reasoning=["chop regime — long-only "
+                                                   "book sits out"])
+        if action == "BUY":
+            return build_long("CE")
+        if action == "SELL":
+            return build_long("PE")
+        return OptionTradeCandidate(strategy="none", underlying=underlying,
+                                    spot=spot, expiry=expiry or "",
+                                    reasoning=["HOLD signal — no options "
+                                               "expression"])
 
     # Chop -> iron condor (16-delta wings both sides).
     # SELL the call spread + SELL the put spread: collect credit on both

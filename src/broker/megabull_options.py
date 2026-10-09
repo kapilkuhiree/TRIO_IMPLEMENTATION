@@ -164,19 +164,24 @@ class MegaBullOptionsBroker(BaseBroker):
         except Exception as exc:
             return self._reject("?", lots, 0.0, f"bad candidate: {exc}")
         legs = d.get("legs", []) or []
-        if len(legs) < 2:
+        expiry = str(d.get("expiry") or "")
+        strat = str(d.get("strategy") or "spread")
+        single = (len(legs) == 1 and strat in ("long-call", "long-put"))
+        if len(legs) < 2 and not single:
             return self._reject(d.get("strategy", "?"), lots, 0.0,
                                 "spread needs 2 legs")
         longs = [l for l in legs if l.get("side") == "BUY"]
         shorts = [l for l in legs if l.get("side") == "SELL"]
-        if not longs or not shorts:
+        if single:
+            if not longs:
+                return self._reject(d.get("strategy", "?"), lots, 0.0,
+                                    "long needs a BUY leg")
+        elif not longs or not shorts:
             return self._reject(d.get("strategy", "?"), lots, 0.0,
                                 "spread needs long+short")
-        expiry = str(d.get("expiry") or "")
-        strat = str(d.get("strategy") or "spread")
         underlying = str(d.get("underlying") or "NIFTY")
         long_k = float(longs[0].get("strike") or 0)
-        short_k = float(shorts[0].get("strike") or 0)
+        short_k = float(shorts[0].get("strike") or 0) if shorts else 0.0
         net = float(d.get("net_debit") or 0.0)
         lots = max(1, int(lots or 1))
         sid = self._spread_id(strat, expiry, long_k, short_k)
