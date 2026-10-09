@@ -779,7 +779,7 @@ class PaperTrader:
         return restored
 
     def execute_option_plan(self, plan: Optional[Dict[str, Any]],
-                              opt_broker: Any = None) -> List[Dict[str, Any]]:
+                               opt_broker: Any = None) -> List[Dict[str, Any]]:
         """Place today's option legs (paper) for candidates carrying them.
 
         Uses the attached ``option_legs`` (spread/condor picked by
@@ -1002,6 +1002,84 @@ class PaperTrader:
         logger.info("execute_plan: placed %d order(s).", len(placed))
         return placed
 
+    def _live_rescan(self, slot: str) -> List[Dict[str, Any]]:
+        """Rebuild the plan from TODAY's live bars and trade anything new.
+
+        This is the market-hours discovery the user asked for: instead of
+        only trading yesterday's premarket file, the session re-runs the
+        full screener (+ option legs) on live data at scheduled slots and
+        immediately executes fresh candidates. ALWAYS sends a Telegram
+        verdict — "found + traded" or "scanned, nothing met the bar" — so
+        a quiet market is never mistaken for a dead bot. Never raises.
+        """
+        try:
+            from scripts.premarket import build_plan
+            cfg = load_config()
+            universe = cfg.get("universe", {}).get("premarket", "nifty100")
+            top_n = cfg.get("screener", {}).get("max_positions_to_open", 3)
+            fresh = build_plan(universe, "1d", top_n)
+            cands = fresh.get("candidates", []) or []
+            try:
+                from src.plan import save_plan as _save_plan
+                from src.plan import today_ist_str
+                _save_plan(dict(fresh, date=today_ist_str()))
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Live rescan (%s) failed: %s", slot, exc)
+            try:
+                from src.alerts import send_telegram
+                send_telegram(
+                    f"🔍 *Live Market Scan ({slot} IST)*\n\n"
+                    f"Scan failed ({exc}). Still managing open positions.")
+            except Exception:
+                pass
+            return []
+        if not cands:
+            logger.info("Live rescan (%s): scanned, nothing met the bar.", slot)
+            try:
+                from src.alerts import send_telegram
+                send_telegram(
+                    f"🔍 *Live Market Scan ({slot} IST)*\n\n"
+                    f"Scanned the live market — no new setup met the bar. "
+                    f"Open positions: `{len(self.broker.positions)}`. "
+                    f"Still watching stops, targets & the NSE options chain.")
+            except Exception:
+                pass
+            return []
+        # Trade the fresh candidates (equity + options) right now.
+        placed_eq = self.execute_plan({"candidates": cands})
+        placed_opt: List[Dict[str, Any]] = []
+        try:
+            opt_broker = getattr(self, "opt_broker", None)
+            if opt_broker is not None:
+                placed_opt = self.execute_option_plan(
+                    {"candidates": cands}, opt_broker=opt_broker)
+        except Exception as exc:
+            logger.warning("Live rescan (%s) options leg failed: %s", slot, exc)
+        try:
+            from src.alerts import send_telegram
+            lines = [f"🔍 *Live Market Scan ({slot} IST) — found "
+                     f"{len(cands)} setup(s), traded now:*"]
+            for c in cands[:5]:
+                lines.append(
+                    f"• {c.get('symbol')} {c.get('action')} "
+                    f"@{c.get('entry_price')} conf {c.get('confidence')} "
+                    f"rank {c.get('rank')}")
+                opt = c.get("option_legs") or {}
+                if opt.get("strategy") and opt.get("strategy") != "none":
+                    legs = " + ".join(
+                        f"{l.get('side')} {l.get('strike')}{l.get('kind')}"
+                        for l in (opt.get("legs") or []))
+                    lines.append(f"  + {opt.get('strategy')} {legs} "
+                                 f"debit {opt.get('net_debit')}")
+            lines.append(f"Equity orders: {len(placed_eq)} | "
+                         f"Options spreads: {len(placed_opt)}")
+            send_telegram("\n".join(lines))
+        except Exception:
+            pass
+        return cands
+
     def run_session(self, plan: Optional[Dict[str, Any]] = None,
                     interval_seconds: int = 60,
                     max_seconds: Optional[int] = None,
@@ -1031,7 +1109,7 @@ class PaperTrader:
         start = time.time()
         plan_done = plan is None  # no plan -> nothing to execute
         market_open_alerted = False
-        scan_940_alerted = False
+        live_scan_times = ["09:40", "11:00", "13:00"]
 
         while True:
             try:
@@ -1050,15 +1128,15 @@ class PaperTrader:
                         except Exception as _mo_exc:
                             logger.warning("Market open alert failed: %s", _mo_exc)
 
-                # 09:40 IST Intraday Scan & Search Alert
-                if now_str >= "09:40" and not scan_940_alerted and self._session_open():
-                    try:
-                        from src.alerts import send_telegram
-                        pos_count = len(self.broker.positions)
-                        send_telegram(f"🔍 *Intraday Market Scan (09:40 IST)*\n\nTRIO is actively searching the NIFTY 100 universe for momentum & breakout setups.\n• Open Positions: `{pos_count}`\n• Status: Monitoring stops, targets & live NSE options chain.")
-                        scan_940_alerted = True
-                    except Exception as _scan_exc:
-                        logger.warning("09:40 scan alert failed: %s", _scan_exc)
+                # Scheduled LIVE market re-scans (09:40 / 11:00 / 13:00 IST):
+                # rebuild the plan from today's live bars (not yesterday's
+                # file), trade anything new, and ALWAYS alert the outcome —
+                # silence is never mistaken for a dead bot.
+                for slot in list(live_scan_times):
+                    if now_str >= slot and self._session_open():
+                        live_scan_times.remove(slot)
+                        new_cands = self._live_rescan(slot)
+                        break
 
                 # Manage existing positions (stops/targets/partials).
                 self._guard_open_positions()
