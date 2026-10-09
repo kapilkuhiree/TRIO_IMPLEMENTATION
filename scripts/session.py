@@ -126,8 +126,8 @@ def main() -> None:
                 date, len((plan or {}).get("candidates", [])))
 
     # Startup "Good morning" Telegram: tells Mr Kapil Kuhire the job woke up,
-    # which plan it loaded, and the broker mirror status — sent BEFORE the
-    # trading loop starts so a silent boot is never mistaken for a dead bot.
+    # which plan it loaded, which broker platforms are selected, and that it is
+    # waiting for the 09:15 NSE market open before firing entries.
     try:
         from src.alerts import send_telegram
         _cand_lines = []
@@ -147,17 +147,28 @@ def main() -> None:
                     f"  + {_c.get('symbol')}: {_opt.get('strategy')} {_legs} "
                     f"debit {_opt.get('net_debit')} "
                     f"maxLoss {_opt.get('maxLoss')}")
-        _msg = ["☀️ *Good morning, Mr Kapil Kuhire Sir!*",
-                f"TRIO session started — {date}.",
-                f"Plan: {len((plan or {}).get('candidates', []))} candidate(s)."]
+
+        eq_prov = (cfg.get("broker", {}) or {}).get("provider", "megabull").upper()
+        opt_prov = (cfg.get("options", {}) or {}).get("broker", "megabull").upper()
+
+        _msg = [
+            "☀️ *Good morning, Mr Kapil Kuhire Sir!*",
+            "TRIO session started at 09:10 IST — *Waiting for market open (09:15 IST)*.",
+            "",
+            f"📍 *Platforms targeted today:*",
+            f"• *Equity Intraday:* `{eq_prov}` (MIS paper fills)",
+            f"• *Index Options:* `{opt_prov}` (with instant local-sim shadow fallback)",
+            "",
+            f"📋 *Today's Plan ({date}):* {len((plan or {}).get('candidates', []))} candidate(s)"
+        ]
         if _cand_lines:
-            _msg.append("*Equity:*")
+            _msg.append("\n*Equity Intraday Candidates:*")
             _msg.append("\n".join(_cand_lines))
         if _opt_lines:
-            _msg.append("*Options (paper spreads, same open):*")
+            _msg.append("\n*NIFTY Options Hedging Spreads:*")
             _msg.append("\n".join(_opt_lines))
         if not _cand_lines and not _opt_lines:
-            _msg.append("No candidates in today's plan — manage-only mode.")
+            _msg.append("\nNo candidates in today's plan — running in manage-only mode.")
         send_telegram("\n".join(_msg))
     except Exception as exc:
         logger.warning("Startup good-morning alert failed: %s", exc)
