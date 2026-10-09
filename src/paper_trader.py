@@ -1030,11 +1030,36 @@ class PaperTrader:
 
         start = time.time()
         plan_done = plan is None  # no plan -> nothing to execute
+        market_open_alerted = False
+        scan_940_alerted = False
+
         while True:
             try:
+                from datetime import datetime, timezone as _tz, timedelta as _td
+                ist_now = datetime.now(_tz(_td(hours=5, minutes=30)))
+                now_str = ist_now.strftime("%H:%M")
+
                 if not plan_done and self._session_open():
                     self.execute_plan(plan)
                     plan_done = True
+                    if not market_open_alerted:
+                        try:
+                            from src.alerts import send_telegram
+                            send_telegram("🔔 *Market Open (09:15 IST)*\n\nNSE session has started! TRIO is now active, orders dispatched, and position tracking is live.")
+                            market_open_alerted = True
+                        except Exception as _mo_exc:
+                            logger.warning("Market open alert failed: %s", _mo_exc)
+
+                # 09:40 IST Intraday Scan & Search Alert
+                if now_str >= "09:40" and not scan_940_alerted and self._session_open():
+                    try:
+                        from src.alerts import send_telegram
+                        pos_count = len(self.broker.positions)
+                        send_telegram(f"🔍 *Intraday Market Scan (09:40 IST)*\n\nTRIO is actively searching the NIFTY 100 universe for momentum & breakout setups.\n• Open Positions: `{pos_count}`\n• Status: Monitoring stops, targets & live NSE options chain.")
+                        scan_940_alerted = True
+                    except Exception as _scan_exc:
+                        logger.warning("09:40 scan alert failed: %s", _scan_exc)
+
                 # Manage existing positions (stops/targets/partials).
                 self._guard_open_positions()
                 self._manage_open_positions()

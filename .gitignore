@@ -44,6 +44,7 @@ logs/
 output/*
 !output/plans/
 !output/dashboard_state.json
+!output/subscribers.json
 output/plans/*
 !output/plans/*.json
 
