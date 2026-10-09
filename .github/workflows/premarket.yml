@@ -44,6 +44,11 @@ jobs:
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
           git add -A output/plans output/dashboard_state.json output/subscribers.json
+          git stash push -m "bot-state" --keep-index || true
+          git fetch origin main || true
+          git merge -X ours --no-edit origin/main || \
+            (git checkout --ours -- output/ && git add -A output/ && \
+             git -c core.editor=true merge --continue) || true
+          git stash pop || true
           git diff --cached --quiet || git commit -m "premarket plan $(date -u +%F)"
-          git pull --rebase --autostash || true
-          git push || (git pull --rebase --autostash && git push)
+          git push || (git pull --no-rebase -X ours || true; git push) || true

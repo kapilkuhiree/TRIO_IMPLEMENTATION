@@ -228,6 +228,44 @@ def test_megabull_options_rejects_without_network(tmp_path):
     assert any(o.get("asset") == "options" for o in orders)
 
 
+def test_option_plan_idempotent_across_passes(tmp_path):
+    """2026-10-09 regression: execute_option_plan runs on EVERY pass
+    (startup + 09:40/11:00/13:00 live re-scans). Repeated passes with the
+    same plan must NOT stack fresh spreads — one spread id per session,
+    so the same loss can never book 8x. Also honours the session cap."""
+    from src.paper_trader import PaperTrader
+    from src.broker.paper import PaperBroker
+
+    trader = PaperTrader(symbols=["NIFTY"], test_mode=False)
+    trader.trade_log_path = tmp_path / "trade_log.jsonl"
+    trader.broker = PaperBroker(initial_capital=500000.0)
+    trader.broker_name = "paper"
+
+    plan = _bear_plan()
+    opt_broker = OptionsPaperBroker(initial_capital=500000.0, lot_size=50)
+    first = trader.execute_option_plan(plan, opt_broker=opt_broker)
+    assert len(first) == 1
+    # three more passes, same session: zero new spreads
+    for _ in range(3):
+        more = trader.execute_option_plan(plan, opt_broker=opt_broker)
+        assert more == []
+    assert len(opt_broker.positions) == 1
+
+    # session cap: a trader with no spreads placed yet stops at the cap
+    trader2 = PaperTrader(symbols=["NIFTY"], test_mode=False)
+    trader2.trade_log_path = tmp_path / "trade_log2.jsonl"
+    trader2.broker = PaperBroker(initial_capital=500000.0)
+    trader2.broker_name = "paper"
+    trader2._opt_spreads_placed = set()
+    from unittest.mock import patch
+    with patch("src.paper_trader.load_config",
+               return_value={"options": {"lot_size": 50,
+                                         "max_spreads_per_session": 0}}):
+        capped = trader2.execute_option_plan(plan, opt_broker=(
+            OptionsPaperBroker(initial_capital=500000.0, lot_size=50)))
+    assert capped == []
+
+
 def _bear_plan(cand_symbol="NIFTY"):
     """One candidate carrying a real bear-put option_legs block."""
     sig = TradeSignal(symbol=cand_symbol, action="SELL",

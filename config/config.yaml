@@ -113,6 +113,10 @@ options:
   broker: "megabull"
   underlying: "NIFTY"         # index only (liquid chain, tightest spreads)
   lot_size: 50                # read from Kite NFO at runtime; fallback only
+  max_spreads_per_session: 4  # hard cap: one spread id per session max,
+                              # so repeated execute_option_plan passes
+                              # (startup + live re-scans) can never stack
+                              # the same loss twice (2026-10-09: 8x booking)
   delta_atm: 0.50             # long leg ~ATM
   delta_otm: 0.30             # short leg ~OTM
   min_oi: 1000                # skip wing when OI below this (illiquid)

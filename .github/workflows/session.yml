@@ -50,9 +50,15 @@ jobs:
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
           git add -A output/dashboard_state.json output/plans output/subscribers.json
+          git stash push -m "bot-state" --keep-index || true
+          git fetch origin main || true
+          # 2026-10-09: rebase --autostash failed on unmerged state files
+          # (exit 128, digest lost). Merge instead: bot files are
+          # append/overwrite state, so "ours" always wins and the push
+          # can never die on a rebase conflict again.
+          git merge -X ours --no-edit origin/main || \
+            (git checkout --ours -- output/ && git add -A output/ && \
+             git -c core.editor=true merge --continue) || true
+          git stash pop || true
           git diff --cached --quiet || git commit -m "session state $(date -u +%F)"
-          git pull --rebase --autostash || true
-          # State files append JSON lines; merge upstream instead of
-          # failing on conflict (trade_log is no longer tracked, so the
-          # old merge-conflict failure mode is gone).
-          git push || (git pull --rebase --autostash && git push)
+          git push || (git pull --no-rebase -X ours || true; git push) || true

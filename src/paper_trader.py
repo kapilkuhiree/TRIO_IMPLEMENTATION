@@ -799,6 +799,16 @@ class PaperTrader:
             except Exception as exc:
                 logger.warning("execute_option_plan: no options broker: %s", exc)
                 return []
+        # Idempotency (2026-10-09: execute_option_plan runs on EVERY pass —
+        # startup + each live re-scan — and each pass opened a FRESH spread
+        # without checking, booking the same loss 8x). One spread id per
+        # session, across the main book AND every shadow book. The set is
+        # keyed by provider so a MegaBull-held spread and a local shadow
+        # never collide.
+        if not hasattr(self, "_opt_spreads_placed"):
+            self._opt_spreads_placed = set()
+        max_spreads = int((load_config().get("options", {}) or {}).get(
+            "max_spreads_per_session", 4))
         placed: List[Dict[str, Any]] = []
         for cand in plan.get("candidates", []) or []:
             opt = cand.get("option_legs") or {}
@@ -821,6 +831,29 @@ class PaperTrader:
                     rank=float(opt.get("rank") or 0.0),
                     confidence=int(opt.get("confidence")
                                    or cand.get("confidence") or 0))
+                provider = str(getattr(
+                    opt_broker, "provider_name", "options_paper"))
+                longs = [l for l in legs if l.side == "BUY"]
+                shorts = [l for l in legs if l.side == "SELL"]
+                sid_key = (provider, pick.strategy, pick.expiry,
+                           float(longs[0].strike) if longs else 0.0,
+                           float(shorts[0].strike) if shorts else 0.0)
+                if sid_key in self._opt_spreads_placed:
+                    logger.info(
+                        "execute_option_plan: SKIP %s %s (spread already "
+                        "held this session).", cand.get("symbol"),
+                        pick.strategy)
+                    continue
+                if len(self._opt_spreads_placed) >= max_spreads:
+                    logger.info(
+                        "execute_option_plan: session cap (%d spreads) "
+                        "reached — SKIP %s.", max_spreads,
+                        cand.get("symbol"))
+                    self._log_event("skip", {
+                        "symbol": cand.get("symbol"), "asset": "options",
+                        "strategy": pick.strategy,
+                        "reason": "session-spread-cap"})
+                    continue
                 risk_amt = float(cand.get("risk_amount") or 0.0)
                 lot_sz = int(load_config().get("options", {}).get(
                     "lot_size", 50))
@@ -829,6 +862,8 @@ class PaperTrader:
                     lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
                 order = opt_broker.open_spread(pick, lots=lots,
                                                reason="options-plan")
+                if order.status == "FILLED":
+                    self._opt_spreads_placed.add(sid_key)
                 if order.status != "FILLED":
                     self._log_event("skip", {
                         "symbol": cand.get("symbol"), "asset": "options",
@@ -853,6 +888,14 @@ class PaperTrader:
                             s_order = shadow.open_spread(
                                 pick, lots=lots, reason="options-shadow")
                             if s_order.status == "FILLED":
+                                # Same spread shape as the main book, so the
+                                # next execute_option_plan pass skips it too.
+                                self._opt_spreads_placed.add(
+                                    ("options_paper", pick.strategy,
+                                     pick.expiry,
+                                     float(longs[0].strike) if longs else 0.0,
+                                     float(shorts[0].strike)
+                                     if shorts else 0.0))
                                 record = {
                                     "symbol": cand.get("symbol"),
                                     "asset": "options",
