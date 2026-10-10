@@ -19,7 +19,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from src.broker.base import BaseBroker, BrokerOrder, Position
-from src.utils import get_logger, utc_now
+from src.utils import get_logger, load_config, utc_now
 
 logger = get_logger("broker.options_paper")
 
@@ -91,6 +91,22 @@ class OptionsPaperBroker(BaseBroker):
         cost = net * lots * self.lot_size
         if cost > self.capital:
             return self._reject(sid, lots, net, "Insufficient capital")
+        bidask = (str(load_config().get("options", {}).get(
+            "fill_model", "mid")).strip().lower() == "bidask")
+        if bidask and not single:
+            # per spec §6: debit spreads — buy at ask, sell at bid + tick slip
+            try:
+                from src.options_pricing import fill_leg_premium as _fill
+                # _leg_quote was already resolved per leg; retrieve per-leg
+                # executable fills by re-reading the quote dicts we just made.
+                # lq/sq are mid-anchored; _fill converts to executable side.
+                adj_l = _fill(lq, "BUY")
+                adj_s = _fill(sq, "SELL")
+                net = round(max(adj_l - adj_s, 0.05), 2)
+                cost = net * lots * self.lot_size
+            except Exception:
+                pass  # fallback stays on mid
+
         oid = f"opt_{uuid.uuid4().hex[:8]}"
         order = BrokerOrder(
             order_id=oid, symbol=sid, side="BUY", quantity=lots,

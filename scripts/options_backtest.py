@@ -183,18 +183,40 @@ def _bs(spot: float, strike: float, dte_days: int, vol: float,
     return bs_price(spot, strike, max(dte_days, 1) / 365.0, vol, kind)
 
 
+def _costs_for(trade: "OptTrade", lot: int = LOT,
+               brokerage_per_order: float = 20.0,
+               stt_rate: float = 0.0015) -> float:
+    """Round-trip cost per spec §3: brokerage × orders + STT on sold legs.
+    Naked long (1 leg -> 2 orders), debit spread (2 legs x2 sides -> 4 orders).
+    """
+    is_long = trade.strategy in ("long-call", "long-put")
+    orders = 2 if is_long else 4
+    brok = brokerage_per_order * orders
+    # STT only on sold premium (long leg has no STT on buy; sell at exit does)
+    # Spread: one SELL leg; Long: SELL at exit.
+    stt = 0.0
+    if not is_long:
+        # short leg sold at entry; long sold at exit
+        stt += trade.entry_debit * 0.5 * lot * stt_rate  # approx sold half
+        stt += trade.exit_value * 0.5 * lot * stt_rate
+    else:
+        stt += trade.exit_value * lot * stt_rate
+    return round(brok + stt, 2)
+
+
 def _enter(variant: str, action: str, spot: float, dte: int,
            vol: float) -> Tuple[str, List[Tuple[float, str, str]],
                                  float, float]:
     """Returns (strategy, [(strike, kind, side)], debit, width)."""
     kind = "CE" if action == "BUY" else "PE"
-    if variant in ("A", "D"):
-        tgt = 0.65 if variant == "A" else 0.50
-        k = _pick_strike(spot, kind, tgt, side="ITM" if variant == "A"
-                         else "ATM" if False else "OTM")
-        # ATM naked: nearest strike (may be OTM side); ITM: ITM side
-        if variant == "D":
-            k = min(_strikes_around(spot), key=lambda x: abs(x - spot))
+    if variant in ("A", "D", "E", "F", "G", "H", "I", "J"):
+        tgt_map = {"A": 0.65, "D": 0.50, "E": 0.60, "F": 0.70,
+                   "G": 0.55, "H": 0.65, "I": 0.65, "J": 0.65}
+        tgt = tgt_map.get(variant, 0.65)
+        side_map = {"A": "ITM", "D": "ATM", "E": "ITM", "F": "ITM",
+                    "G": "ITM", "H": "ITM", "I": "ITM", "J": "ITM"}
+        side = side_map.get(variant, "ITM")
+        k = _pick_strike(spot, kind, tgt, side=side)
         px = _bs(spot, k, dte, vol, kind)
         strat = "long-call" if kind == "CE" else "long-put"
         return strat, [(k, kind, "BUY")], px, 0.0
@@ -202,9 +224,32 @@ def _enter(variant: str, action: str, spot: float, dte: int,
     if variant == "B":
         long_k = min(_strikes_around(spot), key=lambda x: abs(x - spot))
         short_k = _pick_strike(spot, kind, 0.30, side="OTM")
-    else:  # C: ITM long
+    elif variant == "C":
         long_k = _pick_strike(spot, kind, 0.65, side="ITM")
         short_k = _pick_strike(spot, kind, 0.30, side="OTM")
+    elif variant == "K":  # wider spread (0.55/0.15)
+        long_k = _pick_strike(spot, kind, 0.55, side="ITM")
+        short_k = _pick_strike(spot, kind, 0.15, side="OTM")
+    elif variant == "L":  # narrower spread (0.45/0.40)
+        long_k = _pick_strike(spot, kind, 0.45, side="ITM")
+        short_k = _pick_strike(spot, kind, 0.40, side="OTM")
+    elif variant == "M":  # spread with long at 0.55, short at 0.25
+        long_k = _pick_strike(spot, kind, 0.55, side="ITM")
+        short_k = _pick_strike(spot, kind, 0.25, side="OTM")
+    elif variant == "N":  # credit spread (sell OTM, buy further OTM)
+        short_k = _pick_strike(spot, kind, 0.35, side="OTM")
+        long_k = _pick_strike(spot, kind, 0.15, side="OTM")
+        if long_k == short_k:
+            step = 50
+            long_k = short_k + 50 if kind == "CE" else short_k - 50
+        lp = _bs(spot, long_k, dte, vol, kind)
+        sp = _bs(spot, short_k, dte, vol, kind)
+        if sp <= lp:
+            sp = lp + 0.01
+        credit = round(sp - lp, 2)
+        width = abs(long_k - short_k)
+        strat = "bear-call-spread" if kind == "CE" else "bull-put-spread"
+        return strat, [(short_k, kind, "SELL"), (long_k, kind, "BUY")], -credit, width
     if short_k == long_k:
         step = 50
         short_k = long_k + step if kind == "CE" else long_k - step
@@ -276,7 +321,14 @@ def run_variant(df, variant: str, vol: float = 0.18,
             exit_v, reason = eod_v, "spread-target"
         else:
             exit_v, reason = eod_v, "eod"
-        pnl = round((exit_v - debit) * LOT, 2)
+        gross = round((exit_v - debit) * LOT, 2)
+        tmp = OptTrade(date="", action=action, variant=variant,
+                       strategy=strat, expiry_days=dte_entry,
+                       entry_debit=debit, exit_value=exit_v, pnl=gross,
+                       exit_reason=reason, entry_spot=entry_spot,
+                       exit_spot=float(c[i + 1]))
+        costs = _costs_for(tmp, lot=LOT)
+        pnl = round(gross - costs, 2)
         trades.append(OptTrade(
             date=str(idx[i + 1].date()) if hasattr(idx[i + 1], "date")
             else str(idx[i + 1]),
@@ -330,7 +382,12 @@ def main() -> None:
               f"worst={s['worst']:+.0f} exits={s['exits']}")
 
     names = {"A": "long-ITM-0.65", "B": "spread-ATM",
-             "C": "spread-ITM-0.65", "D": "long-ATM-0.50"}
+             "C": "spread-ITM-0.65", "D": "long-ATM-0.50",
+             "E": "long-ITM-0.60", "F": "long-ITM-0.70",
+             "G": "long-ITM-0.55", "H": "long-ITM-0.65-dte5",
+             "I": "long-ITM-0.65-tight", "J": "long-ITM-0.65-wide",
+             "K": "spread-0.55/0.15-wide", "L": "spread-0.45/0.40-narrow",
+             "M": "spread-0.55/0.25", "N": "credit-spread"}
     print("\n==== RANKED (by total P&L) ====")
     for v, (_, s) in sorted(results.items(), key=lambda kv: kv[1][1]["pnl"],
                              reverse=True):

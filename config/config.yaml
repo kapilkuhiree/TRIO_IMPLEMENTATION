@@ -112,7 +112,8 @@ options:
   #                 the quiet local sim.
   broker: "megabull"
   underlying: "NIFTY"         # index only (liquid chain, tightest spreads)
-  lot_size: 50                # read from Kite NFO at runtime; fallback only
+  lot_size: 65                # NIFTY lot from Jan 2026: 65 (was 75); per spec §3
+  strike_step: 50             # NIFTY strike granularity
   max_spreads_per_session: 4  # hard cap: one position id per session max,
                               # so repeated execute_option_plan passes
                               # (startup + live re-scans) can never stack
@@ -133,6 +134,11 @@ options:
   max_premium_pct: 5.0        # skip when premium > 5% of spot (junk)
   expiry_preference: "weekly" # weekly tactical + monthly swing (both swept)
   paper_only: true            # live Kite place_order stays OFF until proven
+  # Fill realism (spec §6): BUY at ask, SELL at bid, plus slippage.
+  fill_model: "bidask"        # mid | bidask  (mid = legacy, bidask = execution-realistic)
+  slippage_ticks: 0.5         # extra slippage per leg in ticks (1 tick = 0.05)
+  brokerage_per_order: 20     # Rs per order leg (broker sheet rate)
+  stt_rate_sold: 0.0015       # STT 0.15% of premium on sold legs (from 2026-04-01 per spec §3)
 
 timeframes:
   default: "15m"

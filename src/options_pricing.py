@@ -137,3 +137,61 @@ def breakeven_call_spread(long_strike: float, net_debit: float) -> float:
 def breakeven_put_spread(long_strike: float, net_debit: float) -> float:
     """Long-strike - debit (bear put)."""
     return float(long_strike) - float(net_debit)
+
+
+def fill_premium(row: Dict[str, float], side: str = "BUY",
+                 slippage_ticks: float = 0.5) -> Dict[str, float]:
+    """Executable fill premium per spec: BUY at ask + slippage, SELL at bid.
+
+    When fill_model is "mid" (legacy), callers should use mid=(bid+ask)/2
+    directly. When "bidask", use this. Falls back to LTP then BS when the
+    chain quote is missing — never raises, never returns 0 for a valid row
+    without a fallback the caller can detect.
+
+    Returns dict with premium, src (bidask|ltp|sim), bid, ask, oi, volume.
+    """
+    tick = 0.05  # NIFTY index option tick
+    slip = float(slippage_ticks or 0.0) * tick
+    # row here is expected to be {"bid":..,"ask":..,"ltp":..,"premium":..}
+    bid = float(row.get("bid") or row.get("bidPrice") or 0.0)
+    ask = float(row.get("ask") or row.get("askPrice") or 0.0)
+    ltp = float(row.get("ltp") or row.get("lastPrice") or 0.0)
+    oi = int(row.get("oi") or row.get("openInterest") or 0)
+    vol = int(row.get("volume") or row.get("vol") or 0)
+    if side == "BUY" and ask > 0:
+        px, src = round(ask + slip, 2), "bidask"
+    elif side == "SELL" and bid > 0:
+        # SELL collects bid: more bid is better for the seller, slippage
+        # is against the seller (lower fill).
+        px, src = round(max(bid - slip, 0.05), 2), "bidask"
+    elif ltp > 0:
+        px, src = round(ltp, 2), "ltp"
+    elif float(row.get("premium") or 0.0) > 0:
+        px, src = round(float(row["premium"]), 2), "sim"
+    else:
+        px, src = 0.0, "none"
+    return {"premium": px, "src": src, "bid": bid, "ask": ask,
+            "oi": oi, "volume": vol}
+
+
+def fill_leg_premium(leg_quote: Dict[str, float], side: str = "BUY",
+                     slippage_ticks: Optional[float] = None) -> float:
+    """Apply spec §6 slippage to an already-quoted leg (mid/ltp/sim).
+
+    Leg_quote is the _leg_quote output {premium, bid, ask, src, ...}.
+    When fill_model is bidask, replace mid with executable side price.
+    """
+    try:
+        ticks = float(slippage_ticks) if slippage_ticks is not None else \
+            float(load_config().get("options", {}).get(
+                "slippage_ticks", 0.5))
+    except Exception:
+        ticks = 0.5
+    slip = ticks * 0.05
+    bid = float(leg_quote.get("bid") or 0.0)
+    ask = float(leg_quote.get("ask") or 0.0)
+    if side == "BUY" and ask > 0:
+        return round(ask + slip, 2)
+    if side == "SELL" and bid > 0:
+        return round(max(bid - slip, 0.05), 2)
+    return float(leg_quote.get("premium") or 0.0)
