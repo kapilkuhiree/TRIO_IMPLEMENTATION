@@ -1169,12 +1169,16 @@ class PaperTrader:
                     self.execute_plan(plan)
                     plan_done = True
                     if not market_open_alerted:
-                        try:
-                            from src.alerts import send_telegram
-                            send_telegram("🔔 *Market Open (09:15 IST)*\n\nNSE session has started! TRIO is now active, orders dispatched, and position tracking is live.")
-                            market_open_alerted = True
-                        except Exception as _mo_exc:
-                            logger.warning("Market open alert failed: %s", _mo_exc)
+                        _open_msg = "🔔 *Market Open (09:15 IST)*\n\nNSE session has started! TRIO is now active, orders dispatched, and position tracking is live."
+                        for _sender in (
+                            lambda m: __import__("src.alerts", fromlist=["send_telegram"]).send_telegram(m),
+                            lambda m: __import__("src.alerts", fromlist=["send_options_telegram"]).send_options_telegram(m),
+                        ):
+                            try:
+                                _sender(_open_msg)
+                            except Exception as _mo_exc:
+                                logger.warning("Market open alert failed: %s", _mo_exc)
+                        market_open_alerted = True
 
                 # Scheduled LIVE market re-scans (09:40 / 11:00 / 13:00 IST):
                 # rebuild the plan from today's live bars (not yesterday's
@@ -1195,8 +1199,8 @@ class PaperTrader:
                     "session_open": self._session_open(),
                     "positions": len(self.broker.positions)})
                 try:
-                    from src.alerts import handle_joins
-                    handle_joins()
+                    from src.alerts import handle_all_joins
+                    handle_all_joins()
                 except Exception:
                     pass
                 if tick_hook is not None:

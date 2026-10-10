@@ -114,15 +114,31 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     }
 
 
-def format_summary(plan: Dict[str, Any]) -> str:
-    """Phone-friendly Telegram summary of the plan."""
-    # Structured stats line — requested vs scanned vs failed.
+def format_summary(plan: Dict[str, Any], kind: str = "all") -> str:
+    """Phone-friendly Telegram summary. kind=all|equity|options."""
     _req = plan.get("requested", plan.get("scanned", "?"))
     _fail = plan.get("failed", "?")
-    lines = [f"*TRIO premarket plan — {plan['date']}*",
+    tag = " — Options (8877508167)" if kind == "options" else (
+        " — Equity" if kind == "equity" else "")
+    lines = [f"*TRIO premarket plan — {plan['date']}{tag}*",
              f"Universe: {plan['universe']} ({plan['scanned']} scanned, {_fail} failed, {plan.get('requested', _req)} requested) "
              f"on {plan['timeframe']}"]
-    cands = plan.get("candidates", [])
+    cands = plan.get("candidates", []) or []
+    if kind == "options":
+        opts = [c for c in cands if (c.get("option_legs") or {}).get("strategy") not in (None, "", "none")]
+        if not opts:
+            lines.append("No options spreads met the bar today.")
+            return "\n".join(lines)
+        lines.append(f"{len(opts)} NIFTY options spread(s):")
+        for c in opts:
+            opt = c.get("option_legs") or {}
+            legs = " + ".join(
+                f"{l.get('side')} {l.get('strike')}{l.get('kind')}@{l.get('premium')}"
+                for l in (opt.get("legs") or []))
+            lines.append(f"• {c.get('symbol')} {opt.get('strategy')} {legs} "
+                         f"debit {opt.get('net_debit')} maxLoss {opt.get('maxLoss')}")
+        return "\n".join(lines)
+    # equity (or all): show equity legs; options detail only for all
     if not cands:
         lines.append("No setups met the bar today — no trades planned.")
         return "\n".join(lines)
@@ -134,23 +150,32 @@ def format_summary(plan: Dict[str, Any]) -> str:
             f"target {c.get('target')} qty {c.get('position_size')} "
             f"conf {c.get('confidence')} rank {c.get('rank')} "
             f"({c.get('setup_name')})")
-        opt = c.get("option_legs") or {}
-        if opt.get("strategy") and opt.get("strategy") != "none":
-            legs = " + ".join(
-                f"{l.get('side')} {l.get('strike')}{l.get('kind')}@{l.get('premium')}"
-                for l in (opt.get("legs") or []))
-            lines.append(
-                f"  + {opt.get('strategy')} {legs} "
-                f"debit {opt.get('net_debit')} "
-                f"maxLoss {opt.get('maxLoss')}")
+        if kind == "all":
+            opt = c.get("option_legs") or {}
+            if opt.get("strategy") and opt.get("strategy") != "none":
+                legs = " + ".join(
+                    f"{l.get('side')} {l.get('strike')}{l.get('kind')}@{l.get('premium')}"
+                    for l in (opt.get("legs") or []))
+                lines.append(
+                    f"  + {opt.get('strategy')} {legs} "
+                    f"debit {opt.get('net_debit')} "
+                    f"maxLoss {opt.get('maxLoss')}")
     return "\n".join(lines)
 
 
+def format_equity_summary(plan: Dict[str, Any]) -> str:
+    return format_summary(plan, kind="equity")
+
+
+def format_options_summary(plan: Dict[str, Any]) -> str:
+    return format_summary(plan, kind="options")
+
+
 def main() -> None:
-    # Check for any new /start subscribers before sending the premarket plan
+    # Check for /start on BOTH bots so broadcasts stay separate.
     try:
-        from src.alerts import handle_joins
-        handle_joins()
+        from src.alerts import handle_all_joins
+        handle_all_joins()
     except Exception:
         pass
 
@@ -179,9 +204,14 @@ def main() -> None:
     if not args.no_alert:
         try:
             from src.alerts import send_telegram
-            send_telegram(format_summary(plan))
+            send_telegram(format_equity_summary(plan))
         except Exception as exc:
-            logger.warning("Premarket Telegram summary failed: %s", exc)
+            logger.warning("Equity premarket Telegram failed: %s", exc)
+        try:
+            from src.alerts import send_options_telegram
+            send_options_telegram(format_options_summary(plan))
+        except Exception as exc:
+            logger.warning("Options premarket Telegram failed: %s", exc)
 
 
 if __name__ == "__main__":

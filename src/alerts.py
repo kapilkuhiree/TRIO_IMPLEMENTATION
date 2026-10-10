@@ -44,48 +44,41 @@ def _md_escape(text: Any) -> str:
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(message: str, config_override: Optional[Dict[str, Any]] = None) -> bool:
-    """
-    Send a message via Telegram bot.
-
-    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.
-
-    Args:
-        message:         Text message to send.
-        config_override: Override alert config.
-
-    Returns:
-        True if sent successfully.
-    """
-    # Unit/smoke tests must NEVER ping the real bot. conftest sets
-    # TRIO_TEST_MODE=1 for the whole suite; combined with the sidecar
-    # trade ledger this keeps the suite hermetic (2026-10-08: a local
-    # pytest run sent live entry/exit Telegram messages).
+def _send_telegram_kind(message: str, kind: str,
+                        config_override: Optional[Dict[str, Any]] = None) -> bool:
+    """Internal: send via kind=equity|options. Separate token/chat pair."""
     if os.environ.get("TRIO_TEST_MODE") == "1" and config_override is None:
         logger.debug("Telegram suppressed in test mode")
         return False
-
-    cfg = load_config()
-    tg_cfg = config_override or cfg.get("alerts", {}).get("telegram", {})
+    if config_override is not None:
+        tg_cfg = config_override
+    elif kind == "options":
+        tg_cfg = (_resolve_bot("options")[0] and _tg_cfg("options")[0]) or \
+                 load_config().get("alerts", {}).get("telegram", {})
+    else:
+        tg_cfg = load_config().get("alerts", {}).get("telegram", {})
 
     if not tg_cfg.get("enabled", False):
         logger.debug("Telegram alerts disabled")
         return False
 
-    token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
-    chat_id = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    if config_override is not None:
+        token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+        chat_id = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    else:
+        token, chat_id, _ = _resolve_bot(kind)
 
     if not token or not chat_id:
-        logger.warning("Telegram credentials not set")
+        logger.warning("Telegram credentials not set (kind=%s)", kind)
         return False
 
-    recipients = _subscriber_ids(chat_id)
+    recipients = _subscriber_ids(chat_id, kind=kind)
     if not recipients:
-        logger.warning("Telegram has no recipients (no subscribers file, no chat ID)")
+        logger.warning("Telegram has no recipients (kind=%s)", kind)
         return False
 
     try:
-        import requests
+        import requests  # noqa: E402
     except ImportError:
         logger.error("requests not installed — cannot send Telegram alerts")
         return False
@@ -94,49 +87,101 @@ def send_telegram(message: str, config_override: Optional[Dict[str, Any]] = None
     for cid in recipients:
         try:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                "chat_id": cid,
-                "text": message,
-                "parse_mode": "Markdown",
-            }
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(url, json={
+                "chat_id": cid, "text": message, "parse_mode": "Markdown",
+            }, timeout=10)
             resp.raise_for_status()
-            _record_delivery(cid, ok=True)
+            _record_delivery(cid, ok=True, kind=kind)
             ok_any = True
         except Exception as exc:
-            # 403 = user blocked the bot. Track consecutive failures and
-            # auto-remove after 3 so one dead account can't slow the fan-out.
             status = getattr(getattr(exc, "response", None), "status_code", None)
             logger.error("Telegram send failed for %s: %s", cid, exc)
-            _record_delivery(cid, ok=False, blocked=(status == 403))
+            _record_delivery(cid, ok=False, blocked=(status == 403), kind=kind)
     if ok_any:
-        logger.info("Telegram alert sent to %d recipient(s)", len(recipients))
+        logger.info("Telegram alert sent to %d recipient(s) (kind=%s)",
+                    len(recipients), kind)
     return ok_any
+
+
+def send_telegram(message: str, config_override: Optional[Dict[str, Any]] = None) -> bool:
+    """Send via the OLD intraday/equity bot."""
+    return _send_telegram_kind(message, kind="equity",
+                               config_override=config_override)
+
+
+def send_options_telegram(message: str,
+                          config_override: Optional[Dict[str, Any]] = None) -> bool:
+    """Send via the NEW options bot (8877508167). Falls back to old when unset."""
+    return _send_telegram_kind(message, kind="options",
+                               config_override=config_override)
+
+
+# ---------------------------------------------------------------------------
+# Legacy resolves: old bot (default channel) vs new options bot
+# ---------------------------------------------------------------------------
+
+def _tg_cfg(kind: str = "equity") -> tuple[Dict[str, Any], bool]:
+    """Return (tg_cfg, is_options). kind=equity|options."""
+    cfg = load_config()
+    tg = (cfg.get("alerts", {}) or {}).get("telegram", {}) or {}
+    if kind == "options":
+        opt = tg.get("options") if isinstance(tg.get("options"), dict) else None
+        # fallback to top-level telegram until the user finishes secrets setup
+        opt_cfg = (opt or tg)
+        return (opt_cfg, bool(opt))
+    return (tg, False)
+
+
+def _resolve_bot(kind: str) -> tuple[str, str, Path]:
+    """Return (token, chat_id, subscriber_file) for kind=equity|options."""
+    is_opt = (kind == "options")
+    cfg = load_config()
+    tg = (cfg.get("alerts", {}) or {}).get("telegram", {}) or {}
+    if is_opt:
+        opt = tg.get("options") if isinstance(tg.get("options"), dict) else {}
+        token_env = (opt.get("bot_token_env") or "TELEGRAM_OPTIONS_BOT_TOKEN")
+        chat_env = (opt.get("chat_id_env") or "TELEGRAM_OPTIONS_CHAT_ID")
+        sub_file = (opt.get("subscriber_file") or "output/subscribers_options.json")
+        token = get_env(token_env) or ""
+        chat_id = get_env(chat_env) or ""
+        # Fallback to the old bot when the new one is not configured yet
+        if not token:
+            token = get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+            chat_id = get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+            sub_file = tg.get("subscriber_file", "output/subscribers.json")
+    else:
+        token = get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+        chat_id = get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+        sub_file = tg.get("subscriber_file", "output/subscribers.json")
+    path = Path(sub_file)
+    if not path.is_absolute():
+        from src.utils import PROJECT_ROOT
+        path = PROJECT_ROOT / sub_file
+    return (token, chat_id, path)
 
 
 # ---------------------------------------------------------------------------
 # Subscriber store + join handling (open broadcast)
 # ---------------------------------------------------------------------------
 
-def _subscriber_file() -> Path:
-    """Path to the subscriber JSON. Falls back to output/subscribers.json."""
+def _subscriber_file(kind: str = "equity") -> Path:
+    """Path to the subscriber JSON for kind=equity|options."""
     try:
-        cfg = load_config()
-        p = cfg.get("alerts", {}).get("telegram", {}).get(
-            "subscriber_file", "output/subscribers.json")
+        return _resolve_bot(kind)[2]
     except Exception:
-        p = "output/subscribers.json"
-    path = Path(p)
-    if not path.is_absolute():
         from src.utils import PROJECT_ROOT
-        path = PROJECT_ROOT / p
-    return path
+        return PROJECT_ROOT / "output/subscribers.json"
 
 
-def _load_subscribers() -> Dict[str, Any]:
-    """Read the subscriber store. Returns {} when missing/corrupt."""
+def _subscriber_file_legacy() -> Path:
+    """Legacy (equity) only — kept for callers that assumed one bot."""
+    return _subscriber_file("equity")
+
+
+def _load_subscribers(kind: str = "equity") -> Dict[str, Any]:
+    """Read the subscriber store for kind. Returns {} when missing/corrupt."""
     try:
-        path = _subscriber_file()
+        path = _subscriber_file(kind)
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -144,18 +189,18 @@ def _load_subscribers() -> Dict[str, Any]:
     return {}
 
 
-def _save_subscribers(data: Dict[str, Any]) -> None:
+def _save_subscribers(data: Dict[str, Any], kind: str = "equity") -> None:
     """Atomic write of the subscriber store (tmp + rename)."""
-    path = _subscriber_file()
+    path = _subscriber_file(kind)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(path)
 
 
-def _subscriber_ids(fallback_chat_id: Optional[str]) -> List[str]:
+def _subscriber_ids(fallback_chat_id: Optional[str], kind: str = "equity") -> List[str]:
     """All chat IDs to fan out to. Falls back to the single .env ID."""
-    data = _load_subscribers()
+    data = _load_subscribers(kind)
     chats = data.get("chats")
     if isinstance(chats, list) and chats:
         return [str(c) for c in chats]
@@ -164,22 +209,22 @@ def _subscriber_ids(fallback_chat_id: Optional[str]) -> List[str]:
     return []
 
 
-def _record_delivery(chat_id: str, ok: bool, blocked: bool = False) -> None:
+def _record_delivery(chat_id: str, ok: bool, blocked: bool = False,
+                     kind: str = "equity") -> None:
     """Track consecutive failures; auto-remove after 3 (likely blocked)."""
     if ok and not blocked:
-        # Clear any failure streak on success.
         try:
-            data = _load_subscribers()
+            data = _load_subscribers(kind)
             fails = data.get("failures", {})
             if str(chat_id) in fails:
                 del fails[str(chat_id)]
                 data["failures"] = fails
-                _save_subscribers(data)
+                _save_subscribers(data, kind)
         except Exception:
             pass
         return
     try:
-        data = _load_subscribers()
+        data = _load_subscribers(kind)
         fails = data.get("failures", {})
         key = str(chat_id)
         fails[key] = int(fails.get(key, 0)) + 1
@@ -190,7 +235,7 @@ def _record_delivery(chat_id: str, ok: bool, blocked: bool = False) -> None:
             logger.warning("Removed Telegram subscriber %s after %s failures",
                            chat_id, "block" if blocked else "3")
         data["failures"] = fails
-        _save_subscribers(data)
+        _save_subscribers(data, kind)
     except Exception as exc:
         logger.warning("Could not record delivery state: %s", exc)
 
@@ -216,49 +261,62 @@ Why closed: target-hit
 _Educational only. Not financial advice._"""
 
 
-def _send_one(token: str, chat_id: str, text: str) -> bool:
+def _send_one(token: str, chat_id: str, text: str,
+              timeout: int = 10) -> bool:
     """Send a single message. Returns True on success. Test-seam."""
     import requests
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     resp = requests.post(url, json={"chat_id": chat_id, "text": text,
-                                    "parse_mode": "Markdown"}, timeout=10)
+                                     "parse_mode": "Markdown"}, timeout=timeout)
     resp.raise_for_status()
     return True
 
 
-def handle_joins() -> List[str]:
-    """Poll getUpdates for new /start senders; subscribe + welcome them.
+def health_check(kind: str = "equity") -> bool:
+    """Ping bot getMe (no message) to verify token validity for kind."""
+    token = _resolve_bot(kind)[0]
+    if not token:
+        return False
+    try:
+        import requests  # noqa: E402
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+        resp.raise_for_status()
+        return bool(resp.json().get("ok"))
+    except Exception:
+        return False
 
-    Returns the list of newly added chat IDs. Safe to call every ~30s:
-    uses the stored offset so each update is processed once.
-    """
-    cfg = load_config()
-    tg_cfg = cfg.get("alerts", {}).get("telegram", {})
-    if not tg_cfg.get("enabled", False):
+
+def _handle_joins_kind(kind: str = "equity") -> List[str]:
+    """Poll getUpdates for `kind`. Separated token/file per kind."""
+    token, chat_id, _ = _resolve_bot(kind)
+    try:
+        cfg = load_config()
+        tg_cfg = cfg.get("alerts", {}).get("telegram", {})
+        if not tg_cfg.get("enabled", False):
+            return []
+    except Exception:
         return []
-    token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
     if not token:
         return []
 
-    data = _load_subscribers()
-    # Seed from .env so the owner's alerts never depend on the store.
-    seed = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    data = _load_subscribers(kind)
+    seed = chat_id  # already resolved from kind-specific env
     chats: List[str] = [str(c) for c in data.get("chats", [])]
     if seed and str(seed) not in chats:
         chats.append(str(seed))
         data["chats"] = chats
-        _save_subscribers(data)
+        _save_subscribers(data, kind)
 
     offset = data.get("offset", 0)
     try:
-        import requests
+        import requests  # noqa: E402
         resp = requests.get(
             f"https://api.telegram.org/bot{token}/getUpdates",
             params={"offset": offset, "timeout": 0}, timeout=15)
         resp.raise_for_status()
         updates = resp.json().get("result", [])
     except Exception as exc:
-        logger.warning("Telegram getUpdates failed: %s", exc)
+        logger.warning("Telegram getUpdates failed (kind=%s): %s", kind, exc)
         return []
 
     new_ids: List[str] = []
@@ -276,13 +334,35 @@ def handle_joins() -> List[str]:
             new_ids.append(cid)
             try:
                 _send_one(token, cid, WELCOME_MESSAGE)
-                logger.info("Welcomed new Telegram subscriber %s", cid)
+                logger.info("Welcomed new Telegram subscriber %s (kind=%s)",
+                            cid, kind)
             except Exception as exc:
                 logger.warning("Welcome message failed for %s: %s", cid, exc)
     data["chats"] = chats
     data["offset"] = max_id
-    _save_subscribers(data)
+    _save_subscribers(data, kind)
     return new_ids
+
+
+def handle_joins() -> List[str]:
+    """Legacy (equity) join poll — kept for backwards-compat."""
+    return _handle_joins_kind("equity")
+
+
+def handle_options_joins() -> List[str]:
+    """New options bot join poll (8877508167)."""
+    return _handle_joins_kind("options")
+
+
+def handle_all_joins() -> List[str]:
+    """Poll BOTH bots. Returns combined new ids (deduped)."""
+    out: List[str] = []
+    for k in ("equity", "options"):
+        try:
+            out.extend(_handle_joins_kind(k))
+        except Exception:
+            pass
+    return list(dict.fromkeys(out))
 
 
 # ---------------------------------------------------------------------------
@@ -514,10 +594,21 @@ def format_exit_message(trade: Dict[str, Any]) -> str:
 
 
 def send_signal_alert(signal: Any) -> None:
-    """Send a signal alert via all enabled channels."""
+    """Send a signal alert via the correct bot (equity vs options)."""
     message = format_signal_message(signal)
-
-    send_telegram(message)
+    is_opt = False
+    try:
+        d = signal if isinstance(signal, dict) else signal.to_dict()
+        if d.get("asset") == "options" or (
+                isinstance(d.get("option_legs"), dict)
+                and d["option_legs"].get("strategy") not in (None, "", "none")):
+            is_opt = True
+    except Exception:
+        pass
+    if is_opt:
+        send_options_telegram(message)
+    else:
+        send_telegram(message)
     send_email(
         subject=f"TRIO: {signal.action if hasattr(signal, 'action') else 'Signal'} — {signal.symbol if hasattr(signal, 'symbol') else ''}",
         body=message,
@@ -525,9 +616,12 @@ def send_signal_alert(signal: Any) -> None:
 
 
 def send_exit_alert(trade: Dict[str, Any]) -> None:
-    """Send a closed-trade (PASS/FAIL) alert via all enabled channels."""
+    """Send a closed-trade (PASS/FAIL) alert via the correct bot."""
     message = format_exit_message(trade)
-    send_telegram(message)
+    if str(trade.get("asset", "")).lower() == "options":
+        send_options_telegram(message)
+    else:
+        send_telegram(message)
     send_email(
         subject=f"TRIO CLOSED {trade.get('result', '')} — {trade.get('symbol', '')} "
                 f"{trade.get('pnl', '')}",

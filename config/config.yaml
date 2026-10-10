@@ -311,6 +311,14 @@ alerts:
     # Open broadcast: anyone who taps /start in the bot is appended here
     # and gets every alert. .env single ID stays as seed/fallback.
     subscriber_file: "output/subscribers.json"
+    # New options bot (intraday alerts stay on the old bot above).
+    # Create TELEGRAM_OPTIONS_BOT_TOKEN/CHAT_ID in GitHub Secrets; on
+    # local dev it falls back to the old bot when absent.
+    options:
+      enabled: true
+      bot_token_env: "TELEGRAM_OPTIONS_BOT_TOKEN"
+      chat_id_env: "TELEGRAM_OPTIONS_CHAT_ID"
+      subscriber_file: "output/subscribers_options.json"
   email:
     enabled: false
     smtp_server: "smtp.gmail.com"

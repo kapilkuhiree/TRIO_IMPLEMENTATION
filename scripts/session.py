@@ -167,10 +167,11 @@ def main() -> None:
     logger.info("Session job: plan=%s candidates=%d",
                 date, len((plan or {}).get("candidates", [])))
 
-    # Check for any new /start subscribers right at startup so everyone receives today's alerts.
+    # Check for /start subscribers on BOTH bots so intraday + options
+    # broadcasts are always reachable — stale per-bot offset is isolated.
     try:
-        from src.alerts import handle_joins
-        _new = handle_joins()
+        from src.alerts import handle_all_joins
+        _new = handle_all_joins()
         if _new:
             logger.info("Found %d new Telegram subscriber(s) at session boot.", len(_new))
     except Exception as exc:
@@ -212,15 +213,25 @@ def main() -> None:
             "",
             f"📋 *Today's Plan ({date}):* {len((plan or {}).get('candidates', []))} candidate(s)"
         ]
+        # Split deliver: equity -> old bot, options -> new bot (8877508167).
+        # When options legs are empty the options bot gets a short "no spreads
+        # — waiting for chain" note so you know it woke up too.
+        _equity_msg = list(_msg)
+        _options_msg = list(_msg)
         if _cand_lines:
-            _msg.append("\n*Equity Intraday Candidates:*")
-            _msg.append("\n".join(_cand_lines))
+            _equity_msg.append("\n*Equity Intraday Candidates:*")
+            _equity_msg.append("\n".join(_cand_lines))
         if _opt_lines:
-            _msg.append("\n*NIFTY Options Hedging Spreads:*")
-            _msg.append("\n".join(_opt_lines))
+            _options_msg.append("\n*NIFTY Options Hedging Spreads:*")
+            _options_msg.append("\n".join(_opt_lines))
+        else:
+            _options_msg.append("\n*NIFTY Options:* no spreads in today's plan "
+                                "(chain/expiry pending — live re-scans will fill in).")
         if not _cand_lines and not _opt_lines:
-            _msg.append("\nNo candidates in today's plan — running in manage-only mode.")
-        send_telegram("\n".join(_msg))
+            _equity_msg.append("\nNo equity candidates — manage-only mode.")
+        send_telegram("\n".join(_equity_msg))
+        from src.alerts import send_options_telegram as _sopt
+        _sopt("\n".join(_options_msg))
     except Exception as exc:
         logger.warning("Startup good-morning alert failed: %s", exc)
 
@@ -297,8 +308,13 @@ def main() -> None:
                             f"{_r.get('net_debit')} lots {_r.get('lots')} "
                             f"— check the MegaBull app")
                 if _opt_status:
-                    _tg("*Options routing — where the NIFTY spread sits:*\n"
-                        + "\n".join(_opt_status))
+                    try:
+                        from src.alerts import send_options_telegram as _otg
+                        _otg("*Options routing — where the NIFTY spread sits (8877508167):*\n"
+                             + "\n".join(_opt_status))
+                    except Exception:
+                        _tg("*Options routing — where the NIFTY spread sits:*\n"
+                            + "\n".join(_opt_status))
             except Exception as _tg_exc:
                 logger.warning("Options routing alert failed: %s", _tg_exc)
     except Exception as exc:

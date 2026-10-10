@@ -121,34 +121,68 @@ def _close_line(c: Dict[str, Any]) -> str:
             f"P&L {c.get('pnl')}")
 
 
-def format_digest(d: Dict[str, Any]) -> str:
-    lines = [f"*TRIO daily digest — {d['date']}*"]
-    lines.append(f"Orders placed: {len(d['orders'])} | "
-                 f"Closed: {len(d['closes'])}  (PASS {d['npass']} / "
-                 f"FAIL {d['nfail']})")
-    lines.append(f"Day P&L: {d['pnl']:+.2f} | Win rate: {d['win_rate']}%")
+def format_digest(d: Dict[str, Any], kind: str = "all") -> str:
+    """Render digest for kind=all|equity|options."""
+    want_eq = kind in ("all", "equity")
+    want_opt = kind in ("all", "options")
+    title = f"*TRIO daily digest — {d['date']}*"
+    if kind == "equity":
+        title += " *— Equity*"
+    elif kind == "options":
+        title += " *— Options (8877508167)*"
+    lines = [title]
     eq, opt = d.get("eq", {}), d.get("opt", {})
-    lines.append(
-        f"Equity: orders {eq.get('n_orders', 0)} closes "
-        f"{eq.get('n_closes', 0)} ({eq.get('pass', 0)}P/{eq.get('fail', 0)}F) "
-        f"P&L {eq.get('pnl', 0.0):+.2f}")
-    lines.append(
-        f"Options: orders {opt.get('n_orders', 0)} closes "
-        f"{opt.get('n_closes', 0)} ({opt.get('pass', 0)}P/{opt.get('fail', 0)}F) "
-        f"P&L {opt.get('pnl', 0.0):+.2f}")
-    lines.append(f"Shadow-exit signals (log-only): {len(d['shadows'])}")
-    if d["orders"]:
-        lines.append("Entries:")
-        for o in d["orders"]:
+    if kind == "all":
+        lines.append(f"Orders placed: {len(d['orders'])} | "
+                     f"Closed: {len(d['closes'])}  (PASS {d['npass']} / "
+                     f"FAIL {d['nfail']})")
+        lines.append(f"Day P&L: {d['pnl']:+.2f} | Win rate: {d['win_rate']}%")
+        lines.append(
+            f"Equity: orders {eq.get('n_orders', 0)} closes "
+            f"{eq.get('n_closes', 0)} ({eq.get('pass', 0)}P/{eq.get('fail', 0)}F) "
+            f"P&L {eq.get('pnl', 0.0):+.2f}")
+        lines.append(
+            f"Options: orders {opt.get('n_orders', 0)} closes "
+            f"{opt.get('n_closes', 0)} ({opt.get('pass', 0)}P/{opt.get('fail', 0)}F) "
+            f"P&L {opt.get('pnl', 0.0):+.2f}")
+    elif kind == "equity":
+        lines.append(f"Equity: orders {eq.get('n_orders', 0)} closes "
+                     f"{eq.get('n_closes', 0)} ({eq.get('pass', 0)}P/{eq.get('fail', 0)}F) "
+                     f"P&L {eq.get('pnl', 0.0):+.2f} | Win rate: {eq.get('wr', 0):.1f}%")
+    else:
+        lines.append(f"Options: orders {opt.get('n_orders', 0)} closes "
+                     f"{opt.get('n_closes', 0)} ({opt.get('pass', 0)}P/{opt.get('fail', 0)}F) "
+                     f"P&L {opt.get('pnl', 0.0):+.2f} | Win rate: {opt.get('wr', 0):.1f}%")
+    if kind == "all":
+        lines.append(f"Shadow-exit signals (log-only): {len(d['shadows'])}")
+
+    # Filter.
+    def _keep(rec: Dict[str, Any], is_order: bool) -> bool:
+        is_opt = (rec.get("asset") == "options")
+        return (want_opt and is_opt) or (want_eq and not is_opt)
+
+    entries = [o for o in d["orders"] if _keep(o, True)] if kind != "all" else d["orders"]
+    closes = [c for c in d["closes"] if _keep(c, False)] if kind != "all" else d["closes"]
+    if entries:
+        lines.append("Entries:" if kind == "all" else ("Equity entries:" if kind == "equity" else "Options entries:"))
+        for o in entries:
             lines.append(_order_line(o))
-    if d["closes"]:
-        lines.append("Closed:")
-        for c in d["closes"]:
+    if closes:
+        lines.append("Closed:" if kind == "all" else ("Equity closed:" if kind == "equity" else "Options closed:"))
+        for c in closes:
             lines.append(_close_line(c))
-    if d["skip_reasons"]:
+    if kind == "all" and d["skip_reasons"]:
         lines.append("Skips: " + ", ".join(
             f"{k}={v}" for k, v in d["skip_reasons"].items()))
     return "\n".join(lines)
+
+
+def format_equity_digest(d: Dict[str, Any]) -> str:
+    return format_digest(d, kind="equity")
+
+
+def format_options_digest(d: Dict[str, Any]) -> str:
+    return format_digest(d, kind="options")
 
 
 def main() -> None:
@@ -165,9 +199,14 @@ def main() -> None:
     if not args.no_alert:
         try:
             from src.alerts import send_telegram
-            send_telegram(text)
+            send_telegram(format_equity_digest(d))
         except Exception as exc:
-            logger.warning("Digest Telegram failed: %s", exc)
+            logger.warning("Equity digest Telegram failed: %s", exc)
+        try:
+            from src.alerts import send_options_telegram
+            send_options_telegram(format_options_digest(d))
+        except Exception as exc:
+            logger.warning("Options digest Telegram failed: %s", exc)
 
 
 if __name__ == "__main__":

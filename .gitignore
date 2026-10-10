@@ -45,6 +45,7 @@ output/*
 !output/plans/
 !output/dashboard_state.json
 !output/subscribers.json
+!output/subscribers_options.json
 output/plans/*
 !output/plans/*.json
 

@@ -24,6 +24,8 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_OPTIONS_BOT_TOKEN: ${{ secrets.TELEGRAM_OPTIONS_BOT_TOKEN }}
+      TELEGRAM_OPTIONS_CHAT_ID: ${{ secrets.TELEGRAM_OPTIONS_CHAT_ID }}
       MEGABULL_API_KEY: ${{ secrets.MEGABULL_API_KEY }}
       TZ: Asia/Kolkata
     steps:
@@ -49,7 +51,7 @@ jobs:
         run: |
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
-          git add -A output/dashboard_state.json output/plans output/subscribers.json
+          git add -A output/dashboard_state.json output/plans output/subscribers.json output/subscribers_options.json
           git stash push -m "bot-state" --keep-index || true
           git fetch origin main || true
           # 2026-10-09: rebase --autostash failed on unmerged state files
