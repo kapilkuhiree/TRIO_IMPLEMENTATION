@@ -469,3 +469,51 @@ def test_squareoff_options_logs_close_to_ledger(tmp_path, monkeypatch):
     assert d["eq"]["n_closes"] == 0
     text = digest.format_digest(d)
     assert "Options:" in text
+
+
+class _FixedSpread:
+    """Synthetic spread candidate with a known mid debit and real bid/ask."""
+
+    def to_dict(self):
+        return {
+            "strategy": "bull-call-spread", "expiry": "30-Oct-2026",
+            "net_debit": 40.0, "maxLoss": 4000.0, "maxGain": 6000.0,
+            "breakeven": 0.0,
+            "legs": [
+                {"side": "BUY", "strike": 25000, "kind": "CE",
+                 "premium": 120.0, "bid": 118.0, "ask": 122.0},
+                {"side": "SELL", "strike": 25200, "kind": "CE",
+                 "premium": 80.0, "bid": 78.0, "ask": 82.0},
+            ],
+        }
+
+
+def test_bidask_fill_is_executable_not_mid(monkeypatch):
+    """spec §6 regression: when fill_model=bidask the paper broker must
+    reprice each leg to its executable side (BUY ask+slip / SELL bid-slip).
+    The previous code referenced undefined names and silently fell back to
+    the mid debit, hiding the slippage — this test locks the fix.
+
+    BUY ask 122 + 0.5 tick (0.025) = 122.03 ; SELL bid 78 - 0.025 = 77.98
+    -> net debit 44.05 (rounded to 44.06 by the broker's 2dp rule).
+    """
+    from src.broker import options_paper as op
+    monkeypatch.setattr(op, "load_config",
+                        lambda *a, **k: {"options": {"fill_model": "bidask",
+                                                     "slippage_ticks": 0.5}})
+    b = OptionsPaperBroker(initial_capital=500000.0, lot_size=65)
+    b.open_spread(_FixedSpread(), lots=1)
+    filled = list(b.positions.values())[0].avg_price
+    assert filled > 40.0 + 3.0, "bidask fill must add execution slippage"
+    assert abs(filled - 44.06) < 0.02, f"unexpected executable debit {filled}"
+
+
+def test_mid_fill_is_unchanged(monkeypatch):
+    """Legacy fill_model=mid must stay exactly the selector's mid debit."""
+    from src.broker import options_paper as op
+    monkeypatch.setattr(op, "load_config",
+                        lambda *a, **k: {"options": {"fill_model": "mid"}})
+    b = OptionsPaperBroker(initial_capital=500000.0, lot_size=65)
+    b.open_spread(_FixedSpread(), lots=1)
+    filled = list(b.positions.values())[0].avg_price
+    assert filled == 40.0

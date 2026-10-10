@@ -91,21 +91,28 @@ class OptionsPaperBroker(BaseBroker):
         cost = net * lots * self.lot_size
         if cost > self.capital:
             return self._reject(sid, lots, net, "Insufficient capital")
-        bidask = (str(load_config().get("options", {}).get(
-            "fill_model", "mid")).strip().lower() == "bidask")
-        if bidask and not single:
-            # per spec §6: debit spreads — buy at ask, sell at bid + tick slip
+        # Fill realism (spec §6): when fill_model is "bidask", reprice every
+        # leg to its executable side (BUY at ask + slip, SELL at bid - slip)
+        # instead of the selector's mid. Legs come from the candidate, so
+        # this works for both a single long and a debit spread. A leg with no
+        # bid/ask (sim-priced) is left untouched by fill_leg_premium.
+        try:
+            bidask = (str(load_config().get("options", {}).get(
+                "fill_model", "mid")).strip().lower() == "bidask")
+        except Exception:
+            bidask = False
+        if bidask:
             try:
                 from src.options_pricing import fill_leg_premium as _fill
-                # _leg_quote was already resolved per leg; retrieve per-leg
-                # executable fills by re-reading the quote dicts we just made.
-                # lq/sq are mid-anchored; _fill converts to executable side.
-                adj_l = _fill(lq, "BUY")
-                adj_s = _fill(sq, "SELL")
-                net = round(max(adj_l - adj_s, 0.05), 2)
+                buy_px = sum(_fill(l, "BUY") for l in longs)
+                sell_px = sum(_fill(l, "SELL") for l in shorts)
+                net = round(max(buy_px - sell_px, 0.05), 2)
                 cost = net * lots * self.lot_size
+                if cost > self.capital:
+                    return self._reject(sid, lots, net,
+                                        "Insufficient capital after slippage")
             except Exception:
-                pass  # fallback stays on mid
+                pass  # fallback stays on the selector's mid
 
         oid = f"opt_{uuid.uuid4().hex[:8]}"
         order = BrokerOrder(
