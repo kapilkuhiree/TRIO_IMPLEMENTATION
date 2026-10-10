@@ -197,6 +197,55 @@ def close_position(symbol: str) -> None:
 # Halt checks
 # ---------------------------------------------------------------------------
 
+def sector_exposure(positions: Dict[str, Any],
+                      capital: Optional[float] = None) -> Dict[str, float]:
+    """Sector exposure as % of capital (per Phase 7).
+
+    Args:
+        positions: {symbol -> {size, entry, ...}} or broker positions.
+        capital:   Own capital, defaults to config.
+    """
+    from src.sector_map import sector_for
+    if capital is None:
+        cfg = load_config()
+        capital = float((cfg.get("risk_management", {}) or {}).get("capital", 100000) or 100000)
+    cap = float(capital) or 100000.0
+    out: Dict[str, float] = {}
+    totals: Dict[str, float] = {}
+    for sym, info in (positions or {}).items():
+        sz = float((info or {}).get("size", info.get("quantity", 0)) if isinstance(info, dict) else 0)
+        entry = float((info or {}).get("entry", info.get("avg_price", 0)) if isinstance(info, dict) else 0)
+        try:
+            notional = sz * entry
+        except Exception:
+            notional = 0.0
+        sec = sector_for(sym)
+        totals[sec] = totals.get(sec, 0.0) + notional
+    for sec, notional in totals.items():
+        out[sec] = round(notional / cap * 100, 2)
+    return out
+
+
+def would_breach_sector(symbol: str, size: int, entry: float,
+                        existing: Optional[Dict[str, Any]] = None,
+                        limit_pct: Optional[float] = None) -> bool:
+    """True if adding one more position would breach the per-sector cap."""
+    from src.sector_map import sector_for
+    cfg = load_config()
+    rm = (cfg.get("risk_management", {}) or {})
+    lim = limit_pct if limit_pct is not None else float(rm.get("max_exposure_per_sector_pct", 40) or 40)
+    cap = float(rm.get("capital", 100000) or 100000)
+    merged = dict(existing or {})
+    merged = dict(merged)
+    # Don't override an existing entry for the same symbol; count the new
+    # not as add, not as replacement, for the breach preview.
+    sec = sector_for(symbol)
+    proposed = dict(merged)
+    proposed[symbol] = {"size": int(size or 0), "entry": float(entry or 0.0)}
+    exp = sector_exposure(proposed, capital=cap)
+    return float(exp.get(sec, 0.0)) > lim
+
+
 def _check_halt(unrealized_total: Optional[float] = None) -> None:
     """Check if trading should be halted (realized + optional unrealized)."""
     cfg = load_config()

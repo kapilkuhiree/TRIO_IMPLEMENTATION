@@ -1095,6 +1095,37 @@ class PaperTrader:
                 return []
         except Exception:
             pass
+        # Sector exposure guard (Phase 7).
+        try:
+            from src.risk_manager import (
+                would_breach_sector as _would_breach_sector,  # noqa: E402
+                get_risk_state as _grs2,  # noqa
+            )
+            # Use RiskState positions if available; otherwise mirror broker book.
+            try:
+                existing = dict(getattr(_grs2(), "positions", {}) or {})
+            except Exception:
+                existing = {}
+            if not existing:
+                # Mirror broker book when the RiskState is empty (fresh start).
+                for _sym, _pos in (getattr(self.broker, "positions", {}) or {}).items():
+                    try:
+                        qty = int(getattr(_pos, "quantity", 0) or 0)
+                        avg = float(getattr(_pos, "avg_price", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    existing[_sym] = {"size": qty, "entry": avg}
+            _sector_new = [c for c in plan.get("candidates", []) or []
+                           if would_breach_sector(
+                               c.get("symbol", ""), int(c.get("position_size") or 0),
+                               float(c.get("entry_price") or 0), existing=existing)]
+            if _sector_new:
+                self._log_event("skip", {
+                    "reason": "sector-exposure",
+                    "symbols": [c.get("symbol") for c in _sector_new],
+                })
+        except Exception:
+            _sector_new = []
         # Available-margin guard (local + remote books both expose get_balance).
         try:
             bal = self.broker.get_balance()
@@ -1107,6 +1138,34 @@ class PaperTrader:
 
         placed: List[Dict[str, Any]] = []
         for cand in plan.get("candidates", []) or []:
+            # Per-symbol sector gate: skip only the banking-heavy candidate,
+            # not the whole plan.
+            try:
+                from src.risk_manager import would_breach_sector as _would_breach1
+                from src.risk_manager import get_risk_state as _grs0
+                try:
+                    existing0 = dict(getattr(_grs0(), "positions", {}) or {})
+                except Exception:
+                    existing0 = {}
+                if not existing0:
+                    for _sym2, _pos2 in (getattr(self.broker, "positions", {}) or {}).items():
+                        try:
+                            existing0[_sym2] = {
+                                "size": int(getattr(_pos2, "quantity", 0) or 0),
+                                "entry": float(getattr(_pos2, "avg_price", 0.0) or 0.0),
+                            }
+                        except Exception:
+                            continue
+                if _would_breach1(cand.get("symbol", ""),
+                                  int(cand.get("position_size") or 0),
+                                  float(cand.get("entry_price") or 0),
+                                  existing=existing0):
+                    self._log_event("skip", {
+                        "symbol": cand.get("symbol"), "action": cand.get("action"),
+                        "reason": "sector-exposure"})
+                    continue
+            except Exception:
+                pass
             # Per-candidate risk check: daily loss / halt, margin, fees.
             try:
                 from src.risk_manager import get_risk_state as _grs

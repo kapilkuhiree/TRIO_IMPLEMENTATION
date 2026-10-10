@@ -1,0 +1,54 @@
+# TRIO — Symbol -> Sector map (NIFTY 50 core; add as the basket expands)
+# Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+# Used by risk_manager -> pre-trade sector exposure gate. Symbols absent here
+# fall into `Unknown`.
+
+mapping:
+  RELIANCE.NS: Energy
+  ONGC.NS: Energy
+  TCS.NS: Technology
+  INFY.NS: Technology
+  HCLTECH.NS: Technology
+  WIPRO.NS: Technology
+  TECHM.NS: Technology
+  HDFCBANK.NS: Financials
+  ICICIBANK.NS: Financials
+  SBIN.NS: Financials
+  KOTAKBANK.NS: Financials
+  AXISBANK.NS: Financials
+  BAJFINANCE.NS: Financials
+  BAJAJFINSV.NS: Financials
+  LT.NS: Industrials
+  ULTRACEMCO.NS: Industrials
+  GRASIM.NS: Industrials
+  HINDALCO.NS: Materials
+  JSWSTEEL.NS: Materials
+  TATASTEEL.NS: Materials
+  COALINDIA.NS: Energy
+  ITC.NS: Consumer Staples
+  HINDUNILVR.NS: Consumer Staples
+  NESTLEIND.NS: Consumer Staples
+  BRITANNIA.NS: Consumer Staples
+  MARUTI.NS: Consumer Discretionary
+  M&M.NS: Consumer Discretionary
+  TITAN.NS: Consumer Discretionary
+  BAJAJ-AUTO.NS: Consumer Discretionary
+  EICHERMOT.NS: Consumer Discretionary
+  SUNPHARMA.NS: Healthcare
+  DRREDDY.NS: Healthcare
+  CIPLA.NS: Healthcare
+  DIVISLAB.NS: Healthcare
+  APOLLOHOSP.NS: Healthcare
+  ADANIENT.NS: Energy
+  ADANIPORTS.NS: Industrials
+  NTPC.NS: Utilities
+  POWERGRID.NS: Utilities
+  BHARTIARTL.NS: Communication
+  INDUSINDBK.NS: Financials
+  HEROMOTOCO.NS: Consumer Discretionary
+  UPL.NS: Materials
+  SHREECEM.NS: Materials
+  TATACONSUM.NS: Consumer Staples
+
+defaults:
+  Unknown: Unknown

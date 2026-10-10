@@ -1,9 +1,15 @@
 """
-TRIO — Backtester
+TRIO — Backtester (execution-realistic)
 Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
-Runs the trading strategy on historical data and reports key metrics:
-win rate, profit factor, max drawdown, Sharpe ratio, and total return.
+Runs the trading strategy on historical data and reports key metrics.
+Signal at bar i close -> entry at bar i+1 OPEN (never same-bar), stop
+gaps fill at the exit bar's open, costs on notional + orders, equity
+includes unrealized, Sharpe annualized by timeframe.
+
+HOLD: same-bar stop before target — a bar that hits both is treated as a
+stop (conservative). Any block that cannot run still counts as a skipped
+bar (not silently ignored).
 
 DISCLAIMER: Educational purposes only. Not financial advice.
 Past performance does not indicate future results.
@@ -28,6 +34,14 @@ from src.risk_manager import (
 )
 
 logger = get_logger("backtester")
+
+_BARS_PER_YEAR = {
+    "1d": 252,
+    "15m": 252 * 25,
+    "5m": 252 * 75,
+    "1h": 252 * 6,
+    "1h": 252 * 6,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +83,7 @@ class BacktestResult:
     max_drawdown_pct: float = 0.0
     sharpe_ratio: float = 0.0
     avg_risk_reward: float = 0.0
+    skipped_bars: int = 0
     trades: List[BacktestTrade] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -86,6 +101,7 @@ class BacktestResult:
             f"  Total Return: {self.total_return_pct:.2f}%\n"
             f"  Max Drawdown: {self.max_drawdown_pct:.2f}%\n"
             f"  Sharpe Ratio: {self.sharpe_ratio:.2f}\n"
+            f"  Skipped Bars: {self.skipped_bars}\n"
         )
 
 
@@ -105,15 +121,16 @@ def run_backtest(
     """
     Run a backtest for a single symbol.
 
-    Strategy: uses the signal engine on rolling windows of historical data.
-    Entries on BUY/SELL signals, exits on stop-loss, take-profit, or opposing signal.
+    Signal at bar i close -> entry at bar i+1 OPEN (next-bar fill), exit
+    fills model stop gaps via the exit bar's open, same-bar stop before
+    target, costs on notional per leg.
 
     Args:
         symbol:             Ticker symbol.
         timeframe:          Candle timeframe.
         period:             How far back to fetch data (e.g., 365d).
         initial_capital:    Starting capital.
-        commission_pct:     Commission per trade (%).
+        commission_pct:     Commission per notional per leg (%).
         slippage_pct:       Slippage per trade (%).
         indicator_lookback: Minimum bars needed before first signal.
 
@@ -153,6 +170,38 @@ def run_backtest(
     trades: List[BacktestTrade] = []
     in_trade = False
     current_trade: Optional[BacktestTrade] = None
+    pending: Optional[Dict[str, Any]] = None
+    skipped_bars = 0
+
+    def _bars_per_year() -> int:
+        return _BARS_PER_YEAR.get(timeframe, 252)
+
+    # helpers
+    def _entry_fill(side: str, raw_open: float) -> float:
+        if side == "BUY":
+            return raw_open * (1 + slippage_pct / 100)
+        return raw_open * (1 - slippage_pct / 100)
+
+    def _exit_fill(side: str, stop: float, exit_open: float) -> float:
+        """Stop gap: if the exit bar gapped through the stop, pay the worse open."""
+        if side == "BUY":
+            gap = exit_open <= stop
+            eff = exit_open if gap else stop
+            return eff * (1 - slippage_pct / 100)
+        gap = exit_open >= stop
+        eff = exit_open if gap else stop
+        return eff * (1 + slippage_pct / 100)
+
+    def _target_fill(side: str, tgt: float) -> float:
+        if side == "BUY":
+            return tgt * (1 - slippage_pct / 100)
+        return tgt * (1 + slippage_pct / 100)
+
+    def _record(side: str, entry: float, exit_p: float, size: int) -> float:
+        raw = (exit_p - entry) * size if side == "BUY" else (entry - exit_p) * size
+        # Costs on notional per leg (entry leg + exit leg), conservative vs the old P&L-fraction model.
+        cost = (abs(entry) * size + abs(exit_p) * size) * commission_pct / 100
+        return raw - cost
 
     # Walk forward
     for i in range(indicator_lookback, len(df)):
@@ -160,10 +209,9 @@ def run_backtest(
         close = float(df["Close"].iloc[i])
         high = float(df["High"].iloc[i])
         low = float(df["Low"].iloc[i])
+        exit_open = float(df["Open"].iloc[i])
 
-        # Trailing stop, only when enabled in config. It is disabled by default
-        # because the out-of-sample test showed trailing exits lost money
-        # (test profit factor 0.72) versus the fixed 1.5R target.
+        # Trailing stop, only when enabled in config.
         if in_trade and current_trade is not None and trail_enabled:
             atr_val = None
             try:
@@ -174,7 +222,6 @@ def run_backtest(
                 atr_val = None
 
             if current_trade.action == "BUY":
-                # update trailing stop upwards when price rises above entry
                 if atr_val and close > current_trade.entry_price:
                     from src.risk_manager import calculate_trailing_stop
                     new_sl = calculate_trailing_stop(close, current_trade.entry_price, atr_val, "BUY")
@@ -187,70 +234,80 @@ def run_backtest(
                     if new_sl is not None and new_sl < current_trade.stop_loss:
                         current_trade.stop_loss = new_sl
 
-        # Check if current trade hits SL or TP
+        # Check if current trade hits SL or TP (stop before target if both)
         if in_trade and current_trade is not None:
+            hit = None
             if current_trade.action == "BUY":
                 if low <= current_trade.stop_loss:
-                    # Stop hit
-                    exit_price = current_trade.stop_loss * (1 - slippage_pct / 100)
-                    current_trade.exit_price = exit_price
-                    current_trade.exit_idx = i
-                    current_trade.exit_reason = "stop_hit"
-                    pnl = (exit_price - current_trade.entry_price) * current_trade.size
-                    pnl -= abs(pnl) * commission_pct / 100
-                    current_trade.pnl = round(pnl, 2)
-                    current_trade.pnl_pct = round(pnl / (current_trade.entry_price * current_trade.size) * 100, 2) if current_trade.size > 0 else 0.0
-                    capital += pnl
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
+                    hit = "stop"
                 elif high >= current_trade.target:
-                    # Target hit
-                    exit_price = current_trade.target * (1 - slippage_pct / 100)
-                    current_trade.exit_price = exit_price
-                    current_trade.exit_idx = i
-                    current_trade.exit_reason = "target_hit"
-                    pnl = (exit_price - current_trade.entry_price) * current_trade.size
-                    pnl -= abs(pnl) * commission_pct / 100
-                    current_trade.pnl = round(pnl, 2)
-                    current_trade.pnl_pct = round(pnl / (current_trade.entry_price * current_trade.size) * 100, 2) if current_trade.size > 0 else 0.0
-                    capital += pnl
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
-
-            elif current_trade.action == "SELL":
+                    hit = "target"
+            else:
                 if high >= current_trade.stop_loss:
-                    exit_price = current_trade.stop_loss * (1 + slippage_pct / 100)
-                    current_trade.exit_price = exit_price
-                    current_trade.exit_idx = i
-                    current_trade.exit_reason = "stop_hit"
-                    pnl = (current_trade.entry_price - exit_price) * current_trade.size
-                    pnl -= abs(pnl) * commission_pct / 100
-                    current_trade.pnl = round(pnl, 2)
-                    current_trade.pnl_pct = round(pnl / (current_trade.entry_price * current_trade.size) * 100, 2) if current_trade.size > 0 else 0.0
-                    capital += pnl
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
+                    hit = "stop"
                 elif low <= current_trade.target:
-                    exit_price = current_trade.target * (1 + slippage_pct / 100)
-                    current_trade.exit_price = exit_price
-                    current_trade.exit_idx = i
-                    current_trade.exit_reason = "target_hit"
-                    pnl = (current_trade.entry_price - exit_price) * current_trade.size
-                    pnl -= abs(pnl) * commission_pct / 100
-                    current_trade.pnl = round(pnl, 2)
-                    current_trade.pnl_pct = round(pnl / (current_trade.entry_price * current_trade.size) * 100, 2) if current_trade.size > 0 else 0.0
-                    capital += pnl
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
+                    hit = "target"
+            if hit == "stop":
+                exit_price = _exit_fill(current_trade.action,
+                                        current_trade.stop_loss, exit_open)
+                current_trade.exit_price = exit_price
+                current_trade.exit_idx = i
+                current_trade.exit_reason = "stop_hit"
+                pnl = _record(current_trade.action, current_trade.entry_price,
+                              exit_price, current_trade.size)
+                current_trade.pnl = round(pnl, 2)
+                current_trade.pnl_pct = round(
+                    pnl / (current_trade.entry_price * current_trade.size) * 100, 2
+                ) if current_trade.size > 0 else 0.0
+                capital += pnl
+                trades.append(current_trade)
+                in_trade = False
+                current_trade = None
+            elif hit == "target":
+                exit_price = _target_fill(current_trade.action,
+                                          current_trade.target)
+                current_trade.exit_price = exit_price
+                current_trade.exit_idx = i
+                current_trade.exit_reason = "target_hit"
+                pnl = _record(current_trade.action, current_trade.entry_price,
+                              exit_price, current_trade.size)
+                current_trade.pnl = round(pnl, 2)
+                current_trade.pnl_pct = round(
+                    pnl / (current_trade.entry_price * current_trade.size) * 100, 2
+                ) if current_trade.size > 0 else 0.0
+                capital += pnl
+                trades.append(current_trade)
+                in_trade = False
+                current_trade = None
 
-        equity_curve.append(capital)
+        # Equity includes unrealized while in trade
+        if in_trade and current_trade is not None:
+            if current_trade.action == "BUY":
+                unreal = (close - current_trade.entry_price) * current_trade.size
+            else:
+                unreal = (current_trade.entry_price - close) * current_trade.size
+            equity_curve.append(capital + unreal)
+        else:
+            equity_curve.append(capital)
 
-        # Generate signal on rolling window (skip if already in trade)
-        if not in_trade and i % 1 == 0:  # every bar (can be adjusted)
+        # Execute any pending entry at bar i's OPEN (next-bar fill).
+        if pending is not None:
+            entry_open = float(df["Open"].iloc[i])
+            entry_price = _entry_fill(pending["action"], entry_open)
+            # Size was computed at bar i-1's close/capital — keep it.
+            current_trade = BacktestTrade(
+                entry_idx=i,
+                action=pending["action"],
+                entry_price=round(entry_price, 2),
+                stop_loss=pending["sl"],
+                target=pending["tp"],
+                size=pending["size"],
+            )
+            in_trade = True
+            pending = None
+
+        # Generate signal on CLOSE of bar i (skip if already in trade or just filled)
+        if not in_trade and pending is None:
             try:
                 readings = compute_indicators(window, symbol, timeframe)
                 signal = generate_signal(
@@ -258,55 +315,55 @@ def run_backtest(
                     latest_price=close,
                     technical_readings=readings,
                 )
-
                 if signal.action in ("BUY", "SELL"):
-                    # Get ATR for stop-loss
                     atr_ind = None
                     for key, ind in readings.indicators.items():
                         if key.startswith("atr_"):
                             atr_ind = ind.value
                             break
-
-                    # Use the swing level for stop placement so the backtest
-                    # matches the live path (and the validated strategy).
                     swing = readings.swing_low if signal.action == "BUY" else readings.swing_high
-
                     sl = calculate_stop_loss(close, atr_ind, signal.action, swing_level=swing)
                     tp = calculate_take_profit(close, sl, signal.action)
                     size = calculate_position_size(close, sl, capital)
-
                     if size > 0:
-                        entry_price = close * (1 + slippage_pct / 100) if signal.action == "BUY" else close * (1 - slippage_pct / 100)
-                        current_trade = BacktestTrade(
-                            entry_idx=i,
-                            action=signal.action,
-                            entry_price=round(entry_price, 2),
-                            stop_loss=sl,
-                            target=tp,
-                            size=size,
-                        )
-                        in_trade = True
-            except Exception as exc:
-                continue  # skip bars where indicator computation fails
+                        # Defer fill to bar i+1 open (realistic). If i is the
+                        # last bar, no next bar exists — skip.
+                        if i + 1 < len(df):
+                            pending = {"action": signal.action, "sl": sl,
+                                       "tp": tp, "size": size}
+            except Exception:
+                skipped_bars += 1
+                pending = None
 
-    # Close any open trade at end
+    # Still in trade or pending? Mark the open leg at the final close.
+    if pending is not None and not in_trade:
+        # No bar left to fill the pending — drop it.
+        pending = None
+        skipped_bars += 1
     if in_trade and current_trade is not None:
         exit_price = float(df["Close"].iloc[-1])
-        if current_trade.action == "BUY":
-            pnl = (exit_price - current_trade.entry_price) * current_trade.size
-        else:
-            pnl = (current_trade.entry_price - exit_price) * current_trade.size
-        pnl -= abs(pnl) * commission_pct / 100
+        pnl = _record(current_trade.action, current_trade.entry_price,
+                      exit_price, current_trade.size)
         current_trade.exit_price = exit_price
         current_trade.exit_idx = len(df) - 1
         current_trade.exit_reason = "end_of_data"
         current_trade.pnl = round(pnl, 2)
-        current_trade.pnl_pct = round(pnl / (current_trade.entry_price * current_trade.size) * 100, 2) if current_trade.size > 0 else 0.0
+        current_trade.pnl_pct = round(
+            pnl / (current_trade.entry_price * current_trade.size) * 100, 2
+        ) if current_trade.size > 0 else 0.0
         capital += pnl
         trades.append(current_trade)
 
+    # Final equity point already captured on the last loop pass (or via
+    # unrealized). Ensure the curve's last entry is the settled capital
+    # when no trade is still open.
+    if not in_trade and equity_curve and equity_curve[-1] != capital:
+        equity_curve.append(capital)
+
     # --- Compute metrics ---
-    result = _compute_metrics(symbol, timeframe, period, initial_capital, capital, equity_curve, trades)
+    result = _compute_metrics(symbol, timeframe, period, initial_capital,
+                              capital, equity_curve, trades,
+                              skipped_bars=skipped_bars)
 
     logger.info("Backtest complete for %s: %s", symbol, result.summary_str())
 
@@ -321,6 +378,7 @@ def _compute_metrics(
     final_capital: float,
     equity_curve: List[float],
     trades: List[BacktestTrade],
+    skipped_bars: int = 0,
 ) -> BacktestResult:
     """Compute backtest metrics from the trade list and equity curve."""
     wins = [t for t in trades if t.pnl > 0]
@@ -343,11 +401,15 @@ def _compute_metrics(
     drawdown = (peak - eq) / peak * 100
     max_drawdown = float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
 
-    # Sharpe ratio (annualized, assuming daily returns)
+    # Sharpe ratio — annualized by BAR, not hardcoded to daily.
+    bpy = {
+        "1d": 252, "15m": 252 * 25, "5m": 252 * 75,
+        "1h": 252 * 6, "1m": 252 * 375,
+    }.get(timeframe, 252)
     if len(equity_curve) > 1:
         returns = np.diff(equity_curve) / equity_curve[:-1]
         if np.std(returns) > 0:
-            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(bpy)
         else:
             sharpe = 0.0
     else:
@@ -375,5 +437,6 @@ def _compute_metrics(
         max_drawdown_pct=round(max_drawdown, 2),
         sharpe_ratio=round(float(sharpe), 2),
         avg_risk_reward=round(avg_rr, 2),
+        skipped_bars=skipped_bars,
         trades=trades,
     )
