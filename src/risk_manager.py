@@ -379,7 +379,7 @@ def apply_risk_management(
     signal.target = tp
     # Ladder levels derived from configured t*_at_r; full ladder always
     # stored so forward paper + sweeps can measure T2/T3.
-    ladder_cfg = cfg.get("ladder", {}) if isinstance(cfg.get("ladder"), dict) else {}
+    ladder_cfg = rm_cfg.get("ladder", {}) if isinstance(rm_cfg.get("ladder"), dict) else {}
     t1_r = ladder_cfg.get("t1_at_r", rm_cfg.get("partial_at_r", 0.8))
     t2_r = ladder_cfg.get("t2_at_r", 1.5)
     t3_r = ladder_cfg.get("t3_at_r", 2.5)

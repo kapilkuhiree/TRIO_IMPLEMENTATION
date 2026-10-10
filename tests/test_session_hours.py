@@ -34,10 +34,16 @@ def _trader():
 
 def test_session_open_boundaries():
     t = _trader()
+    # before start
     assert t._session_open(dtime(9, 19)) is False
+    assert t._session_open(dtime(0, 0)) is False
+    # exact start is inclusive (first admissible entry)
     assert t._session_open(dtime(9, 20)) is True
+    # during session
     assert t._session_open(dtime(12, 0)) is True
-    assert t._session_open(dtime(15, 15)) is True
+    # exact entry cutoff is EXCLUSIVE (Phase 1.4): at session_end no new entries
+    assert t._session_open(dtime(15, 15)) is False
+    # after cutoff
     assert t._session_open(dtime(15, 16)) is False
     assert t._session_open(dtime(21, 23)) is False  # the live incident
 
@@ -74,10 +80,21 @@ def test_in_hours_scan_executes_normally():
     assert "RELIANCE.NS" in t.broker.positions
 
 
-def test_session_open_misconfigured_window_fails_open():
+def test_session_open_misconfigured_window_fails_closed():
     t = _trader()
     with patch("src.paper_trader.load_config",
                return_value={"forward_test": {"session_start": "xx",
                                              "session_end": "yy"}}):
-        # A bad window must never halt trading silently.
-        assert t._session_open(dtime(3, 0)) is True
+        # Phase 1.4: a bad window must BLOCK new entries (management-only),
+        # never fail open into trading an unknown session.
+        assert t._session_open(dtime(3, 0)) is False
+        assert t._session_open(dtime(12, 0)) is False
+
+
+def test_session_open_missing_window_uses_defaults():
+    """No forward_test block -> sane 09:20/15:15 defaults, still exclusive."""
+    t = _trader()
+    with patch("src.paper_trader.load_config", return_value={}):
+        assert t._session_open(dtime(9, 19)) is False
+        assert t._session_open(dtime(9, 20)) is True
+        assert t._session_open(dtime(15, 15)) is False

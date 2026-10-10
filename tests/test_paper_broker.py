@@ -137,6 +137,29 @@ def test_short_loss_reduces_equity():
     assert broker.get_balance()["total"] < 100000
 
 
+def test_partial_close_one_unit_returns_empty_without_side_effects():
+    """Phase 1.3: int(1 * 0.5) == 0 -> a 1-unit partial close must return {}
+    and leave the position, cash and trade log untouched."""
+    broker = PaperBroker(initial_capital=100000)
+    broker.place_order("HDFCBANK.NS", "BUY", 1, price=100.0)
+    cap_before = broker.capital
+    rec = broker.close_position("HDFCBANK.NS", 110.0, "partial", fraction=0.5)
+    assert rec == {}
+    assert "HDFCBANK.NS" in broker.positions
+    assert broker.positions["HDFCBANK.NS"].quantity == 1
+    assert broker.capital == cap_before
+    assert broker.closed_trades == []
+
+
+def test_partial_close_lot_aware_two_units_closes_one():
+    """2 units at 50% -> int(2*0.5)=1 closed, 1 runner left (lot-aware base)."""
+    broker = PaperBroker(initial_capital=100000)
+    broker.place_order("HDFCBANK.NS", "BUY", 2, price=100.0)
+    rec = broker.close_position("HDFCBANK.NS", 110.0, "partial", fraction=0.5)
+    assert rec and rec["quantity"] == 1
+    assert broker.positions["HDFCBANK.NS"].quantity == 1
+
+
 def test_close_record_carries_entry_time_and_holding():
     """Exit alerts need entry/exit timestamps + holding duration, so the
     record must carry entry_time (earliest fill), closed_at and the

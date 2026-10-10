@@ -236,3 +236,33 @@ def test_max_positions_halt():
     result = apply_risk_management(signal, atr_value=1.0)
     assert result.action == "HOLD"
     assert result.risk_check["halt_active"] is True
+
+
+def test_ladder_config_read_from_nested_risk_management():
+    """Phase 1.2 regression: ladder must be read from
+    risk_management.ladder (not a phantom top-level key). Changing
+    t1_at_r/t2_at_r/t3_at_r must change the generated levels."""
+    from unittest.mock import patch
+    from src.utils import load_config
+
+    def _run(t1, t2, t3):
+        cfg = dict(load_config())
+        rm = dict(cfg.get("risk_management", {}))
+        rm["capital"] = 100000
+        rm["ladder"] = {"t1_at_r": t1, "t2_at_r": t2, "t3_at_r": t3}
+        cfg["risk_management"] = rm
+        signal = TradeSignal(symbol="TEST", action="BUY", entry_price=100.0,
+                             confidence=80)
+        with patch("src.risk_manager.load_config", return_value=cfg):
+            res = apply_risk_management(signal, atr_value=2.0, swing_level=96.0)
+        risk = abs(100.0 - res.stop_loss)
+        return res, risk
+
+    res, risk = _run(0.6, 1.2, 2.0)
+    assert res.ladder["T1"] == round(100.0 + risk * 0.6, 2)
+    assert res.ladder["T2"] == round(100.0 + risk * 1.2, 2)
+    assert res.ladder["T3"] == round(100.0 + risk * 2.0, 2)
+
+    res2, risk2 = _run(1.0, 2.0, 3.0)
+    assert res2.ladder["T1"] != res.ladder["T1"]
+    assert res2.ladder["T1"] == round(100.0 + risk2 * 1.0, 2)

@@ -306,7 +306,7 @@ class PaperTrader:
             start = (int(sh), int(sm))
             end = (int(eh), int(em))
         except (ValueError, AttributeError):
-            return True  # misconfigured window must not halt trading
+            return False  # misconfigured window: entries blocked, management only
 
         if now_ist is None:
             ist = timezone(timedelta(hours=5, minutes=30))
@@ -314,7 +314,9 @@ class PaperTrader:
             cur = (now.hour, now.minute)
         else:
             cur = (now_ist.hour, now_ist.minute)
-        return start <= cur <= end
+        # Inclusive start, exclusive end: at session_end new entries stop,
+        # but the runner stays alive to manage/close.
+        return start <= cur < end
 
     def _manage_open_positions(self) -> None:
         """Check trailing stops, fixed stops and targets on open positions.
@@ -376,9 +378,11 @@ class PaperTrader:
         the runner's trailing exit. Shadow logs are emitted without acting
         so forward paper can measure them vs the breakeven hold.
 
-        Runs every `guard_interval` seconds. Stops/targets stay in
-        _manage_open_positions for the slow scan; this guard only arms
-        the scale-outs.
+        Runs every `guard_interval` seconds. Owns the full lifecycle of an
+        open position: ladder scale-outs AND the hard stop/target, so a
+        runner can never fall out of management between the slow scans.
+        The ORIGINAL risk (entry -> initial stop) is frozen on first sight
+        (`pos.initial_stop`) because T1 moves the live stop to breakeven.
         """
         exited: List[Dict[str, Any]] = []
         try:
@@ -424,18 +428,46 @@ class PaperTrader:
                 if price is None: continue
                 self.broker.update_position(sym, price)
 
-                order = next((o for o in reversed(list(
-                    self.broker.orders.values()))
-                    if o.symbol == sym and o.status == "FILLED"), None)
-                if order is None or not order.stop_loss: continue
-                sl = order.stop_loss
+                # The guard's stop/target live on the ORIGINAL entry fill.
+                # After a T1/T2 partial an exit fill shares the same symbol
+                # and PaperBroker stamps it stop_loss=0.0/target=0.0 — so we
+                # must (a) match the entry side and (b) require a TRUTHY stop,
+                # else the runner gets "target-hit at 0.0" on the next tick.
+                entry_side = ("BUY" if pos.side == "LONG" else "SELL")
+                order = next((o for o in list(self.broker.orders.values())
+                              if o.symbol == sym and o.status == "FILLED"
+                              and getattr(o, "side", "") == entry_side
+                              and getattr(o, "stop_loss", 0)), None)
+                if order is None:
+                    # Fallback for SimpleNamespace fixtures without `side`.
+                    order = next((o for o in reversed(list(
+                        self.broker.orders.values()))
+                        if o.symbol == sym and o.status == "FILLED"
+                        and getattr(o, "stop_loss", 0)), None)
+                if order is None: continue
+                sl = float(order.stop_loss)
 
-                risk = abs(pos.avg_price - sl)
+                # Freeze the ORIGINAL risk (entry -> initial stop) the first
+                # time we see this position. After T1 the active stop moves to
+                # breakeven, so recomputing risk from the live stop would be
+                # zero and the runner would silently fall out of management
+                # (no T2, no stop, no target). R is always vs the initial stop.
+                orig_stop = getattr(pos, "initial_stop", None)
+                if orig_stop is None:
+                    orig_stop = sl
+                    try:
+                        setattr(pos, "initial_stop", sl)
+                    except Exception:
+                        pass
+                risk = abs(pos.avg_price - orig_stop)
                 if risk <= 0: continue
                 rr = ((price - pos.avg_price) / risk if pos.side == "LONG"
                       else (pos.avg_price - price) / risk)
 
-                # Ladder T1: 50% at +0.8R, rest to breakeven (risk-free)
+                # Ladder T1: 50% at +0.8R, rest to breakeven (risk-free).
+                # One-unit rule: if T1 cannot close any quantity (int(1*0.5)==0)
+                # the ladder state is left untouched — the position stays
+                # fully open and eligible to retry on the next tick.
                 if rr >= t1_at_r and not pos.halved:
                     rec = self.broker.close_position(
                         sym, price, "partial@T1-0.8R", fraction=t1_frac)
@@ -448,25 +480,17 @@ class PaperTrader:
                                                   "rr": round(rr, 2),
                                                   "decision": "partial@T1-0.8R",
                                                   "record": rec})
-                    order.stop_loss = pos.avg_price
-                    pos.halved = True
-                    setattr(pos, "ladder_t1_hit", True)
+                        order.stop_loss = pos.avg_price
+                        pos.halved = True
+                        setattr(pos, "ladder_t1_hit", True)
 
-                if not getattr(pos, "ladder_t1_hit", False):
-                    # Still eligible for shadow T1 invalidation check
-                    pass
-                else:
-                    # SHADOW: T2 at +1.5R (30% scale + trail), runner T3 trailing.
-                    pass  # handled next block; fallthrough keeps rr check
-
-                # Ladder Phase 2: handled here (shadow unless enabled).
-                # T1 must have fired before T2/T3 are eligible — the runner
-                # without breakeven breaks the risk-free invariant.
+                # Ladder Phase 2: requires T1, eligible at +1.5R.
+                # Shadow unless ladder.enabled_phase2. One-unit T2 uses the
+                # same rule: no quantity -> leave hit-flag unset.
                 if getattr(pos, "ladder_t1_hit", False) \
                         and rr >= t2_at_r and not getattr(
                             pos, "ladder_t2_hit", False):
                     if phase2:
-                        # Live: 30% at T2, then arm the trailing stop on the 20% runner.
                         rec = self.broker.close_position(
                             sym, price, "partial@T2-1.5R", fraction=t2_frac)
                         if rec:
@@ -478,16 +502,17 @@ class PaperTrader:
                                                       "rr": round(rr, 2),
                                                       "decision": "partial@T2-1.5R",
                                                       "record": rec})
-                        setattr(pos, "ladder_t2_hit", True)
-                        try:
-                            atr_v = _atr()
-                            if atr_v:
-                                trail = (price - atr_v * trail_mult
-                                         if pos.side == "LONG"
-                                         else price + atr_v * trail_mult)
-                                order.stop_loss = float(trail)
-                        except Exception:
-                            pass
+                            setattr(pos, "ladder_t2_hit", True)
+                            try:
+                                atr_v = _atr()
+                                if atr_v:
+                                    trail = (price - atr_v * trail_mult
+                                             if pos.side == "LONG"
+                                             else price + atr_v * trail_mult)
+                                    order.stop_loss = float(trail)
+                            except Exception:
+                                pass
+                        # else: no quantity -> do NOT set ladder_t2_hit
                     else:
                         self._log_event("shadow-exit", {
                             "symbol": sym, "side": pos.side,
@@ -496,8 +521,9 @@ class PaperTrader:
                             "reason": "ladder-T2", "would_be": "partial@T2-1.5R",
                         })
 
-                    # 2. Shadow invalidation (log-only; never closes)
-                    try:
+                # Shadow invalidation (log-only; never closes)
+                try:
+                    if rr >= t1_at_r * 0.5:
                         _shadow = compute_indicators(
                             fetch_market_data(sym, self.timeframe).ohlcv, sym, self.timeframe)
                         if self._should_shadow_exit(pos, price, _shadow):
@@ -508,21 +534,28 @@ class PaperTrader:
                                 "reason": "thesis-invalidation",
                                 "would_be": "exit",
                             })
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
-                    # 3. Hard stop check (skip if a partial just fired)
-                    if not (rr >= pt_r and not pos.halved):
-                        if (pos.side == "LONG" and price <= sl) or \
-                                (pos.side == "SHORT" and price >= sl):
-                            rec = self.broker.close_position(sym, price, "stop-hit")
-                            if rec:
-                                self._log_event("close", rec)
-                        elif (pos.side == "LONG" and price >= tgt) or \
-                                (pos.side == "SHORT" and price <= tgt):
-                            rec = self.broker.close_position(sym, price, "target-hit")
-                            if rec:
-                                self._log_event("close", rec)
+                # Hard stop/target — always checked, ladder state irrelevant.
+                # The active target lives on the original FILLED order; the
+                # active stop is either the original sl or (post-T1)
+                # breakeven/trailing after ladder actions.
+                tgt_val = getattr(order, "target", 0) or None
+                stop_hit = ((pos.side == "LONG" and price <= sl) or
+                            (pos.side == "SHORT" and price >= sl))
+                tgt_hit = False
+                if tgt_val is not None:
+                    tgt_hit = ((pos.side == "LONG" and price >= float(tgt_val)) or
+                               (pos.side == "SHORT" and price <= float(tgt_val)))
+                if stop_hit:
+                    rec = self.broker.close_position(sym, price, "stop-hit")
+                    if rec:
+                        self._log_event("close", rec)
+                elif tgt_hit:
+                    rec = self.broker.close_position(sym, price, "target-hit")
+                    if rec:
+                        self._log_event("close", rec)
             except Exception as exc:
                 logger.error("Guard failed for %s: %s", sym, exc)
         return exited
