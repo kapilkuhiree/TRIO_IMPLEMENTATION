@@ -158,8 +158,19 @@ class OptionsPaperBroker(BaseBroker):
             return {}
         lots = pos.quantity
         debit = pos.avg_price
-        pnl = (float(mid) - debit) * lots * self.lot_size
-        self.capital += float(mid) * lots * self.lot_size
+        strategy = (self.spreads.get(spread_id) or {}).get("strategy", "")
+        gross = (float(mid) - debit) * lots * self.lot_size
+        # Net of round-trip cost (spec §3) so the paper ledger matches the
+        # backtest (scripts/options_backtest._costs_for). Deduct from capital
+        # too, so balance and booked P&L never disagree.
+        cost = 0.0
+        try:
+            from src.options_pricing import round_trip_cost as _rtc
+            cost = _rtc(strategy, debit, float(mid), lots, self.lot_size)
+        except Exception:
+            cost = 0.0
+        pnl = round(gross - cost, 2)
+        self.capital += float(mid) * lots * self.lot_size - cost
         entry_times = [getattr(o, "placed_at", "") for o in self.orders.values()
                        if getattr(o, "symbol", "") == spread_id
                        and getattr(o, "status", "") == "FILLED"
@@ -175,7 +186,8 @@ class OptionsPaperBroker(BaseBroker):
             "reason": reason, "result": "PASS" if pnl > 0 else "FAIL",
             "entry_time": entry_at, "closed_at": closed_at,
             "holding_minutes": minutes_between(entry_at, closed_at),
-            "asset": "options",
+            "asset": "options", "strategy": strategy,
+            "cost": cost, "gross_pnl": round(gross, 2),
         }
         self.closed_trades.append(record)
         del self.positions[spread_id]

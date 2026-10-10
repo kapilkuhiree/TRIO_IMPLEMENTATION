@@ -195,3 +195,46 @@ def fill_leg_premium(leg_quote: Dict[str, float], side: str = "BUY",
     if side == "SELL" and bid > 0:
         return round(max(bid - slip, 0.05), 2)
     return float(leg_quote.get("premium") or 0.0)
+
+
+def round_trip_cost(strategy: str, entry_debit: float, exit_value: float,
+                    lots: int = 1, lot_size: Optional[int] = None,
+                    n_orders: Optional[int] = None) -> float:
+    """Round-trip rupee cost for one options trade (spec section 3).
+
+    Deliberately mirrors scripts/options_backtest._costs_for so the live
+    paper ledger and the backtest agree on P&L: brokerage x orders + STT on
+    the sold premium only.
+      - naked long (1 leg):           2 orders, STT on the exit sale.
+      - debit/credit spread (2 legs): 4 orders, STT on the entry short leg
+        and the exit long leg (approximated as half the net premium each).
+    Config keys: options.brokerage_per_order (default 20),
+    options.stt_rate_sold (default 0.0015), options.lot_size (default 50).
+    """
+    try:
+        ocfg = load_config().get("options", {}) or {}
+    except Exception:
+        ocfg = {}
+    try:
+        brok_per = float(ocfg.get("brokerage_per_order", 20.0) or 0.0)
+    except (TypeError, ValueError):
+        brok_per = 20.0
+    try:
+        stt_rate = float(ocfg.get("stt_rate_sold", 0.0015) or 0.0)
+    except (TypeError, ValueError):
+        stt_rate = 0.0015
+    if lot_size is None:
+        try:
+            lot_size = int(ocfg.get("lot_size", 50))
+        except (TypeError, ValueError):
+            lot_size = 50
+    is_long = str(strategy) in ("long-call", "long-put")
+    orders = int(n_orders) if n_orders is not None else (2 if is_long else 4)
+    brok = brok_per * orders
+    notional = int(lots) * int(lot_size)
+    if is_long:
+        stt = float(exit_value) * notional * stt_rate
+    else:
+        stt = float(entry_debit) * 0.5 * notional * stt_rate
+        stt += float(exit_value) * 0.5 * notional * stt_rate
+    return round(brok + stt, 2)

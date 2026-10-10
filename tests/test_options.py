@@ -517,3 +517,40 @@ def test_mid_fill_is_unchanged(monkeypatch):
     b.open_spread(_FixedSpread(), lots=1)
     filled = list(b.positions.values())[0].avg_price
     assert filled == 40.0
+
+
+def test_round_trip_cost_matches_backtest_model():
+    """spec §3 regression: the live paper cost helper must mirror
+    scripts/options_backtest._costs_for (brokerage x orders + STT on sold
+    premium). Config: brokerage 20/order, STT 0.0015, lot 65.
+      naked long : 2 orders + STT on the exit sale.
+      spread     : 4 orders + STT on ~half the premium each side.
+    """
+    from src.options_pricing import round_trip_cost
+    long_cost = round_trip_cost("long-call", entry_debit=120.0,
+                                exit_value=150.0, lots=1, lot_size=65)
+    assert abs(long_cost - (20.0 * 2 + 150.0 * 65 * 0.0015)) < 0.01
+    spread_cost = round_trip_cost("bear-put-spread", entry_debit=90.8,
+                                  exit_value=90.8, lots=1, lot_size=65)
+    assert abs(spread_cost - (20.0 * 4
+                              + 90.8 * 65 * 0.0015)) < 0.01
+
+
+def test_options_paper_close_books_net_of_costs(monkeypatch):
+    """The paper close must book P&L NET of round-trip cost and deduct it
+    from capital, so booked P&L and balance can never disagree."""
+    from src.broker import options_paper as op
+    monkeypatch.setattr(op, "load_config",
+                        lambda *a, **k: {"options": {"fill_model": "mid",
+                                                     "brokerage_per_order": 20,
+                                                     "stt_rate_sold": 0.0015,
+                                                     "lot_size": 65}})
+    b = OptionsPaperBroker(initial_capital=500000.0, lot_size=65)
+    b.open_spread(_FixedSpread(), lots=1)
+    sid = list(b.positions.keys())[0]
+    cap_before = b.capital
+    rec = b.close_spread(sid, 50.0, "test")
+    assert rec["gross_pnl"] == 10.0 * 1 * 65          # (50 - 40) * lot
+    assert rec["cost"] > 0
+    assert rec["pnl"] == round(rec["gross_pnl"] - rec["cost"], 2)
+    assert b.capital == round(cap_before + 50.0 * 65 - rec["cost"], 2)

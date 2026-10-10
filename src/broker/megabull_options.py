@@ -286,7 +286,17 @@ class MegaBullOptionsBroker(BaseBroker):
         if remote and not remote_ok:
             logger.warning("Spread %s partially closed remotely; "
                            "booking with remote-mid", spread_id)
-        pnl = (float(mid) - debit) * lots * self.lot_size
+        gross = (float(mid) - debit) * lots * self.lot_size
+        # Net of round-trip cost (spec §3), mirroring options_paper and the
+        # backtest so the shared digest never mixes gross and net P&L.
+        cost = 0.0
+        try:
+            from src.options_pricing import round_trip_cost as _rtc
+            cost = _rtc(detail.get("strategy", ""), debit, float(mid),
+                        lots, self.lot_size)
+        except Exception:
+            cost = 0.0
+        pnl = round(gross - cost, 2)
         closed_at = utc_now()
         entry_times = [getattr(o, "placed_at", "")
                        for o in self.orders.values()
@@ -305,6 +315,7 @@ class MegaBullOptionsBroker(BaseBroker):
             "holding_minutes": minutes_between(entry_at, closed_at),
             "asset": "options",
             "strategy": detail.get("strategy", ""),
+            "cost": cost, "gross_pnl": round(gross, 2),
         }
         self.closed_trades.append(record)
         del self.positions[spread_id]
