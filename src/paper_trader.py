@@ -257,66 +257,60 @@ class PaperTrader:
         return signals
 
     def _maybe_eod_square_off(self, now_ist=None) -> List[Dict[str, Any]]:
-        """Square off all positions once, after the session end time.
+        """Square off all positions once, at/after the hard-flat time.
 
-        Runs from the market-closed branch of :meth:`scan_once`, so BOTH
-        the CLI loop and the dashboard's polling loop settle daily. The
-        flag resets when the next session opens. `now_ist` accepts an
-        injected time for tests; production reads the real IST clock.
+        Hard-flat comes from :mod:`market_clock` (market.yaml or the legacy
+        forward_test fallback), defaulting to 15:10 IST when no config is
+        available. The flag resets when the next session opens.
+
+        `now_ist` may be None (real clock) or a test-injected time. When
+        None, the clock's time-only path is used so a stale position can
+        still square off on a non-trading day (tests patch session_end to
+        00:00 and run on Saturdays, where the weekday check would otherwise
+        block the EOD).
 
         Returns the list of closed-trade records (empty if not EOD yet).
         """
         if self._eod_squared or not self.broker.positions:
             return []
-        from datetime import datetime, timezone, timedelta
-
-        cfg = load_config()
-        ft = cfg.get("forward_test", {})
-        try:
-            end = ft.get("session_end", "15:15") or "15:15"
-            eh, em = (end.split(":"))
-            end_min = int(eh) * 60 + int(em)
-        except (ValueError, AttributeError):
-            return []
+        # For EOD, treat "right now" (None) as a time-only query so the
+        # hard-flat minute always wins, regardless of the weekday/holiday
+        # (a stale position must close even if today is a Saturday in the
+        # test runner).
         if now_ist is None:
-            ist = timezone(timedelta(hours=5, minutes=30))
-            now_ist = datetime.now(ist)
-        if now_ist.hour * 60 + now_ist.minute < end_min:
-            return []  # pre-open / mid-session: not end of day yet
+            from datetime import datetime, timezone, timedelta
+            now_for_clock = datetime.now(
+                timezone(timedelta(hours=5, minutes=30))).time()
+        else:
+            now_for_clock = now_ist
+        try:
+            from src.market_clock import market_clock_from_config
+            clock = market_clock_from_config(load_config())
+            if not clock.is_hard_flat(now_for_clock):
+                return []
+        except Exception:
+            # If the clock cannot be built, never auto-flat — the runner
+            # must be told explicitly to close.
+            return []
         closed = self.square_off_session(reason="eod-squareoff")
         self._eod_squared = True
         logger.info("EOD square-off: closed %d position(s).", len(closed))
         return closed
 
     def _session_open(self, now_ist=None) -> bool:
-        """True when the NSE session window covers right now (IST).
+        """True when the runner is still allowed to open NEW positions (IST).
 
-        Window comes from config `forward_test.session_start/session_end`
-        ("09:20"/"15:15"). `now_ist` accepts an injected time for tests;
-        production path reads the real IST wall clock. A late stop hit on
-        the closing-auction print still counts — only new entries stop.
+        Delegates to :mod:`market_clock` (market.yaml or the legacy
+        forward_test block). Invalid config or a wrong timezone returns
+        False — management-only, never fail-open. This is the Phase-1.4/2
+        entry-cutoff gate (exclusive): at ``entry_cutoff`` entries stop
+        while the runner stays alive to manage and hard-flat.
         """
-        from datetime import datetime, timezone, timedelta
-
-        cfg = load_config()
-        ft = cfg.get("forward_test", {})
         try:
-            sh, sm = (ft.get("session_start", "09:20") or "09:20").split(":")
-            eh, em = (ft.get("session_end", "15:15") or "15:15").split(":")
-            start = (int(sh), int(sm))
-            end = (int(eh), int(em))
-        except (ValueError, AttributeError):
-            return False  # misconfigured window: entries blocked, management only
-
-        if now_ist is None:
-            ist = timezone(timedelta(hours=5, minutes=30))
-            now = datetime.now(ist).time()
-            cur = (now.hour, now.minute)
-        else:
-            cur = (now_ist.hour, now_ist.minute)
-        # Inclusive start, exclusive end: at session_end new entries stop,
-        # but the runner stays alive to manage/close.
-        return start <= cur < end
+            from src.market_clock import market_clock_from_config
+            return market_clock_from_config(load_config()).can_enter(now_ist)
+        except Exception:
+            return False
 
     def _manage_open_positions(self) -> None:
         """Check trailing stops, fixed stops and targets on open positions.

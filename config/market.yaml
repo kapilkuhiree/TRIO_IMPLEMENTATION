@@ -1,0 +1,17 @@
+# ============================================================================
+# TRIO — Market & Clock Configuration (authoritative)
+# Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+# Consumed by src/market_clock.py -> src/utils.load_config() merges this
+# file under the `market` section, so all session logic uses one source.
+# Override per-test via load_config() -> {"market": {...}}.
+# ============================================================================
+
+market:
+  exchange: "NSE"
+  timezone: "Asia/Kolkata"
+  open: "09:15"
+  entry_start: "09:20"
+  entry_cutoff: "15:00"   # exclusive: at 15:00 new entries stop (exits only)
+  hard_flat: "15:10"      # exclusive: at 15:10 force square-off
+  close: "15:30"
+  holidays: []            # e.g. ["2026-08-15", "2026-10-02"]

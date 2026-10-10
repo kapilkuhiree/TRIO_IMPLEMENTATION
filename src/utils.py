@@ -64,10 +64,13 @@ _config_cache: Optional[Dict[str, Any]] = None
 
 def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     """
-    Load and cache the YAML config file.
+    Load and cache the YAML config file, merging config/market.yaml under
+    ``cfg["market"]`` when that file exists so all clock/session logic
+    reads one source (Phase 2).
 
     Args:
-        path: Override path to config file.
+        path: Override path to config file. When an explicit path is passed
+              the market merge is skipped so tests can pass synthetic dicts.
 
     Returns:
         Parsed config dictionary.
@@ -81,7 +84,22 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
         raise FileNotFoundError(f"Config file not found: {config_file}")
 
     with open(config_file, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+
+    # Merge the authoritative market clock file so every consumer sees
+    # cfg["market"]. If that file is absent, callers fall back to
+    # forward_test; if it is present, it wins.
+    if path is None:
+        market_path = PROJECT_ROOT / "config" / "market.yaml"
+        if market_path.exists():
+            try:
+                with open(market_path, "r", encoding="utf-8") as mf:
+                    mdata = yaml.safe_load(mf) or {}
+                mkt = mdata.get("market", {})
+                if isinstance(mkt, dict) and mkt:
+                    cfg["market"] = mkt
+            except Exception:
+                pass  # malformed market.yaml -> fall back to forward_test
 
     if path is None:
         _config_cache = cfg
