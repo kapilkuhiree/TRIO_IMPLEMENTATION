@@ -184,94 +184,41 @@ class PaperTrader:
         })
 
         signals: List[TradeSignal] = []
+        try:
+            from src.execution_lifecycle import reconcile_broker, submit_candidate
+            recon = reconcile_broker(self)
+            if recon.get("uncertain"):
+                logger.warning("scan_once: broker uncertain — entries blocked, "
+                               "managing existing positions only.")
+                self._guard_open_positions()
+                self._manage_open_positions()
+                return []
+            proposed: Dict[str, Any] = dict(getattr(self, "_proposed", {}) or {})
+        except Exception:
+            from src.execution_lifecycle import submit_candidate  # type: ignore
+            proposed = {}
         for cand in candidates:
             signal = cand.signal
             signals.append(signal)
             self.signals_log.append(cand.to_dict())
-
-            # HOLD-SKIP (shorts-enabled accounts): never re-enter a symbol
-            # already held on the SAME side. Re-scanning the same name
-            # every 5 minutes pyramided ULTRACEMCO 8x and HDFCBANK 6x on
-            # 2026-10-06. A SELL into an existing LONG still executes as
-            # a settlement close (CNC clip below); anything else held is
-            # skipped. One net position per symbol.
-            held = self.broker.positions.get(signal.symbol)
-            same_side_held = (
-                held is not None and held.quantity > 0 and (
-                    (signal.action == "SELL" and held.side == "SHORT")
-                    or (signal.action == "BUY" and held.side == "LONG")))
-            if same_side_held:
-                logger.info(
-                    "SKIP %s %s: already holding %d (%s) — rank %.1f kept "
-                    "in log, no order placed.",
-                    signal.action, signal.symbol, held.quantity,
-                    held.side, cand.rank)
-                self.signals_log[-1]["skipped"] = "already-holding"
-                self._log_event("skip", {
-                    "symbol": signal.symbol, "action": signal.action,
-                    "rank": cand.rank, "setup": cand.setup_name,
-                    "confidence": signal.confidence,
-                    "reason": "already-holding"})
-                continue
-
-            # Settlement check: never SELL what the account does not hold.
-            if signal.action == "SELL" and not allow_shorts:
-                held_qty = held.quantity if held and held.side == "LONG" else 0
-                if held_qty <= 0:
-                    logger.warning(
-                        "SKIP SELL %s: no holdings (would be rejected on a "
-                        "real CNC account with 'insufficient holdings'). "
-                        "Rank %.1f kept in log, no order placed.",
-                        signal.symbol, cand.rank)
-                    self.signals_log[-1]["skipped"] = "no-holdings"
-                    continue
-                if signal.position_size > held_qty:
-                    logger.warning(
-                        "CLIP SELL %s: signal wants %d but only %d held — "
-                        "clipping to holdings (real broker would reject the "
-                        "excess).", signal.symbol, signal.position_size,
-                        held_qty)
-                    signal.position_size = held_qty
-
+            payload = {
+                "symbol": signal.symbol, "action": signal.action,
+                "entry_price": signal.entry_price, "stop_loss": signal.stop_loss,
+                "target": signal.target, "position_size": signal.position_size,
+                "confidence": signal.confidence, "rank": cand.rank,
+                "setup_name": cand.setup_name,
+                "reasoning": list(signal.reasoning or []),
+                "risk_amount": getattr(signal, "risk_amount", 0.0),
+            }
             try:
-                order = self.broker.place_order(
-                    symbol=signal.symbol,
-                    side=signal.action,
-                    quantity=signal.position_size,
-                    price=signal.entry_price,
-                    stop_loss=signal.stop_loss,
-                    target=signal.target,
-                )
-                if order.status == "REJECTED":
-                    logger.warning("Order rejected for %s: %s",
-                                   signal.symbol, order.error)
-                    self.signals_log[-1]["skipped"] = "rejected"
-                    self._log_event("skip", {
-                        "symbol": signal.symbol, "action": signal.action,
-                        "rank": cand.rank, "setup": cand.setup_name,
-                        "confidence": signal.confidence,
-                        "reason": f"rejected: {order.error}"})
-                    continue
-                logger.info("Paper order (rank %.1f, %s): %s",
-                            cand.rank, cand.setup_name, order.to_dict())
-                self._log_event("order", {
-                    "symbol": signal.symbol, "action": signal.action,
-                    "entry": signal.entry_price, "stop": signal.stop_loss,
-                    "target": signal.target, "qty": signal.position_size,
-                    "rank": cand.rank, "setup": cand.setup_name,
-                    "confidence": signal.confidence,
-                    "reasoning": (signal.reasoning or [])[:4],
-                })
-                # Telegram entry alert: what / where / stop / target / why.
-                try:
-                    from src.alerts import send_signal_alert
-                    send_signal_alert(cand.to_dict())
-                except Exception as exc:
-                    logger.warning("Entry alert failed for %s: %s",
-                                   signal.symbol, exc)
+                res = submit_candidate(self, payload, reason="scan",
+                                       proposed=proposed, cfg=cfg)
             except Exception as exc:
                 logger.error("Error placing order for %s: %s",
                              signal.symbol, exc)
+                continue
+            if res.get("status") != "FILLED":
+                self.signals_log[-1]["skipped"] = res.get("reason", "skip")
 
         return signals
 
@@ -366,19 +313,35 @@ class PaperTrader:
                 if sl and price <= sl and pos.side == "LONG":
                     rec = self.broker.close_position(sym, price, "stop-hit")
                     if rec:
-                        self._log_event("close", rec)
+                        from src.execution_lifecycle import record_confirmed_close as _rcc
+                        try:
+                            _rcc(self, sym, rec)
+                        except Exception:
+                            self._log_event("close", rec)
                 elif sl and price >= sl and pos.side == "SHORT":
                     rec = self.broker.close_position(sym, price, "stop-hit")
                     if rec:
-                        self._log_event("close", rec)
+                        from src.execution_lifecycle import record_confirmed_close as _rcc
+                        try:
+                            _rcc(self, sym, rec)
+                        except Exception:
+                            self._log_event("close", rec)
                 elif tgt and price >= tgt and pos.side == "LONG":
                     rec = self.broker.close_position(sym, price, "target-hit")
                     if rec:
-                        self._log_event("close", rec)
+                        from src.execution_lifecycle import record_confirmed_close as _rcc
+                        try:
+                            _rcc(self, sym, rec)
+                        except Exception:
+                            self._log_event("close", rec)
                 elif tgt and price <= tgt and pos.side == "SHORT":
                     rec = self.broker.close_position(sym, price, "target-hit")
                     if rec:
-                        self._log_event("close", rec)
+                        from src.execution_lifecycle import record_confirmed_close as _rcc
+                        try:
+                            _rcc(self, sym, rec)
+                        except Exception:
+                            self._log_event("close", rec)
             except Exception as exc:
                 logger.error("Error managing %s: %s", sym, exc)
 
@@ -398,12 +361,10 @@ class PaperTrader:
         (`pos.initial_stop`) because T1 moves the live stop to breakeven.
         """
         exited: List[Dict[str, Any]] = []
-        try:
-            provider = getattr(self, "broker_name", "paper")
-        except Exception:
-            provider = "paper"
-        if provider != "paper":
-            return exited
+        # Broker-agnostic: the manager DECIDES for every provider; each
+        # broker only EXECUTES close_position(). Remote (MegaBull) positions
+        # are managed on their mirrored stops/targets — no silent strategy
+        # fork (see execution_lifecycle.reconcile_broker first).
         if not self.broker.positions:
             return exited
 
@@ -496,9 +457,14 @@ class PaperTrader:
                         order.stop_loss = pos.avg_price
                         pos.halved = True
                         setattr(pos, "ladder_t1_hit", True)
+                        # Partial: realized pnl only; position stays open.
                         try:
                             from src.risk_manager import update_pnl as _rm_p
                             _rm_p(float(rec.get("pnl") or 0.0))
+                            try:
+                                pos.booked_pnl = float(getattr(pos, "booked_pnl", 0.0) or 0.0) + float(rec.get("pnl") or 0.0)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -524,6 +490,10 @@ class PaperTrader:
                             try:
                                 from src.risk_manager import update_pnl as _rm_p2
                                 _rm_p2(float(rec.get("pnl") or 0.0))
+                                try:
+                                    pos.booked_pnl = float(getattr(pos, "booked_pnl", 0.0) or 0.0) + float(rec.get("pnl") or 0.0)
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                             try:
@@ -584,29 +554,21 @@ class PaperTrader:
                 if stop_hit:
                     rec = self.broker.close_position(sym, price, "stop-hit")
                     if rec:
-                        self._log_event("close", rec)
                         try:
-                            from src.risk_manager import (
-                                close_position as _rm_close,
-                                update_pnl as _rm_pnl,
-                            )
-                            _rm_pnl(float(rec.get("pnl") or 0.0))
-                            _rm_close(sym)
+                            from src.execution_lifecycle import record_confirmed_close
+                            record_confirmed_close(self, sym, rec)
+                            exited.append(rec)
                         except Exception:
-                            pass
+                            self._log_event("close", rec)
                 elif tgt_hit:
                     rec = self.broker.close_position(sym, price, "target-hit")
                     if rec:
-                        self._log_event("close", rec)
                         try:
-                            from src.risk_manager import (
-                                close_position as _rm_close,
-                                update_pnl as _rm_pnl,
-                            )
-                            _rm_pnl(float(rec.get("pnl") or 0.0))
-                            _rm_close(sym)
+                            from src.execution_lifecycle import record_confirmed_close
+                            record_confirmed_close(self, sym, rec)
+                            exited.append(rec)
                         except Exception:
-                            pass
+                            self._log_event("close", rec)
             except Exception as exc:
                 logger.error("Guard failed for %s: %s", sym, exc)
         return exited
@@ -741,18 +703,11 @@ class PaperTrader:
                                                  reason)
                 if rec:
                     closed.append(rec)
-                    self._log_event("close", rec)
                     try:
-                        from src.risk_manager import (
-                            close_position as _rm_close,
-                            update_pnl as _rm_pnl,
-                            _check_halt as _rm_check,
-                        )
-                        pnl = float(rec.get("pnl") or 0.0)
-                        _rm_pnl(pnl)
-                        _rm_close(sym)
+                        from src.execution_lifecycle import record_confirmed_close as _rcc2
+                        _rcc2(self, sym, rec)
                     except Exception:
-                        pass
+                        self._log_event("close", rec)
             except Exception as exc:
                 logger.error("Square-off failed for %s: %s", sym, exc)
         self._write_trade_log_csv()
@@ -1051,31 +1006,12 @@ class PaperTrader:
             logger.warning("execute_plan: no plan supplied.")
             return []
         cfg = load_config()
-        allow_shorts = cfg.get("trading", {}).get("allow_shorts", False)
-        max_open = cfg.get("risk_management", {}).get("max_open_positions", 5)
-
-        try:
-            self.broker.refresh_positions()
-        except Exception as exc:
-            logger.warning("execute_plan: position refresh failed: %s", exc)
-
-        # Rebuild risk state from the refreshed broker book (restart-resilient).
-        try:
-            from src.risk_manager import rebuild_from_ledger
-            today = None
-            try:
-                from datetime import datetime, timezone, timedelta as _td
-                IST = timezone(_td(hours=5, minutes=30))
-                today = datetime.now(IST).strftime("%Y-%m-%d")
-            except Exception:
-                pass
-            rebuild_from_ledger(self.broker.positions,
-                                getattr(self.broker, "closed_trades", []),
-                                today=today)
-        except Exception:
-            pass
-        # Hard block when any risk halt is already active (daily loss, max
-        # positions backstopped by RiskState, not just config).
+        from src.execution_lifecycle import reconcile_broker, submit_candidate
+        recon = reconcile_broker(self)
+        if recon.get("uncertain"):
+            logger.warning("execute_plan: broker uncertain — blocking new "
+                           "entries until refresh confirms.")
+            return []
         try:
             from src.risk_manager import get_risk_state
             if get_risk_state().halt_active:
@@ -1085,206 +1021,31 @@ class PaperTrader:
         except Exception:
             pass
 
-        # Broker-uncertainty guard: if the remote book returned a pending/
-        # out-of-sync marker, do not trade until it reconciles.
-        try:
-            raw = getattr(self.broker, "positions", {})
-            if any(getattr(p, "status", "") == "PENDING" for p in raw.values()):
-                logger.warning("execute_plan: broker has PENDING positions — "
-                               "blocking new entries until refresh confirms.")
-                return []
-        except Exception:
-            pass
-        # Sector exposure guard (Phase 7).
-        try:
-            from src.risk_manager import (
-                would_breach_sector as _would_breach_sector,  # noqa: E402
-                get_risk_state as _grs2,  # noqa
-            )
-            # Use RiskState positions if available; otherwise mirror broker book.
-            try:
-                existing = dict(getattr(_grs2(), "positions", {}) or {})
-            except Exception:
-                existing = {}
-            if not existing:
-                # Mirror broker book when the RiskState is empty (fresh start).
-                for _sym, _pos in (getattr(self.broker, "positions", {}) or {}).items():
-                    try:
-                        qty = int(getattr(_pos, "quantity", 0) or 0)
-                        avg = float(getattr(_pos, "avg_price", 0.0) or 0.0)
-                    except Exception:
-                        continue
-                    existing[_sym] = {"size": qty, "entry": avg}
-            _sector_new = [c for c in plan.get("candidates", []) or []
-                           if would_breach_sector(
-                               c.get("symbol", ""), int(c.get("position_size") or 0),
-                               float(c.get("entry_price") or 0), existing=existing)]
-            if _sector_new:
-                self._log_event("skip", {
-                    "reason": "sector-exposure",
-                    "symbols": [c.get("symbol") for c in _sector_new],
-                })
-        except Exception:
-            _sector_new = []
-        # Available-margin guard (local + remote books both expose get_balance).
-        try:
-            bal = self.broker.get_balance()
-            if float(bal.get("available", 1)) <= 0:
-                logger.warning("execute_plan: available margin exhausted — "
-                               "blocking new entries.")
-                return []
-        except Exception:
-            pass
-
+        # Transaction-like proposed portfolio: every confirmed fill in this
+        # pass updates it, so the NEXT candidate sees the new exposure.
+        proposed: Dict[str, Any] = dict(getattr(self, "_proposed", {}) or {})
         placed: List[Dict[str, Any]] = []
         for cand in plan.get("candidates", []) or []:
-            # Per-symbol sector gate: skip only the banking-heavy candidate,
-            # not the whole plan.
-            try:
-                from src.risk_manager import would_breach_sector as _would_breach1
-                from src.risk_manager import get_risk_state as _grs0
-                try:
-                    existing0 = dict(getattr(_grs0(), "positions", {}) or {})
-                except Exception:
-                    existing0 = {}
-                if not existing0:
-                    for _sym2, _pos2 in (getattr(self.broker, "positions", {}) or {}).items():
-                        try:
-                            existing0[_sym2] = {
-                                "size": int(getattr(_pos2, "quantity", 0) or 0),
-                                "entry": float(getattr(_pos2, "avg_price", 0.0) or 0.0),
-                            }
-                        except Exception:
-                            continue
-                if _would_breach1(cand.get("symbol", ""),
-                                  int(cand.get("position_size") or 0),
-                                  float(cand.get("entry_price") or 0),
-                                  existing=existing0):
-                    self._log_event("skip", {
-                        "symbol": cand.get("symbol"), "action": cand.get("action"),
-                        "reason": "sector-exposure"})
-                    continue
-            except Exception:
-                pass
-            # Per-candidate risk check: daily loss / halt, margin, fees.
-            try:
-                from src.risk_manager import get_risk_state as _grs
-                if _grs().halt_active:
-                    break
-                # Fees/slippage estimation: commission + slippage on notional
-                cfg2 = cfg
-                comm = float(cfg2.get("risk_management", {}).get("backtesting",
-                             {}).get("commission_pct", 0) or
-                             cfg2.get("backtesting", {}).get("commission_pct", 0) or 0) / 100
-                slip = float(cfg2.get("backtesting", {}).get("slippage_pct", 0) or
-                             cfg2.get("backtesting", {}).get("slippage_pct", 0) or 0) / 100
-                notional = float(cand.get("entry_price") or 0) * int(
-                    cand.get("position_size") or 0)
-                est_cost = round(notional * (comm + slip), 2)
-                try:
-                    if float(self.broker.get_balance().get("available", 1e12)) < est_cost:
-                        self._log_event("skip", {
-                            "symbol": signal.symbol if 'signal' in locals() else cand.get("symbol"),
-                            "reason": "margin-after-est-cost"})
-                        continue
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-            if len(self.broker.positions) >= max_open:
-                logger.info("execute_plan: max_open_positions (%d) reached.",
-                            max_open)
-                break
-            signal = TradeSignal(
-                symbol=cand.get("symbol", ""),
-                action=cand.get("action", "HOLD"),
-                entry_price=cand.get("entry_price"),
-                stop_loss=cand.get("stop_loss"),
-                target=cand.get("target"),
-                position_size=int(cand.get("position_size") or 0),
-                confidence=int(cand.get("confidence") or 0),
-                reasoning=list(cand.get("reasoning") or []),
-            )
-            if signal.action not in ("BUY", "SELL") or not signal.position_size:
-                continue
-
-            held = self.broker.positions.get(signal.symbol)
-            same_side = (
-                held is not None and held.quantity > 0 and (
-                    (signal.action == "SELL" and held.side == "SHORT")
-                    or (signal.action == "BUY" and held.side == "LONG")))
-            if same_side:
-                logger.info("execute_plan: SKIP %s %s (already holding).",
-                            signal.action, signal.symbol)
-                continue
-
-            if signal.action == "SELL" and not allow_shorts:
-                held_qty = held.quantity if held and held.side == "LONG" else 0
-                if held_qty <= 0:
-                    logger.warning("execute_plan: SKIP SELL %s (no holdings).",
-                                   signal.symbol)
-                    self._log_event("skip", {
-                        "symbol": signal.symbol, "action": "SELL",
-                        "rank": cand.get("rank"), "setup": cand.get("setup_name"),
-                        "reason": "no-holdings"})
-                    continue
-                signal.position_size = min(signal.position_size, held_qty)
-
-            try:
-                order = self.broker.place_order(
-                    symbol=signal.symbol, side=signal.action,
-                    quantity=signal.position_size, price=signal.entry_price,
-                    stop_loss=signal.stop_loss, target=signal.target,
-                    reason="premarket-plan",
-                )
-            except Exception as exc:
-                logger.error("execute_plan: order error for %s: %s",
-                             signal.symbol, exc)
-                continue
-
-            if getattr(order, "status", "") in ("PENDING", "PLACED", "ACCEPTED"):
-                logger.warning("execute_plan: %s pending (%s) — not booked "
-                               "until confirmed filled.",
-                               signal.symbol, order.status)
-                self._log_event("skip", {
-                    "symbol": signal.symbol, "action": signal.action,
-                    "rank": cand.get("rank"),
-                    "reason": f"pending: {order.status}"})
-                continue
-            if order.status != "FILLED":
-                # Rejections must not consume risk or be treated as fills.
-                logger.warning("execute_plan: %s rejected: %s",
-                               signal.symbol, order.error)
-                self._log_event("skip", {
-                    "symbol": signal.symbol, "action": signal.action,
-                    "rank": cand.get("rank"), "setup": cand.get("setup_name"),
-                    "reason": f"rejected: {order.error}"})
-                continue
-
-            # Confirmed fill: register exposure so halt checks see it immediately.
-            try:
-                from src.risk_manager import add_position as _add
-                _add(signal.symbol, signal.position_size, signal.entry_price,
-                     cand.get("risk_amount", 0.0) or 0.0)
-            except Exception:
-                pass
-
-            record = {
-                "symbol": signal.symbol, "action": signal.action,
-                "entry": signal.entry_price, "stop": signal.stop_loss,
-                "target": signal.target, "qty": signal.position_size,
-                "rank": cand.get("rank"), "setup": cand.get("setup_name"),
-                "confidence": signal.confidence, "order_id": order.order_id,
+            payload = {
+                "symbol": cand.get("symbol", ""), "action": cand.get("action", "HOLD"),
+                "entry_price": cand.get("entry_price"),
+                "stop_loss": cand.get("stop_loss"), "target": cand.get("target"),
+                "position_size": int(cand.get("position_size") or 0),
+                "confidence": int(cand.get("confidence") or 0),
+                "reasoning": list(cand.get("reasoning") or []),
+                "rank": cand.get("rank"), "setup_name": cand.get("setup_name"),
+                "risk_amount": cand.get("risk_amount", 0.0) or 0.0,
             }
-            placed.append(record)
-            self._log_event("order", record)
             try:
-                from src.alerts import send_signal_alert
-                send_signal_alert({**cand, "order_id": order.order_id})
+                res = submit_candidate(self, payload, reason="premarket-plan",
+                                       proposed=proposed, cfg=cfg)
             except Exception as exc:
-                logger.warning("Entry alert failed for %s: %s",
-                               signal.symbol, exc)
+                logger.error("execute_plan: submit error for %s: %s",
+                             cand.get("symbol"), exc)
+                continue
+            if res.get("status") != "FILLED":
+                continue
+            placed.append(res["record"])
 
         logger.info("execute_plan: placed %d order(s).", len(placed))
         return placed

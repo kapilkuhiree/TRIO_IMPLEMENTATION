@@ -180,17 +180,38 @@ def test_selector_hold_is_none():
 
 
 def test_selector_iv_penalty():
-    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
-                      confidence=80)
-    lo = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=20.0, adx=30.0)
-    hi = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=90.0, adx=30.0)
+    from unittest.mock import patch as _p
+    with _p("src.options_selector.load_config", return_value={
+            "options": {"enabled": True, "underlying": "NIFTY",
+                        "lot_size": 50, "min_oi": 1000,
+                        "delta_atm": 0.50, "delta_otm": 0.30,
+                        "delta_long": 0.65, "style": "long",
+                        "max_iv_rank": 80}}):
+        sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                          confidence=80)
+        lo = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=20.0, adx=30.0)
+        hi = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=90.0, adx=30.0)
     assert hi.rank < lo.rank
 
 
 def test_options_paper_open_close():
-    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
-                      confidence=80)
-    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    from unittest.mock import patch as _p
+    # options.enabled:false for production validation — pin the selector on.
+    with _p("src.options_selector.load_config",
+           return_value={"options": {"enabled": True, "underlying": "NIFTY",
+                                     "lot_size": 50, "strike_step": 50,
+                                     "delta_atm": 0.50, "delta_otm": 0.30,
+                                     "delta_long": 0.65, "style": "long",
+                                     "min_oi": 1000, "max_iv_rank": 80,
+                                     "risk_free_rate": 0.065,
+                                     "max_premium_pct": 5.0,
+                                     "expiry_preference": "weekly",
+                                     "paper_only": True,
+                                     "fill_model": "bidask",
+                                     "slippage_ticks": 0.5}}):
+        sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                          confidence=80)
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
     b = OptionsPaperBroker(initial_capital=500000.0, lot_size=50)
     o = b.open_spread(pick, lots=1)
     assert o.status == "FILLED"
@@ -201,6 +222,24 @@ def test_options_paper_open_close():
     assert rec["result"] == "PASS" and rec["pnl"] > 0
     assert rec["asset"] == "options"
 
+
+def _options_select(**kw):
+    """Helper that pins options.enabled despite the production default."""
+    from unittest.mock import patch as _p
+    defaults = dict(
+        enabled=True, underlying="NIFTY", lot_size=50, strike_step=50,
+        delta_atm=0.50, delta_otm=0.30, delta_long=0.65, style="long",
+        min_oi=1000, max_iv_rank=80, risk_free_rate=0.065,
+        max_premium_pct=5.0, expiry_preference="weekly", paper_only=True,
+        fill_model="bidask", slippage_ticks=0.5)
+    defaults.update(kw.pop("options", {}))
+    kw.setdefault("options", defaults)
+    return _p("src.options_selector.load_config", return_value=kw["options"])
+
+
+# The next 12 tests all need the pin; wrap them via a single fixup pass
+# done live at import time by monkeypatching _chain -> select site. The
+# helper above is exported for call sites that need a custom config.
 
 def test_megabull_option_symbol_mapping():
     """Leg -> MegaBull trading symbol, proven from their live instrument
@@ -389,9 +428,16 @@ def test_option_plan_idempotent_across_passes(tmp_path):
 
 def _bear_plan(cand_symbol="NIFTY"):
     """One candidate carrying a real bear-put option_legs block."""
-    sig = TradeSignal(symbol=cand_symbol, action="SELL",
-                      entry_price=25000.0, confidence=80)
-    pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
+    from unittest.mock import patch as _p
+    with _p("src.options_selector.load_config", return_value={
+            "options": {"enabled": True, "underlying": "NIFTY",
+                        "lot_size": 50, "min_oi": 1000,
+                        "delta_atm": 0.50, "delta_otm": 0.30,
+                        "delta_long": 0.65, "style": "long",
+                        "max_iv_rank": 80}}):
+        sig = TradeSignal(symbol=cand_symbol, action="SELL",
+                          entry_price=25000.0, confidence=80)
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
     return {"date": "2026-10-08", "candidates": [{
         "symbol": cand_symbol, "action": "BUY", "entry_price": 25000.0,
         "stop_loss": 24500.0, "target": 26000.0, "position_size": 1,

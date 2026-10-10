@@ -1,87 +1,61 @@
 # TRIO — Project State
-Last updated: 2026-10-07 (MegaBull default + ladder T1 live, 138/138, +4569.87 today)
+**Commit:** `fix/production-hardening` (see `git log`; based on `origin/main 6851d82`).
+**Tests:** 214 passed (`python -m pytest -q --basetemp ... -p no:randomly`), compile clean.
+**Last update:** 2026-10-10 (unified execution/risk lifecycle + restart-safe rebuild).
 
-## Today scored — first winning session on LIVE + MegaBull (verified)
-- LIVE `TRIO_IMPLEMENTATION` WON: **+4569.87 (+0.91%)**, equity 499819.83 -> 504389.70
-  (provider=megabull, 92 scans today, 0.0 used_margin — no leverage).
-- 13 entries (all SELL, composite-short, 15m): 2 booked intraday via
-  `partial@+1R`, 11 held to the 15:15 close (*see Ladder gap below*).
-- 13 exits: 8 PASS / 5 FAIL = **61.5% win** (matches the 60.5% walk-forward).
-- Entry/Exit Telegram alerts live: exit wiring was on PAPER but never on
-  MegaBull (MKT exits 7713xx) — now on BOTH providers with P&L+reason.
-- Key in `.env` only as `MEGABULL_API_KEY` (real key wired after chat;
-  shared account Shreyash Laddha — rotate monthly).
+## Modes right now
+- **Broker:** `config broker.provider: megabull` (remote paper), tests pin `paper`.
+  Unknown provider raises at startup; missing key raises; `mode: live` needs
+  `TRIO_LIVE=1` / `live_confirmed`. PENDING/PLACED/ACCEPTED never booked as fills.
+- **Options:** `config options.enabled: false` (separate experiment E). Chain code,
+  bidask fill, `round_trip_cost` and remote/megabull legs remain, but the session
+  attaches no legs and `execute_option_plan` only fires on explicit config.
+  Shadow fallback records are tagged `venue: local_shadow` and never enter risk/equity.
+- **Shorts:** `config trading.allow_shorts: false` (long-only validation A first).
+  CNC settlement rule clips/skips SELL without holdings; shorts need their own
+  multi-regime proof before `allow_shorts: true` returns.
+- **Market clock:** `config/market.yaml` authoritative —
+  `open 09:15 | entry_start 09:20 | entry_cutoff 15:00 (excl) | hard_flat 15:10 | close 15:30`,
+  IST only. Invalid/wrong-TZ → management-only. Legacy `forward_test` fallback kept.
+- **Risk:** T1 `0.8R 50%→breakeven` live; T2 `1.5R 30%→trail` shadow
+  (`ladder.enabled_phase2: false`). Realized + marked-unrealized daily halt
+  (5%), max positions (5, dynamic), per-symbol 20%, per-sector 40%, plus
+  consecutive-loss and drawdown halts. Halts are per-reason:
+  `daily_loss`/`consecutive_loss`/`drawdown` = session-persistent;
+  `max_positions` = dynamic; `broker_uncertain` = until reconciliation.
+  Restart rebuilds everything from broker + JSONL with order_id dedup + IST day
+  mapping (consec losses/wins, watermark, partials, sector, risk amounts).
 
-## MegaBull is now the DEFAULT paper broker (verified key + smoke)
-- `src/broker/megabull.py`: MIS fills on the free simulator; P&L authoritative
-  on their ledger (`/api/user/my` + `/api/position/my`). 11 mocked-HTTP tests.
-- Symbol map: strip `.NS` -> tradingSymbol, 6076-row CSV cached. MIS allows
-  short-first. No bracket/OCO: our guard loop owns stop/target exits.
-- `risk_management.capital: 500000` so sizing scales (1.5% = Rs7,500/trade,
-  20% exposure cap, 5% daily halt = Rs25,000). `TRIO_BROKER_PROVIDER`
-  env flips paper|megabull without editing config; test suite pins paper.
-- LIVE running on `TRIO_IMPLEMENTATION:5000` will take tomorrow's trades;
-  DEV (`TRIO_IMPLEMENTATION_NEW:5001`) stays the lab. Both on megabull
-  provider.
+## Execution (single lifecycle — no more path forks)
+`src/execution_lifecycle.py` owns: `reconcile_broker` (refresh + PENDING/UNKNOWN
+scan + `broker_uncertain` halt + risk rebuild) → `preflight` (halt/max/dup/
+sector/margin) → `submit_candidate` (CNC clip, place, pending≠filled, confirm,
+register, audit, alert) → `record_confirmed_close` (pnl/consec/position/halts/
+log/alert-once). `scan_once`, `execute_plan`, live rescans all call it. Sector
+is transactional: every confirmed fill updates the proposed portfolio in-pass.
+The ladder guard is broker-agnostic: it decides for local AND MegaBull; each
+broker only executes `close_position`. `_manage_open_positions` stop/target
+paths also route through `record_confirmed_close`.
 
-## Ladder Scaled Exits — Phase 1 built (T1 @ 0.8R: 50% + breakeven)
-**Gap closed:** 11/13 trades sat 355 mins to EOD=flat because 1.5R was too
-far. Today a full `T1/T2/T3` ladder (Entry->T1 50% -> breakeven -> T2/T3)
-was discussed; for tomorrow Phase 1 (T1 only) is armed:
-- `risk_manager.py`: `ladder_targets(entry, stop, action)` -> {T1: 0.8R}.
-- `config`: `breakeven_at_r: 0.8`, `partial_at_r: 0.8`, `partial_fraction: 0.5`.
-- `paper_trader.py`: `_guard_open_positions()` closes 50% at T1 and moves
-  the remaining stop to breakeven (risk-free). Hard stops mastered in
-  `_manage_open_positions()`. Guard skips megabull mirrors (remote safety).
-- Alerts: `format_exit_message()` marks `partial@T1-0.8R` as `🔹 PARTIAL 50%`;
-  Telegram entry alert shows `T1: ... (50% + breakeven)`.
-- Tested: `test_ladder_t1_partial_and_breakeven` + `test_ladder_targets_derived`.
-  **Future:** when 21-day replay proves it, arm T2 (1.5R -> T1) and T3 (2.5R).
+## Backtest (execution-realistic)
+Next-bar `Open` fills (never same-bar), stop gaps pay the worse open,
+stop-before-target on shared bars, notional costs per leg, unrealized in
+equity, Sharpe annualized by bars-per-year, `skipped_bars: N`. Exact-value
+tests pin entry/exit/slippage/commission/gap/EOD traces.
 
-## Six live-session defects fixed today (root-caused from trade_log.jsonl)
-1. Broker SELL-on-SHORT silently deleted the position (`paper.py`): now
-   side-aware fills; every close records to `closed_trades` + alerts.
-2. Balance double-count (equity 857,470 from 10k): equity = cash + LONG
-   value − SHORT owed; SHORT margin capped at initial capital.
-3. Hold-skip: same-side re-entry skipped+logged (was ULTRACEMCO 8x/5min).
-4. EOD square-off inside `scan_once` (was Ctrl+C only): 2026-10-06 held
-   2 positions 25 min past close with no exit/alert/record.
-5. Setup classifier from readings, not the `MACD` vs `macd` string match
-   (83% of live orders were `other`).
-6. Log `mode`+`broker` tags; test events -> `trade_log_test.jsonl`. Today's
-   polluted log archived as `trade_log_20261006_contaminated.jsonl`.
-   Real today 2026-10-06: Rs0 booked (0 real closes), −47 floating, −700 was test junk.
+## Known defects / open work (honest)
+- Session cadence/jackson `09:40/11:00/13:00` rescans proven only on paper;
+  remote-pending storms need the UNKNOWN_REMOTE_STATE poll loop tested live.
+- Weekly-loss scheduler keys off `weekly_pnl` but has no weekly rollover job yet.
+- Sector map covers NIFTY 50; unknown symbols fall back to `Unknown`.
+- Zerodha adapter is a stub — `provider: zerodha` raises today by design.
+- Strategy evidence: 5y daily long OOS + 21-day short replay + short single
+  live-paper win is NOT a joint proof of shorts+megabull+ladder+options+rescans.
+  Follow the A→H experiment ladder in config comments before combining features.
 
-## Telegram alerts LIVE + session-hours guard (verified 21:28 IST)
-- Entry/exit alerts wired into paper loop; test message DELIVERED to phone.
-- Fixed live 400 Bad Request: `_md_escape()` on all dynamic text
-  (tech_score= lines broke Markdown parsing). Regression test pinned.
-- Fixed live 21:23 after-hours SELL: `_session_open()` blocks new entries
-  outside 09:20–15:15 IST; stops/targets still managed. Replay tool exempt.
-  4 boundary tests. Full suite: 93/93 pass.
-
-## Current verdict: Ladder Phase 1 live — run forward paper
-- Baseline verified: compile clean, 138/138 tests pass.
-- Config frozen at the measured values:
-  - shorts ON (all 21-day replays ran with shorts; NIFTY +2963, BANKNIFTY +993)
-  - 1.5R final target (all session replays ran at 1.5R; 2.0R untested here)
-  - **Active Manager T1 0.8R: 50% + breakeven** (ladder Phase 1)
-  - ADX regime filter OFF (helped NIFTY +83 on n=15, bled BANKNIFTY 993→277)
-  - time stop OFF (monotonically worse at every tighter setting)
-  - no open-window ban (would have deleted the best bucket: +1662 at bars 0-1)
-- Short-side evidence is thinner than long-side: 21 days of session replay
-  vs 5y daily OOS validation. Stated honestly in config comments.
-
-## Tomorrow morning (restart required — dashboard != trader)
-- **Before 9 AM:** `cd "C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION"; python scripts\dashboard.py --port 5000`
-  (leave window open; browser http://127.0.0.1:5000).
-- At 09:20 entry alerts now show `T1: ... (50% + breakeven)`; a T1 hit
-  sends a `🔹 PARTIAL 50% — ... breakeven` Telegram alert mid-session.
-- Verify first close has P&L+reason+exit time (wired for both brokers;
-  proved live 2026-10-06).
-
-## Full verification (17:29 IST)
-- Compile: src + scripts clean.
-- Tests: 138/138 pass (ladder: partial+breakeven, targets, megabull id-row).
-- Live 15m scan (15 names) -> board; 92 scans today.
-- Dashboard: provider megabull, equity 504389.70, scans 92, no error.
+## Next action
+1. Merge `fix/production-hardening` → `main` after one green CI + smoke.
+2. Run experiment A (long-only equity, local paper) forward-paper with costs;
+   ship separate long/short drawdown + regime analysis before enabling B–H.
+3. Failure-injection suite: timeout, accepted-but-unconfirmed, delayed refresh,
+   duplicate close, partial remote fill, restart, corrupt ledger, alert outage.

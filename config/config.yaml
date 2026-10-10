@@ -52,17 +52,17 @@ symbols:
   - "BAJFINANCE.NS"
   - "HCLTECH.NS"
 
-# Trading account model. Shorts are currently ENABLED (allow_shorts: true).
-# All recent measurements were taken with shorts on: the 21-day NIFTY 15m
-# replay (+2963.61, 18 trades, 17 of them SELL) and the 21-day BANKNIFTY
-# replay (+993.27) both depend on the short path. The original 5y daily
-# validation was long-only pullback; the short side has 21 days of session
-# replay evidence, not 5 years — treat it as newer and thinner evidence.
+# Trading account model. Shorts DISABLED by default for production
+# validation (long-only equity first). Evidence ladder:
+#   A. long-only equity, local paper   <- VALIDATE FIRST
+#   B. short-only equity               <- needs multi-regime + swaps/lots of trades
+#   C. long+short, D. MegaBull equity, E. options, F/G. ladder phases, H. live rescans
+# Enable shorts ONLY after A is proven forward-paper with costs/slippage and
+# separate long/short drawdown + regime analysis ships.
 # CNC/delivery accounts CANNOT short: the paper loop still clips/skips SELL
-# without holdings (see settlement tests). Only enable this with an MIS
-# account where intraday shorting is genuinely possible.
+# without holdings (see settlement tests).
 trading:
-  allow_shorts: true
+  allow_shorts: false
 
 # Short-shadow validation: when only=true, day_session replay *skips*
 # SELL entries (records them as short-shadow intent in the debug ledger)
@@ -98,8 +98,12 @@ screener:
 # Spot view comes from the validated engine; options only replace HOW a
 # BUY/SELL is held. Paper fills via options_paper (live mid / LTP / BS sim).
 # Live Kite fills need the Kite Connect plan (~Rs500/mo) + keys in Secrets.
+# Options stay DISABLED for production validation (separate experiment E).
+# Expiry, bid/ask, chain freshness, strike/lot-size, leg failure, slippage,
+# taxes and theta all need their own proof AFTER the equity system is proven.
+# Keep options EXPLICIT: set enabled: true only for the options experiment.
 options:
-  enabled: true               # attach option_legs to screened candidates
+  enabled: false              # attach option_legs to screened candidates
   # Which book the index options execute on:
   #   "paper"    -> local options_paper sim (chain-mid fills; legacy)
   #   "megabull" -> MegaBull remote paper so the NIFTY position is VISIBLE

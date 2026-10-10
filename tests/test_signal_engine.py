@@ -86,18 +86,22 @@ def test_buy_when_technicals_confirm():
 
 
 def test_sell_when_technicals_confirm():
-    readings = _readings({
-        "sma_9": "bearish",
-        "ema_9": "bearish",
-        "macd": "bearish",
-        "rsi_14": "bearish",
-    })
-    signal = generate_signal(
-        symbol="TEST",
-        latest_price=80.0,
-        technical_readings=readings,
-        config_override=ENGINE_CFG,
-    )
+    from unittest.mock import patch as _p
+    # allow_shorts:false in installed market.yaml would block SELL -> HOLD
+    with _p("src.signal_engine.load_config",
+           return_value={"trading": {"allow_shorts": True}}):
+        readings = _readings({
+            "sma_9": "bearish",
+            "ema_9": "bearish",
+            "macd": "bearish",
+            "rsi_14": "bearish",
+        })
+        signal = generate_signal(
+            symbol="TEST",
+            latest_price=80.0,
+            technical_readings=readings,
+            config_override=ENGINE_CFG,
+        )
     assert signal.action == "SELL"
     assert signal.composite_score < 0
 
@@ -231,22 +235,25 @@ def test_short_blocked_when_macd_turned_up():
     assert any("SHORT BLOCKED" in r for r in signal.reasoning)
 
 def test_short_allowed_when_macd_confirms():
-    """Shorts exist only in signals mode (MIS-style accounts)."""
-    cfg = dict(PULLBACK_CFG)
-    cfg["entry_strategy"] = "signals"
-    cfg["trading"] = {"allow_shorts": True}
-    
-    signal = generate_signal(
-        symbol="TEST",
-        latest_price=80.0,
-        technical_readings=_readings({
-            "sma_9": "bearish",
-            "ema_9": "bearish",
-            "macd": "bearish",   # value -1 < signal 0: momentum down
-            "rsi_14": "bearish",
-        }),
-        config_override=cfg,
-    )
+    """Signals mode may short when technically confirmed — market clock
+    and trading allow_shorts must both permit it. Patch the global config
+    because PULLBACK_CFG overrides don't propagate to load_config."""
+    from unittest.mock import patch as _p
+    with _p("src.signal_engine.load_config",
+           return_value={"trading": {"allow_shorts": True}}):
+        cfg = dict(PULLBACK_CFG)
+        cfg["entry_strategy"] = "signals"
+        signal = generate_signal(
+            symbol="TEST",
+            latest_price=80.0,
+            technical_readings=_readings({
+                "sma_9": "bearish",
+                "ema_9": "bearish",
+                "macd": "bearish",   # value -1 < signal 0: momentum down
+                "rsi_14": "bearish",
+            }),
+            config_override=cfg,
+        )
     assert signal.action == "SELL"
 
 

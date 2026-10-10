@@ -25,22 +25,38 @@ logger = get_logger("risk_manager")
 
 @dataclass
 class RiskState:
-    """Tracks current risk state across the trading session."""
+    """Tracks current risk state across the trading session.
+
+    Halt policy (explicit per-reason):
+      daily_loss      -> session-persistent (rest of session)
+      consecutive_loss-> session-persistent (rest of session)
+      broker_uncertain-> persists until reconciliation confirms the book
+      max_positions   -> DYNAMIC: clears when count falls below the limit
+      drawdown        -> session-persistent once breached
+    """
     daily_pnl: float = 0.0
     open_positions: int = 0
     positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # symbol -> position info
     halt_active: bool = False
     halt_reason: str = ""
+    halts: Dict[str, str] = field(default_factory=dict)  # reason -> message
     consecutive_losses: int = 0
+    consecutive_wins: int = 0
     high_watermark: float = 0.0
     weekly_pnl: float = 0.0
     last_session_date: str = ""
+    last_reconciled_at: str = ""
+    partial_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def reset_daily(self) -> None:
         """Reset daily counters (call at start of each trading day)."""
         self.daily_pnl = 0.0
         self.halt_active = False
         self.halt_reason = ""
+        self.halts = {}
+        self.consecutive_losses = 0
+        self.consecutive_wins = 0
+        self.high_watermark = 0.0
 
 
 # Global risk state
@@ -111,48 +127,91 @@ def rebuild_from_ledger(
     _risk_state.open_positions = len(_risk_state.positions)
     _risk_state.last_session_date = today
 
-    # Realized P&L for today (broker records first, trade_log.jsonl second)
-    day_realized = 0.0
+    # Realized P&L for today. Dedup broker closed_trades vs the JSONL
+    # ledger by stable key (order_id > trade_id > composite) so a restart
+    # never double-counts P&L, and a hydrated broker record never hides a
+    # ledger-only close (process died before the mirror was saved).
+    from datetime import datetime as _DT, timedelta as _TDD, timezone as _TZZ
+    _IST = _TZZ(_TDD(hours=5, minutes=30))
+
+    def _key(r: Dict[str, Any]) -> str:
+        for k in ("order_id", "trade_id", "close_id"):
+            v = r.get(k)
+            if v:
+                return f"{k}:{v}"
+        return ("cmp:%s|%s|%s|%s|%s" % (
+            r.get("symbol"), r.get("side"), r.get("entry"),
+            r.get("exit"), r.get("quantity")))
+
+    def _ist_day(ts: str) -> str:
+        try:
+            dt = _DT.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_TZZ.utc)
+            return dt.astimezone(_IST).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    seen: Dict[str, float] = {}
+    ordered_pnls: List[float] = []
+    # 1) broker records first
     for r in (closed_trades or []):
         try:
-            ts = str(r.get("closed_at") or r.get("entry_time") or "")
-            # Keep any record that carries today's IST date or has no date at
-            # all (the broker unit tests use no timestamp — treat as today).
-            if (not ts) or today in ts or today in str(r.get("date") or ""):
-                day_realized += float(r.get("pnl") or 0.0)
+            ts = str(r.get("closed_at") or r.get("entry_time") or r.get("ts") or "")
+            day = _ist_day(ts) if ts else today
+            if day and day != today:
+                continue
+            k = _key(r if isinstance(r, dict) else {})
+            if k in seen:
+                continue
+            v = float(r.get("pnl") or 0.0)
+            seen[k] = v
+            ordered_pnls.append(v)
         except Exception:
             continue
-    # If still zero, try the JSONL ledger (append-only Source of Truth)
-    if day_realized == 0.0:
-        try:
-            from pathlib import Path as _P
-            from src.utils import load_config as _lc2
-            cfg = _lc2()
-            log_path = _P(cfg.get("logging", {}).get("trade_log",
-                            "output/trade_log.jsonl"))
-            if log_path.exists():
-                import json as _j
-                for line in log_path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = _j.loads(line)
-                    except Exception:
-                        continue
-                    if rec.get("event") != "close" or rec.get("mode") == "test":
-                        continue
-                    # Already counted via broker above; jsonl is the fallback
-                    # when broker records haven't been hydrated yet.
-                    # Prefer the ledger if the file exists and is non-empty.
-                    pass
-        except Exception:
-            pass
-    _risk_state.daily_pnl = day_realized
-    _risk_state.high_watermark = max(day_realized, 0.0)
-    # Don't spin halt checks here — the next _check_halt on any event will
-    # set it. Consecutive-losses needs the full sequence, so keep 0 until
-    # the first realized loss is tallied via update_pnl.
+    # 2) JSONL ledger (UTC ts -> IST day; test-mode rows ignored; never double-sum)
+    try:
+        from pathlib import Path as _P
+        from src.utils import load_config as _lc2
+        cfg = _lc2()
+        log_path = _P(cfg.get("logging", {}).get("trade_log",
+                        "output/trade_log.jsonl"))
+        if log_path.exists():
+            import json as _j
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _j.loads(line)
+                except Exception:
+                    continue
+                if rec.get("event") != "close" or rec.get("mode") == "test":
+                    continue
+                if _ist_day(str(rec.get("ts") or "")) != today:
+                    continue
+                k = _key(rec)
+                if k in seen:
+                    continue
+                v = float(rec.get("pnl") or 0.0)
+                seen[k] = v
+                ordered_pnls.append(v)
+    except Exception:
+        pass
+
+    _risk_state.daily_pnl = round(sum(seen.values()), 2)
+    _risk_state.high_watermark = max(_risk_state.daily_pnl, 0.0)
+    # Consecutive losses / wins from the time-ordered close sequence.
+    _risk_state.consecutive_losses = 0
+    _risk_state.consecutive_wins = 0
+    for v in ordered_pnls:
+        if v < 0:
+            _risk_state.consecutive_losses += 1
+            _risk_state.consecutive_wins = 0
+        elif v > 0:
+            _risk_state.consecutive_wins += 1
+            _risk_state.consecutive_losses = 0
+    _check_halt()
     return _risk_state
 
 
@@ -166,14 +225,16 @@ def on_broker_retry_failed(symbol: str) -> bool:
 
 
 def update_pnl(pnl: float) -> None:
-    """Update the daily PnL (+ consecutive-loss + drawdown watermark)."""
+    """Update the daily PnL (+ consecutive-loss/win + drawdown watermark)."""
     _risk_state.daily_pnl += pnl
     # watermark for drawdown (peak of today's realized equity)
     if _risk_state.daily_pnl > _risk_state.high_watermark:
         _risk_state.high_watermark = _risk_state.daily_pnl
     if pnl < 0:
         _risk_state.consecutive_losses += 1
+        _risk_state.consecutive_wins = 0
     elif pnl > 0:
+        _risk_state.consecutive_wins += 1
         _risk_state.consecutive_losses = 0
     _check_halt()
 
@@ -256,43 +317,49 @@ def _check_halt(unrealized_total: Optional[float] = None) -> None:
     except Exception:
         capital = 100000.0
 
+    def _set(reason: str, msg: str, level: str = "critical") -> None:
+        _risk_state.halts[reason] = msg
+        _risk_state.halt_active = True
+        _risk_state.halt_reason = msg
+        if level == "critical":
+            logger.critical("TRADING HALTED: %s", msg)
+        else:
+            logger.warning("TRADING HALTED: %s", msg)
+
     # 1) Daily realized loss
     max_daily_loss_pct = float(rm_cfg.get("max_daily_loss_pct", 5.0) or 0.0)
     max_daily_loss = capital * max_daily_loss_pct / 100
     if max_daily_loss > 0 and _risk_state.daily_pnl <= -max_daily_loss:
-        _risk_state.halt_active = True
-        _risk_state.halt_reason = (
-            f"Daily loss limit breached: PnL={_risk_state.daily_pnl:.2f} "
-            f"(limit={-max_daily_loss:.2f})"
-        )
-        logger.critical("TRADING HALTED: %s", _risk_state.halt_reason)
+        _set("daily_loss",
+             f"Daily loss limit breached: PnL={_risk_state.daily_pnl:.2f} "
+             f"(limit={-max_daily_loss:.2f})")
 
     # 2) Daily realized + unrealized (mark-to-market drawdown within the day)
     if unrealized_total is not None:
         eff = _risk_state.daily_pnl + float(unrealized_total)
         if max_daily_loss > 0 and eff <= -max_daily_loss:
-            _risk_state.halt_active = True
-            _risk_state.halt_reason = (
-                f"Daily loss (incl. unrealized) breached: {eff:.2f}")
-            logger.critical("TRADING HALTED: %s", _risk_state.halt_reason)
+            _set("daily_loss",
+                 f"Daily loss (incl. unrealized) breached: {eff:.2f}")
 
-    # 3) Max open positions
+    # 3) Max open positions — DYNAMIC: clears when count falls below limit.
     max_positions = int(rm_cfg.get("max_open_positions", 5) or 5)
     if _risk_state.open_positions >= max_positions:
-        _risk_state.halt_active = True
-        _risk_state.halt_reason = (
-            f"Max open positions reached: {_risk_state.open_positions}/{max_positions}"
-        )
-        logger.warning("TRADING HALTED: %s", _risk_state.halt_reason)
+        _set("max_positions",
+             f"Max open positions reached: {_risk_state.open_positions}/{max_positions}",
+             level="warning")
+    else:
+        _risk_state.halts.pop("max_positions", None)
+        # Recompute halt_active from the remaining (session-persistent) reasons.
+        if not any(k in _risk_state.halts for k in
+                   ("daily_loss", "consecutive_loss", "broker_uncertain", "drawdown")):
+            _risk_state.halt_active = False
+            _risk_state.halt_reason = ""
 
     # 4) Consecutive losing trades
     max_consec = int(rm_cfg.get("max_consecutive_losses", 0) or 0)
     if max_consec > 0 and _risk_state.consecutive_losses >= max_consec:
-        _risk_state.halt_active = True
-        _risk_state.halt_reason = (
-            f"Consecutive losses limit: {_risk_state.consecutive_losses}/{max_consec}"
-        )
-        logger.critical("TRADING HALTED: %s", _risk_state.halt_reason)
+        _set("consecutive_loss",
+             f"Consecutive losses limit: {_risk_state.consecutive_losses}/{max_consec}")
 
     # 5) Drawdown off the high watermark (realized)
     max_dd_pct = float(rm_cfg.get("max_drawdown_pct", 0.0) or 0.0)
@@ -300,10 +367,29 @@ def _check_halt(unrealized_total: Optional[float] = None) -> None:
         dd = (_risk_state.high_watermark - _risk_state.daily_pnl) / max(
             _risk_state.high_watermark, 1.0) * 100
         if dd >= max_dd_pct:
-            _risk_state.halt_active = True
-            _risk_state.halt_reason = (
-                f"Max drawdown breached: {dd:.1f}% (limit {max_dd_pct}%)")
-            logger.critical("TRADING HALTED: %s", _risk_state.halt_reason)
+            _set("drawdown",
+                 f"Max drawdown breached: {dd:.1f}% (limit {max_dd_pct}%)")
+
+
+def set_broker_uncertain(msg: str) -> None:
+    """Mark the remote book UNKNOWN — blocks new entries until reconciled."""
+    _risk_state.halts["broker_uncertain"] = msg
+    _risk_state.halt_active = True
+    _risk_state.halt_reason = msg
+    logger.critical("TRADING HALTED (broker uncertain): %s", msg)
+
+
+def clear_broker_uncertain() -> None:
+    """Reconciliation confirmed the book — lift only the uncertain halt."""
+    _risk_state.halts.pop("broker_uncertain", None)
+    try:
+        from src.utils import utc_now
+        _risk_state.last_reconciled_at = str(utc_now())
+    except Exception:
+        pass
+    if not _risk_state.halts:
+        _risk_state.halt_active = False
+        _risk_state.halt_reason = ""
 
 
 # ---------------------------------------------------------------------------
