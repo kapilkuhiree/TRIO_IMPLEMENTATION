@@ -72,12 +72,13 @@ def load_plan(date: Optional[str] = None,
         return None
 
 
-def find_latest_plan(plan_dir: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def find_latest_plan(plan_dir: Optional[Path] = None,
+                     max_age_days: int = 365) -> Optional[Dict[str, Any]]:
     """Return the most recent (lexically latest YYYY-MM-DD) plan on disk.
 
-    Used when today's plan hasn't been written yet — the session should
-    keep trading yesterday's signals (still ranked on yesterday's close)
-    rather than sitting idle until the overnight job catches up.
+    Args:
+        plan_dir:     Override directory.
+        max_age_days: Plans older than this are ignored (stale).
     """
     d = plan_dir or PLAN_DIR
     if not d.exists():
@@ -85,12 +86,49 @@ def find_latest_plan(plan_dir: Optional[Path] = None) -> Optional[Dict[str, Any]
     json_files = sorted(d.glob("*.json"))
     if not json_files:
         return None
-    # YYYY-MM-DD sorts lexically == chronologically
+    # Reject a future-dated filename (clock skew / bad write)
+    cutoff = datetime.now(IST).strftime("%Y-%m-%d")
+    json_files = [p for p in json_files if p.stem <= cutoff]
+    if max_age_days is not None and max_age_days >= 0:
+        try:
+            cutoff_early = (datetime.now(IST) - timedelta(days=max_age_days)
+                            ).strftime("%Y-%m-%d")
+            json_files = [p for p in json_files if p.stem >= cutoff_early]
+        except Exception:
+            pass
+    if not json_files:
+        return None
     latest_file = json_files[-1]
     try:
         return json.loads(latest_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def validate_stale(cand: Dict[str, Any], date: str,
+                   live_price: Optional[float] = None,
+                   max_age_days: int = 1,
+                   max_deviation_pct: float = 1.0) -> Optional[str]:
+    """Return None if *cand* is safe to trade when stale, else a reason."""
+    try:
+        from datetime import datetime as _dt1
+        cand_date = str(cand.get("date") or date)
+        days = (_dt1.strptime(date, "%Y-%m-%d") -
+                _dt1.strptime(cand_date, "%Y-%m-%d")).days
+        if days > max_age_days:
+            return f"stale {days}d > {max_age_days}d"
+        if live_price is not None:
+            ep = float(cand.get("entry_price") or 0) or 1.0
+            dev = abs(live_price - ep) / ep * 100
+            if dev > max_deviation_pct:
+                return f"price-deviation {dev:.1f}% > {max_deviation_pct}%"
+        if not cand.get("stop_loss") or not cand.get("target"):
+            return "missing stop/target"
+        if int(cand.get("position_size") or 0) <= 0:
+            return "invalid qty"
+        return None
+    except Exception as exc:
+        return f"stale-check error: {exc}"
 
 
 def mark_executed(payload: Dict[str, Any], order_ids: List[str],

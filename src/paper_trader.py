@@ -54,18 +54,37 @@ class PaperTrader:
         rm_cfg = cfg.get("risk_management", {})
         capital = initial_capital or rm_cfg.get("capital", 100000)
 
-        # Provider precedence: explicit env (TRIO_BROKER_PROVIDER=paper|
-        # megabull) > config `broker.provider` > local paper. The test
-        # suite pins `paper` via tests/conftest.py so the suite never
-        # touches the network, whatever config.yaml says.
-        provider = (
+        # Provider MUST be explicit. Any typo like "megabul" now fails fast
+        # instead of silently returning a paper simulator that hides the error.
+        allowed = {"paper", "megabull"}
+        # Optional: add "zerodha" here when that adapter is fully implemented.
+        raw = provider = (
             os.environ.get("TRIO_BROKER_PROVIDER", "").strip().lower()
             or (cfg.get("broker", {}) or {}).get("provider", "paper")
         )
+        if raw not in allowed:
+            raise ValueError(
+                f"Unknown broker provider '{raw}' — allowed: {sorted(allowed)}. "
+                f"Refusing to trade silently on a typoed simulator.")
+        # MegaBull paper requires intent: env or config "megabull" plus a
+        # non-empty API key, otherwise fail-closed before any order.
         if provider == "megabull":
             from src.broker.megabull import MegaBullBroker, load_dotenv_key
             api_key = os.environ.get("MEGABULL_API_KEY", "") or \
                 load_dotenv_key("MEGABULL_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "Broker 'megabull' selected but no MEGABULL_API_KEY found "
+                    "in the environment or .env — refusing to run without credentials.")
+            # Live mode must be confirmed explicitly: TRIO_LIVE=1 or
+            # forward_test.live_confirmed:true — never silently extend the
+            # remote paper balance to a real account.
+            if str(cfg.get("mode", "")).lower() in ("live", "real") \
+                    and not str(os.environ.get("TRIO_LIVE", "")).strip():
+                if not bool((cfg.get("forward_test", {}) or {}).get("live_confirmed")):
+                    raise RuntimeError(
+                        "Config 'mode: live' requires TRIO_LIVE=1 or "
+                        "forward_test.live_confirmed: true to proceed.")
             self.broker = MegaBullBroker(
                 api_key=api_key,
                 initial_capital=capital,

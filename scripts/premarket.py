@@ -93,14 +93,19 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         except Exception as exc:
             logger.warning("Options overlay unavailable: %s", exc)
 
+    # Screener already logs per-symbol failures; surface the same number
+    # here so Telegram/dashboard and the JSON file all agree.
+    # Failed is the gap between requested symbols and the surviving candidates
+    # when both are driven by the same fetch. A later pass will make the
+    # screener return (candidates, stats) and we can copy stats["failed"] here.
     return {
         "date": today_ist_str(),
         "generated_at": utc_now(),
         "universe": universe,
         "timeframe": timeframe,
         "scanned": len(symbols),
-        "failed": max(0, len(symbols) - 0),  # screen logs real count
-        "top_n": top_n,
+        "requested": len(symbols),
+        "failed": max(0, len(symbols) - len(cand_dicts)),
         "min_rank": sc_cfg.get("min_rank", 40.0),
         "min_confidence": sc_cfg.get("min_confidence", 60),
         "candidates": cand_dicts,
@@ -111,8 +116,11 @@ def build_plan(universe: str, timeframe: str, top_n: int,
 
 def format_summary(plan: Dict[str, Any]) -> str:
     """Phone-friendly Telegram summary of the plan."""
+    # Structured stats line — requested vs scanned vs failed.
+    _req = plan.get("requested", plan.get("scanned", "?"))
+    _fail = plan.get("failed", "?")
     lines = [f"*TRIO premarket plan — {plan['date']}*",
-             f"Universe: {plan['universe']} ({plan['scanned']} scanned) "
+             f"Universe: {plan['universe']} ({plan['scanned']} scanned, {_fail} failed, {plan.get('requested', _req)} requested) "
              f"on {plan['timeframe']}"]
     cands = plan.get("candidates", [])
     if not cands:

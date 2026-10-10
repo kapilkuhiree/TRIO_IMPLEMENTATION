@@ -42,66 +42,88 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=int, default=6 * 3600)
     parser.add_argument("--no-plan", action="store_true",
                         help="Skip reading a plan (management only)")
+    parser.add_argument("--allow-stale-plan", action="store_true",
+                        help="Allow stale-plan fallback (default: management-only)")
     args = parser.parse_args()
 
     date = args.date or today_ist_str()
     cfg = load_config()
 
-    # Load today's plan; if missing fall back to the most recent one so the
-    # session never sits idle — exactly like the manual daily scans you ran
-    # before automation. Yesterday's plan's signals are still valid for today
-    # (they were ranked on yesterday's close), and the live fallback also
-    # refreshes them from today's bars.
     plan = None if args.no_plan else load_plan(date)
-    if plan is None and not args.no_plan:
+    if plan is not None:
+        # Use today's plan as-is (validated on its own screen).
+        pass
+    elif args.no_plan:
+        plan = None
+    elif args.allow_stale_plan:
+        # Explicit flag required: try stale -> fresh union or build from scratch.
         from src.plan import find_latest_plan
-
         latest = find_latest_plan()
         if latest is not None:
             latest_date = latest.get("date", "?")
             logger.warning(
-                "No plan for %s — using latest plan (%s) with %d candidate(s).",
-                date, latest_date, len(latest.get("candidates", [])))
-            plan = latest
-            # Also build a fresh scan for today in parallel — the session
-            # trades the latest (yesterday) plan now and the fresh plan's
-            # candidates will be available next loop after _save_plan.
+                "No plan for %s — stale allowed, using latest (%s).",
+                date, latest_date)
+            # Validate staleness + price deviation per candidate before merging.
             try:
-                from scripts.premarket import build_plan
-                from src.plan import save_plan as _save_plan
-                cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
-                fresh = build_plan(cfg_universe, "1d",
-                                   cfg.get("screener", {}).get("max_positions_to_open", 3))
-                fresh["date"] = date
-                _save_plan(fresh, date=date)
-                logger.info("Fresh today's plan also built: %d candidate(s) for %s.",
-                            len(fresh.get("candidates", [])), date)
-                # Trade the union but dedupe by symbol — fresh intraday scan
-                # wins when the same symbol appears with a newer signal.
-                seen = {c.get("symbol") for c in fresh.get("candidates", [])}
-                merged = list(fresh.get("candidates", []))
-                for c in latest.get("candidates", []) or []:
-                    if c.get("symbol") not in seen:
-                        merged.append(c)
-                # Keep ranking order and cap to top_n
-                top_n = cfg.get("screener", {}).get("max_positions_to_open", 3)
-                merged.sort(key=lambda x: x.get("rank", 0), reverse=True)
-                plan = dict(fresh)
-                plan["candidates"] = merged[: top_n * 2]  # small headroom for union
-                plan["merged_from"] = latest_date
+                from src.data_fetcher import fetch_market_data
+                safe_latest: List[Dict[str, Any]] = []
+                for _c in (latest.get("candidates", []) or []):
+                    lp = None
+                    try:
+                        lp = fetch_market_data(
+                            _c.get("symbol", ""), "1d").latest_price
+                    except Exception:
+                        pass
+                    r = None
+                    try:
+                        from src.plan import validate_stale
+                        r = validate_stale(_c, date, live_price=lp)
+                    except Exception:
+                        r = None
+                    if r is None:
+                        safe_latest.append(_c)
+                    else:
+                        logger.warning("Stale %s rejected: %s",
+                                       _c.get("symbol"), r)
+                latest_safe = {**latest, "candidates": safe_latest}
+                if not safe_latest:
+                    logger.warning("All stale candidates rejected — not merging.")
+                try:
+                    from scripts.premarket import build_plan
+                    from src.plan import save_plan as _save_plan
+                    cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
+                    fresh = build_plan(cfg_universe, "1d",
+                                       cfg.get("screener", {}).get("max_positions_to_open", 3))
+                    fresh["date"] = date
+                    _save_plan(fresh, date=date)
+                    logger.info("Fresh plan also built: %d candidate(s) for %s.",
+                                len(fresh.get("candidates", [])), date)
+                    seen = {c.get("symbol") for c in fresh.get("candidates", [])}
+                    merged = list(fresh.get("candidates", []))
+                    for c in latest_safe.get("candidates", []) or []:
+                        if c.get("symbol") not in seen:
+                            merged.append(c)
+                    top_n = cfg.get("screener", {}).get("max_positions_to_open", 3)
+                    merged.sort(key=lambda x: x.get("rank", 0), reverse=True)
+                    plan = dict(fresh)
+                    plan["candidates"] = merged[: top_n * 2]
+                    if safe_latest:
+                        plan["merged_from"] = latest_date
+                except Exception as exc:
+                    logger.warning("Fresh scan failed: %s — trading stale only.", exc)
+                    plan = latest_safe or None
             except Exception as exc:
-                logger.warning("Fresh today's scan failed: %s — trading latest plan only.", exc)
+                logger.warning("Stale fallback failed: %s — manage-only.", exc)
+                plan = None
         else:
-            # No plan at all on disk — build today's from scratch so the
-            # session never sits idle, same as the manual scans we did before.
-            logger.warning("No plan for %s and no prior plan — running live scan.",
-                           date)
+            logger.warning("No plan for %s and no prior plan — running live scan.", date)
             try:
                 from scripts.premarket import build_plan
                 from src.plan import save_plan as _save_plan
                 cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
                 plan = build_plan(cfg_universe, "1d",
-                                  cfg.get("screener", {}).get("max_positions_to_open", 3))
+                                   cfg.get("screener", {}).get("max_positions_to_open", 3))
                 plan["date"] = date
                 _save_plan(plan, date=date)
                 logger.info("Live fallback plan built: %d candidate(s) for %s.",
@@ -109,6 +131,25 @@ def main() -> None:
             except Exception as exc:
                 logger.error("Live fallback scan failed: %s — manage-only.", exc)
                 plan = None
+    else:
+        # Default: no today's plan -> build a fresh one; _never_ trade stale
+        # automatically. Without --allow-stale-plan the runner is management-only
+        # until a fresh plan arrives.
+        logger.warning("No plan for %s — no stale trading without "
+                       "--allow-stale-plan; building a fresh plan.", date)
+        try:
+            from scripts.premarket import build_plan
+            from src.plan import save_plan as _save_plan
+            cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
+            plan = build_plan(cfg_universe, "1d",
+                               cfg.get("screener", {}).get("max_positions_to_open", 3))
+            plan["date"] = date
+            _save_plan(plan, date=date)
+            logger.info("Fresh plan built: %d candidate(s) for %s.",
+                        len(plan.get("candidates", [])), date)
+        except Exception as exc:
+            logger.error("Fresh plan build failed: %s — manage-only.", exc)
+            plan = None
 
     # Session uses the plan's symbols so position data can be fetched.
     symbols = list(plan.get("symbols", [])) if plan else []
