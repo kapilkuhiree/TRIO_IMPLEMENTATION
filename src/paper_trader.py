@@ -477,6 +477,11 @@ class PaperTrader:
                         order.stop_loss = pos.avg_price
                         pos.halved = True
                         setattr(pos, "ladder_t1_hit", True)
+                        try:
+                            from src.risk_manager import update_pnl as _rm_p
+                            _rm_p(float(rec.get("pnl") or 0.0))
+                        except Exception:
+                            pass
 
                 # Ladder Phase 2: requires T1, eligible at +1.5R.
                 # Shadow unless ladder.enabled_phase2. One-unit T2 uses the
@@ -498,6 +503,11 @@ class PaperTrader:
                                                       "record": rec})
                             setattr(pos, "ladder_t2_hit", True)
                             try:
+                                from src.risk_manager import update_pnl as _rm_p2
+                                _rm_p2(float(rec.get("pnl") or 0.0))
+                            except Exception:
+                                pass
+                            try:
                                 atr_v = _atr()
                                 if atr_v:
                                     trail = (price - atr_v * trail_mult
@@ -514,6 +524,16 @@ class PaperTrader:
                             "rr": round(rr, 2),
                             "reason": "ladder-T2", "would_be": "partial@T2-1.5R",
                         })
+                # Mark-to-market push: a red book halts the runner even
+                # before a full stop is hit (realized + unrealized check).
+                try:
+                    from src.risk_manager import _check_halt as _gc2
+                    total = 0.0
+                    for _p in self.broker.positions.values():
+                        total += float(getattr(_p, "pnl", 0.0) or 0.0)
+                    _gc2(unrealized_total=total)
+                except Exception:
+                    pass
 
                 # Shadow invalidation (log-only; never closes)
                 try:
@@ -546,10 +566,28 @@ class PaperTrader:
                     rec = self.broker.close_position(sym, price, "stop-hit")
                     if rec:
                         self._log_event("close", rec)
+                        try:
+                            from src.risk_manager import (
+                                close_position as _rm_close,
+                                update_pnl as _rm_pnl,
+                            )
+                            _rm_pnl(float(rec.get("pnl") or 0.0))
+                            _rm_close(sym)
+                        except Exception:
+                            pass
                 elif tgt_hit:
                     rec = self.broker.close_position(sym, price, "target-hit")
                     if rec:
                         self._log_event("close", rec)
+                        try:
+                            from src.risk_manager import (
+                                close_position as _rm_close,
+                                update_pnl as _rm_pnl,
+                            )
+                            _rm_pnl(float(rec.get("pnl") or 0.0))
+                            _rm_close(sym)
+                        except Exception:
+                            pass
             except Exception as exc:
                 logger.error("Guard failed for %s: %s", sym, exc)
         return exited
@@ -685,6 +723,17 @@ class PaperTrader:
                 if rec:
                     closed.append(rec)
                     self._log_event("close", rec)
+                    try:
+                        from src.risk_manager import (
+                            close_position as _rm_close,
+                            update_pnl as _rm_pnl,
+                            _check_halt as _rm_check,
+                        )
+                        pnl = float(rec.get("pnl") or 0.0)
+                        _rm_pnl(pnl)
+                        _rm_close(sym)
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.error("Square-off failed for %s: %s", sym, exc)
         self._write_trade_log_csv()
@@ -991,8 +1040,80 @@ class PaperTrader:
         except Exception as exc:
             logger.warning("execute_plan: position refresh failed: %s", exc)
 
+        # Rebuild risk state from the refreshed broker book (restart-resilient).
+        try:
+            from src.risk_manager import rebuild_from_ledger
+            today = None
+            try:
+                from datetime import datetime, timezone, timedelta as _td
+                IST = timezone(_td(hours=5, minutes=30))
+                today = datetime.now(IST).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            rebuild_from_ledger(self.broker.positions,
+                                getattr(self.broker, "closed_trades", []),
+                                today=today)
+        except Exception:
+            pass
+        # Hard block when any risk halt is already active (daily loss, max
+        # positions backstopped by RiskState, not just config).
+        try:
+            from src.risk_manager import get_risk_state
+            if get_risk_state().halt_active:
+                logger.critical("execute_plan: trading halted — %s.",
+                                get_risk_state().halt_reason)
+                return []
+        except Exception:
+            pass
+
+        # Broker-uncertainty guard: if the remote book returned a pending/
+        # out-of-sync marker, do not trade until it reconciles.
+        try:
+            raw = getattr(self.broker, "positions", {})
+            if any(getattr(p, "status", "") == "PENDING" for p in raw.values()):
+                logger.warning("execute_plan: broker has PENDING positions — "
+                               "blocking new entries until refresh confirms.")
+                return []
+        except Exception:
+            pass
+        # Available-margin guard (local + remote books both expose get_balance).
+        try:
+            bal = self.broker.get_balance()
+            if float(bal.get("available", 1)) <= 0:
+                logger.warning("execute_plan: available margin exhausted — "
+                               "blocking new entries.")
+                return []
+        except Exception:
+            pass
+
         placed: List[Dict[str, Any]] = []
         for cand in plan.get("candidates", []) or []:
+            # Per-candidate risk check: daily loss / halt, margin, fees.
+            try:
+                from src.risk_manager import get_risk_state as _grs
+                if _grs().halt_active:
+                    break
+                # Fees/slippage estimation: commission + slippage on notional
+                cfg2 = cfg
+                comm = float(cfg2.get("risk_management", {}).get("backtesting",
+                             {}).get("commission_pct", 0) or
+                             cfg2.get("backtesting", {}).get("commission_pct", 0) or 0) / 100
+                slip = float(cfg2.get("backtesting", {}).get("slippage_pct", 0) or
+                             cfg2.get("backtesting", {}).get("slippage_pct", 0) or 0) / 100
+                notional = float(cand.get("entry_price") or 0) * int(
+                    cand.get("position_size") or 0)
+                est_cost = round(notional * (comm + slip), 2)
+                try:
+                    if float(self.broker.get_balance().get("available", 1e12)) < est_cost:
+                        self._log_event("skip", {
+                            "symbol": signal.symbol if 'signal' in locals() else cand.get("symbol"),
+                            "reason": "margin-after-est-cost"})
+                        continue
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
             if len(self.broker.positions) >= max_open:
                 logger.info("execute_plan: max_open_positions (%d) reached.",
                             max_open)
@@ -1044,7 +1165,17 @@ class PaperTrader:
                              signal.symbol, exc)
                 continue
 
+            if getattr(order, "status", "") in ("PENDING", "PLACED", "ACCEPTED"):
+                logger.warning("execute_plan: %s pending (%s) — not booked "
+                               "until confirmed filled.",
+                               signal.symbol, order.status)
+                self._log_event("skip", {
+                    "symbol": signal.symbol, "action": signal.action,
+                    "rank": cand.get("rank"),
+                    "reason": f"pending: {order.status}"})
+                continue
             if order.status != "FILLED":
+                # Rejections must not consume risk or be treated as fills.
                 logger.warning("execute_plan: %s rejected: %s",
                                signal.symbol, order.error)
                 self._log_event("skip", {
@@ -1052,6 +1183,14 @@ class PaperTrader:
                     "rank": cand.get("rank"), "setup": cand.get("setup_name"),
                     "reason": f"rejected: {order.error}"})
                 continue
+
+            # Confirmed fill: register exposure so halt checks see it immediately.
+            try:
+                from src.risk_manager import add_position as _add
+                _add(signal.symbol, signal.position_size, signal.entry_price,
+                     cand.get("risk_amount", 0.0) or 0.0)
+            except Exception:
+                pass
 
             record = {
                 "symbol": signal.symbol, "action": signal.action,
