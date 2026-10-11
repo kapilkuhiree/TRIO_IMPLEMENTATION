@@ -420,6 +420,7 @@ class PaperTrader:
                         and getattr(o, "stop_loss", 0)), None)
                 if order is None: continue
                 sl = float(order.stop_loss)
+                tgt = float(order.target or 0.0)
 
                 # Freeze the ORIGINAL risk (entry -> initial stop) the first
                 # time we see this position. After T1 the active stop moves to
@@ -442,7 +443,52 @@ class PaperTrader:
                 # One-unit rule: if T1 cannot close any quantity (int(1*0.5)==0)
                 # the ladder state is left untouched — the position stays
                 # fully open and eligible to retry on the next tick.
-                if rr >= t1_at_r and not pos.halved:
+                # Shared policy integration: T1 decision via exit_policy module.
+                from src.exit_policy import LadderState, decide_exit
+                state = LadderState(
+                    side=pos.side,
+                    entry=pos.avg_price,
+                    initial_stop=float(getattr(pos, "initial_stop", sl)),
+                    stop=sl,
+                    target=tgt,
+                    quantity=pos.quantity,
+                    original_quantity=pos.quantity,
+                    t1_hit=getattr(pos, "ladder_t1_hit", False),
+                    t2_hit=getattr(pos, "ladder_t2_hit", False),
+                )
+                atr = _atr()
+                actions = decide_exit(state, price=price, atr=atr)
+                
+                # Filter for T1 partials from shared policy
+                t1_actions = [a for a in actions if a.kind == "partial" and "T1" in a.reason]
+                
+                if rr >= t1_at_r and not pos.halved and t1_actions:
+                    # Execute T1 partial from shared policy
+                    action = t1_actions[0]
+                    rec = self.broker.close_position(
+                        sym, price, action.reason,
+                        fraction=action.fraction_of_original)
+                    if rec:
+                        from src.execution_lifecycle import record_confirmed_close
+                        record_confirmed_close(self, sym, rec)
+                        exited.append(rec)
+                        # Persist T1 success to position
+                        setattr(pos, "ladder_t1_hit", True)
+                        pos.halved = True
+                        order.stop_loss = pos.avg_price
+                        # Partial: realized pnl only; position stays open.
+                        try:
+                            from src.risk_manager import update_pnl as _rm_p
+                            _rm_p(float(rec.get("pnl") or 0.0))
+                            try:
+                                pos.booked_pnl = float(getattr(pos, "booked_pnl", 0.0) or 0.0) + float(rec.get("pnl") or 0.0)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                elif rr >= t1_at_r and not pos.halved:
+                    # Legacy T1 path (fallback if decide_exit didn't fire,
+                    # e.g. phase2 config differences)
                     rec = self.broker.close_position(
                         sym, price, "partial@T1-0.8R", fraction=t1_frac)
                     if rec:
@@ -468,25 +514,50 @@ class PaperTrader:
                         except Exception:
                             pass
 
-                # Ladder Phase 2: requires T1, eligible at +1.5R.
-                # Shadow unless ladder.enabled_phase2. One-unit T2 uses the
-                # same rule: no quantity -> leave hit-flag unset.
-                if getattr(pos, "ladder_t1_hit", False) \
-                        and rr >= t2_at_r and not getattr(
-                            pos, "ladder_t2_hit", False):
-                    if phase2:
+                # 4. Execute T1 partials from shared policy (already done above)
+                # -----------------------------------------------------------------
+                # 5. Ladder Phase 2 via shared exit policy
+                # -----------------------------------------------------------------
+                if getattr(pos, "ladder_t1_hit", False):
+                    # Build LadderState for shared policy
+                    state = LadderState(
+                        side=pos.side,
+                        entry=pos.avg_price,
+                        initial_stop=float(getattr(pos, "initial_stop", sl)),
+                        stop=sl,
+                        target=tgt,
+                        quantity=pos.quantity,
+                        original_quantity=pos.quantity,
+                        t1_hit=True,
+                        t2_hit=getattr(pos, "ladder_t2_hit", False),
+                    )
+                    atr = _atr()
+                    phase2 = bool(ladder_cfg.get("enabled_phase2", False))
+                    actions = decide_exit(state, price=price, atr=atr,
+                                          hard_flat=self._eod_squared, cfg=cfg)
+                    
+                    # Filter for T2 partials
+                    t2_actions = [a for a in actions if a.kind == "partial" and "T2" in a.reason]
+                    
+                    if t2_actions and rr >= t2_at_r:
+                        # Execute T2 partial from shared policy
+                        action = t2_actions[0]
                         rec = self.broker.close_position(
-                            sym, price, "partial@T2-1.5R", fraction=t2_frac)
+                            sym, price, action.reason,
+                            fraction=action.fraction_of_original)
                         if rec:
-                            logger.info("LADDER T2 %s @ %.2f (%.1f%%) — "
-                                        "trailing armed",
-                                        sym, price, rec["pnl_pct"])
-                            self._log_event("guard", {"symbol": sym,
-                                                      "price": price,
-                                                      "rr": round(rr, 2),
-                                                      "decision": "partial@T2-1.5R",
-                                                      "record": rec})
+                            from src.execution_lifecycle import record_confirmed_close
+                            record_confirmed_close(self, sym, rec)
+                            exited.append(rec)
+                            # Persist T2 success to position
                             setattr(pos, "ladder_t2_hit", True)
+                            # Arm trailing stop if ATR available
+                            if atr and action.new_stop:
+                                if pos.side == "LONG":
+                                    order.stop_loss = max(order.stop_loss or 0, action.new_stop)
+                                else:
+                                    order.stop_loss = min(order.stop_loss or 0, action.new_stop)
+                            # Partial: realized pnl only; position stays open.
                             try:
                                 from src.risk_manager import update_pnl as _rm_p2
                                 _rm_p2(float(rec.get("pnl") or 0.0))
@@ -496,23 +567,17 @@ class PaperTrader:
                                     pass
                             except Exception:
                                 pass
-                            try:
-                                atr_v = _atr()
-                                if atr_v:
-                                    trail = (price - atr_v * trail_mult
-                                             if pos.side == "LONG"
-                                             else price + atr_v * trail_mult)
-                                    order.stop_loss = float(trail)
-                            except Exception:
-                                pass
-                        # else: no quantity -> do NOT set ladder_t2_hit
-                    else:
+                    elif not t2_actions and rr >= t2_at_r and phase2 is False:
+                        # phase2 off -> T2 becomes shadow log
                         self._log_event("shadow-exit", {
                             "symbol": sym, "side": pos.side,
                             "entry": pos.avg_price, "price": price,
                             "rr": round(rr, 2),
                             "reason": "ladder-T2", "would_be": "partial@T2-1.5R",
                         })
+                    # If phase2 is True but no t2_actions (e.g. quantity too small),
+                    # the legacy logic below handles it as a fallback
+                # _legacy_t2_management placeholder has been removed; logic inline above
                 # Mark-to-market push: a red book halts the runner even
                 # before a full stop is hit (realized + unrealized check).
                 try:

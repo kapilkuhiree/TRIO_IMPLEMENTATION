@@ -43,10 +43,12 @@ class RiskState:
     consecutive_losses: int = 0
     consecutive_wins: int = 0
     high_watermark: float = 0.0
-    weekly_pnl: float = 0.0
+    weekly_realized_pnl: float = 0.0
+    last_week_id: str = ""
     last_session_date: str = ""
     last_reconciled_at: str = ""
     partial_history: List[Dict[str, Any]] = field(default_factory=list)
+    ladder_states: Dict[str, Dict[str, Any]] = field(default_factory=dict) # sym -> state
 
     def reset_daily(self) -> None:
         """Reset daily counters (call at start of each trading day)."""
@@ -56,7 +58,22 @@ class RiskState:
         self.halts = {}
         self.consecutive_losses = 0
         self.consecutive_wins = 0
-        self.high_watermark = 0.0
+        # Keep high_watermark - it's the historical peak equity
+        # Only reset if it's a new week (handled separately)
+
+    def _get_week_id(self, date_str: str) -> str:
+        """Return ISO week ID (YYYY-Www)."""
+        from datetime import datetime
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return d.strftime("%Y-W%W")
+
+    def update_weekly(self, today_str: str, daily_pnl: float) -> None:
+        """Handle weekly rollover."""
+        week_id = self._get_week_id(today_str)
+        if week_id != self.last_week_id:
+            self.weekly_realized_pnl = 0.0
+            self.last_week_id = week_id
+        self.weekly_realized_pnl += daily_pnl
 
 
 # Global risk state
@@ -200,7 +217,18 @@ def rebuild_from_ledger(
         pass
 
     _risk_state.daily_pnl = round(sum(seen.values()), 2)
+    # Restore high watermark
     _risk_state.high_watermark = max(_risk_state.daily_pnl, 0.0)
+    try:
+        from pathlib import Path as _P
+        snap_path = _P("output/equity_snapshot.json")
+        if snap_path.exists():
+            import json as _j
+            snap = _j.loads(snap_path.read_text(encoding="utf-8"))
+            _risk_state.high_watermark = float(snap.get("high_watermark", _risk_state.high_watermark))
+    except Exception:
+        pass
+
     # Consecutive losses / wins from the time-ordered close sequence.
     _risk_state.consecutive_losses = 0
     _risk_state.consecutive_wins = 0
@@ -224,12 +252,40 @@ def on_broker_retry_failed(symbol: str) -> bool:
     return True
 
 
+def _save_equity_snapshot() -> None:
+    """Persist equity snapshot for restart watermark recovery."""
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        snap_path = _P("output/equity_snapshot.json")
+        snap_path.parent.mkdir(parents=True, exist_ok=True)
+        snap = {
+            "high_watermark": _risk_state.high_watermark,
+            "daily_pnl": _risk_state.daily_pnl,
+            "weekly_realized_pnl": _risk_state.weekly_realized_pnl,
+            "last_week_id": _risk_state.last_week_id,
+            "last_session_date": _risk_state.last_session_date,
+        }
+        snap_path.write_text(_j.dumps(snap), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def update_pnl(pnl: float) -> None:
     """Update the daily PnL (+ consecutive-loss/win + drawdown watermark)."""
     _risk_state.daily_pnl += pnl
     # watermark for drawdown (peak of today's realized equity)
     if _risk_state.daily_pnl > _risk_state.high_watermark:
         _risk_state.high_watermark = _risk_state.daily_pnl
+    # weekly rollover
+    try:
+        from src.utils import load_config as _lc
+        from datetime import datetime, timedelta, timezone as _tz
+        IST = _tz(timedelta(hours=5, minutes=30))
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        _risk_state.update_weekly(today, pnl)
+    except Exception:
+        pass
     if pnl < 0:
         _risk_state.consecutive_losses += 1
         _risk_state.consecutive_wins = 0
@@ -237,6 +293,7 @@ def update_pnl(pnl: float) -> None:
         _risk_state.consecutive_wins += 1
         _risk_state.consecutive_losses = 0
     _check_halt()
+    _save_equity_snapshot()
 
 
 def add_position(symbol: str, size: int, entry: float, risk_amount: float) -> None:
@@ -369,6 +426,24 @@ def _check_halt(unrealized_total: Optional[float] = None) -> None:
         if dd >= max_dd_pct:
             _set("drawdown",
                  f"Max drawdown breached: {dd:.1f}% (limit {max_dd_pct}%)")
+
+    # 6) Weekly loss halt
+    max_weekly_loss_pct = float(rm_cfg.get("max_weekly_loss_pct", 0.0) or 0.0)
+    if max_weekly_loss_pct > 0:
+        max_weekly_loss = capital * max_weekly_loss_pct / 100
+        if _risk_state.weekly_realized_pnl <= -max_weekly_loss:
+            _set("weekly_loss",
+                 f"Weekly loss limit breached: {_risk_state.weekly_realized_pnl:.2f} "
+                 f"(limit={-max_weekly_loss:.2f})")
+
+    # 6) Weekly realized loss
+    max_weekly_loss_pct = float(rm_cfg.get("max_weekly_loss_pct", 0.0) or 0.0)
+    if max_weekly_loss_pct > 0:
+        max_weekly_loss = capital * max_weekly_loss_pct / 100
+        if _risk_state.weekly_realized_pnl <= -max_weekly_loss:
+            _set("weekly_loss",
+                 f"Weekly loss limit breached: PnL={_risk_state.weekly_realized_pnl:.2f} "
+                 f"(limit={-max_weekly_loss:.2f})")
 
 
 def set_broker_uncertain(msg: str) -> None:

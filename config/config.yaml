@@ -76,7 +76,7 @@ short_shadow:
 # MEGABULL_API_KEY — never paste it here). "paper" keeps the local
 # in-memory simulator (offline default for the test suite).
 broker:
-  provider: "megabull"
+  provider: "paper"
   base_url: "https://api.megabull.in"
 
 # Screener: scan the basket, rank setups by quality, trade only the best.

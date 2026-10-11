@@ -8,11 +8,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.broker.paper import PaperBroker
+from src.broker.base import BrokerOrder
 from src.paper_trader import PaperTrader
 from src.risk_manager import (reset_risk_state, get_risk_state,
                               rebuild_from_ledger, update_pnl)
 from src.execution_lifecycle import (submit_candidate, reconcile_broker,
-                                     record_confirmed_close, preflight)
+                                      record_confirmed_close,
+                                      record_confirmed_fill, preflight)
 
 
 def setup_function():
@@ -43,6 +45,50 @@ def test_single_engine_scan_and_plan_paths_agree():
     placed = t2.execute_plan({"candidates": [_cand("B")]})
     assert len(placed) == 1
     assert get_risk_state().open_positions >= 1
+
+
+def test_unconfirmed_broker_orders_do_not_register_risk_or_alert():
+    """Pending/unknown submissions stop before confirmed-fill side effects."""
+    from unittest.mock import patch
+
+    class _UnconfirmedBroker:
+        provider_name = "megabull"
+
+        def __init__(self, status):
+            self.status = status
+            self.positions = {}
+            self.closed_trades = []
+
+        def get_balance(self):
+            return {"available": 100000.0}
+
+        def place_order(self, **kwargs):
+            return BrokerOrder(order_id="remote-1", symbol=kwargs["symbol"],
+                               side=kwargs["side"], quantity=kwargs["quantity"],
+                               status=self.status, broker="megabull")
+
+    with patch("src.alerts.send_signal_alert") as alert:
+        for status in ("PENDING", "UNKNOWN"):
+            reset_risk_state()
+            t = _trader()
+            t.broker = _UnconfirmedBroker(status)
+            result = submit_candidate(t, _cand(), proposed={})
+            assert result["status"] == "PENDING"
+            assert get_risk_state().open_positions == 0
+            assert get_risk_state().positions == {}
+        assert alert.call_count == 0
+
+
+def test_record_confirmed_fill_rejects_unconfirmed_order():
+    from unittest.mock import patch
+
+    t = _trader()
+    order = BrokerOrder(order_id="remote-1", status="UNKNOWN")
+    with patch("src.alerts.send_signal_alert") as alert:
+        result = record_confirmed_fill(t, _cand(), order, 10)
+    assert result == {}
+    assert get_risk_state().open_positions == 0
+    assert alert.call_count == 0
 
 
 def test_sector_atomic_plan_two_banks_one_tech():
@@ -168,5 +214,18 @@ def test_record_confirmed_close_updates_all():
     rec = t.broker.close_position("X", 80.0, "stop-hit")
     out = record_confirmed_close(t, "X", rec)
     assert out
-    assert "X" not in get_risk_state().positions or True
     assert get_risk_state().daily_pnl < 0
+
+
+def test_record_confirmed_close_idempotent():
+    """Calling record_confirmed_close twice with the same record updates P&L only once."""
+    t = _trader()
+    rec = {"symbol": "X", "side": "LONG", "quantity": 10, "entry": 100.0,
+           "exit": 110.0, "pnl": 100.0, "reason": "target-hit", "order_id": "CLS-100"}
+    pnl_before = get_risk_state().daily_pnl
+    record_confirmed_close(t, "X", rec)
+    pnl_after1 = get_risk_state().daily_pnl
+    record_confirmed_close(t, "X", rec)
+    pnl_after2 = get_risk_state().daily_pnl
+    assert pnl_after1 == pnl_before + 100.0
+    assert pnl_after2 == pnl_after1

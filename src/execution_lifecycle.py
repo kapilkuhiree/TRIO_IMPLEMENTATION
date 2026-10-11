@@ -22,6 +22,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils import get_logger, load_config
@@ -31,6 +32,36 @@ logger = get_logger("execution_lifecycle")
 TERMINAL_SUBMIT = ("FILLED", "REJECTED")
 _PENDING = ("PENDING", "PLACED", "ACCEPTED")
 
+# Module-level state for reconciliation conservatism (Issue #2)
+# Track consecutive successful refreshes per trader instance
+_refresh_state: Dict[int, Dict[str, Any]] = {}
+
+# Idempotency cache for record_confirmed_close (Issue #3)
+# Map of (trader_id, symbol, order_id/close_key) -> timestamp
+_processed_closes: Dict[Tuple[int, str, str], float] = {}
+_IDEMPOTENCY_TTL = 86400  # 24 hours
+
+
+def _get_trader_id(trader) -> int:
+    """Get a stable identifier for the trader instance."""
+    return id(trader)
+
+
+def _make_close_key(record: Dict[str, Any]) -> str:
+    """Create a unique key for a close record."""
+    # Use order_id if available, otherwise use a composite key
+    for k in ("order_id", "trade_id", "close_id"):
+        v = record.get(k)
+        if v:
+            return f"{k}:{v}"
+    # Fallback composite key
+    return ("cmp:%s|%s|%s|%s|%s" % (
+        record.get("symbol", ""),
+        record.get("side", ""),
+        record.get("entry", ""),
+        record.get("exit", ""),
+        record.get("quantity", "")))
+
 
 # ---------------------------------------------------------------------------
 # reconcile
@@ -39,19 +70,28 @@ _PENDING = ("PENDING", "PLACED", "ACCEPTED")
 def reconcile_broker(trader) -> Dict[str, Any]:
     """Refresh the mirror, scan for PENDING/UNKNOWN rows, rebuild risk.
 
-    Returns {"pending": [...], "uncertain": bool}. On uncertain books sets
-    the broker_uncertain halt; on a clean refresh clears ONLY that halt.
+    Requires consecutive successful refreshes (1 for local paper, 2 for remote)
+    and does not clear uncertainty on empty responses if there are pending orders.
+    Returns {"pending": [...], "uncertain": bool}.
     """
     out: Dict[str, Any] = {"pending": [], "uncertain": False}
     broker = getattr(trader, "broker", None)
+    tid = _get_trader_id(trader)
+    is_paper = (getattr(broker, "provider_name", "paper") == "paper")
+    required_consecutive = 1 if is_paper else 2
+    state = _refresh_state.setdefault(tid, {"consecutive_successes": required_consecutive, "last_empty_at": 0.0})
+
     if broker is None:
         return out
+    refresh_ok = True
     try:
         broker.refresh_positions()
     except AttributeError:
         pass
     except Exception as exc:
         logger.warning("reconcile: refresh failed: %s", exc)
+        refresh_ok = False
+        state["consecutive_successes"] = 0
         try:
             from src.risk_manager import set_broker_uncertain
             set_broker_uncertain(f"refresh failed: {exc}")
@@ -59,23 +99,47 @@ def reconcile_broker(trader) -> Dict[str, Any]:
         except Exception:
             pass
         return out
+
+    if refresh_ok:
+        state["consecutive_successes"] += 1
+
     try:
-        pending = [s for s, p in (getattr(broker, "positions", {}) or {}).items()
+        positions_dict = getattr(broker, "positions", {}) or {}
+        pending = [s for s, p in positions_dict.items()
                    if str(getattr(p, "status", "") or "").upper() in _PENDING
                    or str(getattr(p, "status", "") or "").upper().startswith("UNKNOWN")]
     except Exception:
         pending = []
+
+    # Check for pending orders in broker if available
+    try:
+        if hasattr(broker, "_pending_orders") and broker._pending_orders:
+            pending = list(set(pending + list(broker._pending_orders)))
+    except Exception:
+        pass
+
     out["pending"] = pending
+
+    # Empty response check / conservatism check:
+    is_empty_book = not positions_dict and not pending
+
     try:
         from src.risk_manager import (set_broker_uncertain,
                                       clear_broker_uncertain, rebuild_from_ledger,
                                       get_risk_state)
-        if pending:
-            set_broker_uncertain(f"{len(pending)} pending/unknown position(s): "
-                                 + ",".join(pending[:5]))
+        rs_current = get_risk_state()
+        has_pending_or_uncertain = bool(pending) or getattr(rs_current, "halt_active", False) and "broker_uncertain" in getattr(rs_current, "halts", {})
+
+        if pending or state["consecutive_successes"] < required_consecutive:
+            reason = f"{len(pending)} pending/unknown position(s)" if pending else f"warming up refresh confidence ({state['consecutive_successes']}/{required_consecutive})"
+            set_broker_uncertain(reason)
+            out["uncertain"] = True
+        elif is_empty_book and has_pending_or_uncertain and not is_paper:
+            # Empty response when remote and uncertain -> conservative keep uncertain
             out["uncertain"] = True
         else:
             clear_broker_uncertain()
+
         # Rebuild from the now-refreshed mirror + ledger.
         try:
             from datetime import datetime, timezone, timedelta as _td
@@ -83,7 +147,7 @@ def reconcile_broker(trader) -> Dict[str, Any]:
             today = datetime.now(IST).strftime("%Y-%m-%d")
         except Exception:
             today = None
-        rebuild_from_ledger(getattr(broker, "positions", {}) or {},
+        rebuild_from_ledger(positions_dict,
                             getattr(broker, "closed_trades", []) or [],
                             today=today)
         rs = get_risk_state()
@@ -276,6 +340,11 @@ def submit_candidate(trader, candidate: Dict[str, Any],
 def record_confirmed_fill(trader, candidate: Dict[str, Any],
                           order: Any, qty: int) -> Dict[str, Any]:
     """Register a CONFIRMED fill: risk + audit + alert. Alert fires once."""
+    if str(getattr(order, "status", "") or "").upper() != "FILLED":
+        logger.warning("record_confirmed_fill: ignoring unconfirmed %s order %s",
+                       getattr(order, "status", ""),
+                       getattr(order, "order_id", ""))
+        return {}
     from src.risk_manager import add_position as _add
     sym = str(candidate.get("symbol", ""))
     try:
@@ -309,9 +378,26 @@ def record_confirmed_fill(trader, candidate: Dict[str, Any],
 
 def record_confirmed_close(trader, symbol: str,
                            record: Dict[str, Any]) -> Dict[str, Any]:
-    """Single close path: realized pnl + consec + position + halts + log + alert-once."""
+    """Single close path: realized pnl + consec + position + halts + log + alert-once.
+    Idempotent: prevents duplicate accounting if called multiple times with the same close record.
+    """
     if not record:
         return {}
+    tid = _get_trader_id(trader)
+    ckey = _make_close_key(record)
+    now = time.time()
+
+    # Cleanup expired TTL cache items
+    expired = [k for k, v in _processed_closes.items() if now - v > _IDEMPOTENCY_TTL]
+    for k in expired:
+        _processed_closes.pop(k, None)
+
+    cache_key = (tid, symbol, ckey)
+    if cache_key in _processed_closes:
+        logger.debug("record_confirmed_close: duplicate close event ignored for %s (%s)", symbol, ckey)
+        return record
+    _processed_closes[cache_key] = now
+
     try:
         from src.risk_manager import close_position as _rm_close, update_pnl as _rm_pnl
         _rm_pnl(float(record.get("pnl") or 0.0))

@@ -42,6 +42,13 @@ TIMEOUT = 15
 RETRIES = 2
 
 
+# Statuses
+STATUS_SUBMITTED = "SUBMITTED"
+STATUS_PENDING = "PENDING"
+STATUS_FILLED = "FILLED"
+STATUS_REJECTED = "REJECTED"
+STATUS_UNKNOWN = "UNKNOWN"
+
 class MegaBullBroker(BaseBroker):
     """Paper fills executed remotely on the MegaBull simulator."""
 
@@ -196,7 +203,7 @@ class MegaBullBroker(BaseBroker):
             order_id=f"megabull_rej_{int(time.time() * 1000)}",
             symbol=symbol, side=side, quantity=quantity,
             order_type=order_type, price=price,
-            status="REJECTED", broker="megabull",
+            status=STATUS_REJECTED, broker="megabull",
             placed_at=utc_now(), error=error,
         )
         logger.warning("MegaBull REJECT %s %d x %s: %s", side, quantity,
@@ -214,7 +221,10 @@ class MegaBullBroker(BaseBroker):
         target: Optional[float] = None,
         reason: str = "order",
     ) -> BrokerOrder:
-        """Send a MIS order to the MegaBull simulator."""
+        """Send a MIS order to the MegaBull simulator.
+
+        State lifecycle: SUBMITTED -> PENDING -> FILLED | REJECTED | UNKNOWN
+        """
         if not self.api_key:
             return self._reject(symbol, side, quantity, price or 0.0,
                                 "MEGABULL_API_KEY missing")
@@ -255,85 +265,93 @@ class MegaBullBroker(BaseBroker):
             if price:
                 body["price"] = float(price)
 
-        try:
-            data = self._post("/api/order/buysell", body)
-        except Exception as exc:  # noqa: BLE001 - fail-closed
-            return self._reject(symbol, side, quantity, price or 0.0,
-                                f"order API failed: {exc}", otype)
-
-        remote_id = str((data or {}).get("id", ""))
+        # 1. Create order in SUBMITTED state immediately
         placed_at = utc_now()
-        confirmed = False
-        # Build a provisional order to run the confirmation check (row lookup
-        # + position-book fallback). This avoids duplicating the confirmed-slot
-        # logic that Close uses (_exit_confirmed) for entry ambiguity.
-        _probe = BrokerOrder(
-            order_id=f"megabull_{remote_id or int(time.time() * 1000)}",
+        temp_id = f"megabull_{int(time.time() * 1000)}"
+        order = BrokerOrder(
+            order_id=temp_id,
             symbol=symbol, side=side.upper(), quantity=int(quantity),
             order_type=otype, price=float(price or 0.0),
             stop_loss=stop_loss or 0.0, target=target or 0.0,
-            status="FILLED", broker="megabull",
-            placed_at=placed_at, filled_at=placed_at,
+            status=STATUS_SUBMITTED, broker="megabull",
+            placed_at=placed_at, filled_at="",
         )
+        self.orders[order.order_id] = order
+
         try:
+            data = self._post("/api/order/buysell", body)
+        except Exception as exc:  # noqa: BLE001 - fail-closed
+            order.status = STATUS_REJECTED
+            order.error = f"order API failed: {exc}"
+            return order
+
+        remote_id = str((data or {}).get("id", ""))
+        # Update order_id to include remote_id if available
+        final_id = f"megabull_{remote_id or temp_id.split('_')[-1]}"
+        if final_id != temp_id:
+            self.orders.pop(temp_id, None)
+            order.order_id = final_id
+            self.orders[final_id] = order
+
+        # 2. Check immediate confirmation (should be rare for LIMIT, common for MKT)
+        confirmed = False
+        try:
+            _probe = BrokerOrder(
+                order_id=final_id,
+                symbol=symbol, side=side.upper(), quantity=int(quantity),
+                order_type=otype, price=float(price or 0.0),
+                stop_loss=stop_loss or 0.0, target=target or 0.0,
+                status=STATUS_FILLED, broker="megabull",
+                placed_at=placed_at, filled_at=placed_at,
+            )
             confirmed = self._fill_confirmed(_probe)
         except Exception:
             confirmed = False
+
         row_status = ""
         try:
             row = self._order_row(remote_id) if remote_id else None
             row_status = str((row or {}).get("status", "")).upper()
         except Exception:
             row_status = ""
-        # Lifecycle (fix #1): REMOTE_ACCEPTED != FILLED. Only a confirmed
-        # entry is FILLED; an accepted LIMIT/SL that is still PENDING, or a
-        # row that cannot be read, stays PENDING/UNKNOWN so the caller
-        # (submit_candidate) never books risk or fires an alert until the
-        # mirror confirms the leg.
+
+        # 3. Determine final status for this call
         if confirmed:
-            status = "FILLED"
-            filled_at = placed_at
+            order.status = STATUS_FILLED
+            order.filled_at = placed_at
+            # Seed mirror ONLY on confirmed fill
             self._seed_mirror_from_order(symbol, side.upper(),
                                          int(quantity), float(price or 0.0))
         elif row_status in ("PENDING", "PLACED", "ACCEPTED", "QUEUED", "OPEN"):
-            status = "PENDING"
-            filled_at = ""
+            order.status = STATUS_PENDING
+            order.filled_at = ""
+            self._pending_orders.add(order.order_id)
         elif not row_status and remote_id:
-            # Remote accepted but not yet visible in /order/my — treat as
-            # PENDING (poll-able), not UNKNOWN until proven stale.
-            status = "PENDING"
-            filled_at = ""
+            # Remote accepted but not yet visible in /order/my
+            # This is UNKNOWN - we don't know if it's pending or failed
+            order.status = STATUS_UNKNOWN
+            order.filled_at = ""
+            order.error = "Remote order not visible in order book after submission"
+            self._pending_orders.add(order.order_id)
         else:
-            status = "PENDING"
-            filled_at = ""
-        order = BrokerOrder(
-            order_id=f"megabull_{remote_id or int(time.time() * 1000)}",
-            symbol=symbol, side=side.upper(), quantity=int(quantity),
-            order_type=otype, price=float(price or 0.0),
-            stop_loss=stop_loss or 0.0, target=target or 0.0,
-            status=status, broker="megabull",
-            placed_at=placed_at, filled_at=filled_at,
-        )
-        self.orders[order.order_id] = order
+            # Should not happen, but be conservative
+            order.status = STATUS_UNKNOWN
+            order.filled_at = ""
+            order.error = "Ambiguous remote state"
+            self._pending_orders.add(order.order_id)
+
         logger.info("MegaBull order %s (remote %s, row=%s, confirmed=%s): "
                     "%s %d x %s -> %s (reason=%s)",
                     order.order_id, remote_id, row_status or "?",
                     confirmed, order.side, quantity, symbol,
-                    status, reason)
-        # An accepted-but-unexecuted order leaves NO seed — the exit path
-        # stays honest. A confirmed one refreshes so the row is closable.
+                    order.status, reason)
+
+        # Refresh to sync mirror
         self.refresh_positions()
         pos = self.positions.get(symbol)
         logger.info("Post-order mirror for %s: %s",
                     symbol, (pos.side, pos.quantity, pos.avg_price)
                     if pos else None)
-        if status == "PENDING":
-            # Mark the book UNKNOWN so reconcile_broker can gate new entries
-            # until the exchange propagates (see execution_lifecycle.py:63-88).
-            try:
-                self._pending_orders.add(order.order_id)  # type: ignore
-            except Exception:
-                pass
         return order
 
     def _order_row(self, remote_id: str) -> Optional[Dict[str, Any]]:
@@ -357,17 +375,22 @@ class MegaBullBroker(BaseBroker):
 
         Same ambiguity problem as exits: match the SPECIFIC remote id,
         not side+qty. The entry is confirmed only when its row reads
-        COMPLETE/EXECUTED/FILLED (or the position endpoint already nets
-        the leg). A row still PENDING, or missing after propagation
-        time, is NOT a fill — the mirror stays empty and the position
-        stays unclosable until the exchange catches up (proved live:
-        order 771079 accepted but absent from the book minutes later).
+        COMPLETE/EXECUTED/FILLED. A LIMIT row still PENDING, or missing
+        after propagation time, is NOT a fill — an unrelated existing
+        position cannot confirm it. MKT keeps the existing immediate-fill
+        fallback only when its order row is absent and the position endpoint
+        already reflects the leg.
         """
         row = self._order_row(self._remote_id(order))
-        if row is not None and str(row.get("status", "")).upper() in (
-                "COMPLETE", "EXECUTED", "FILLED"):
-            return True
-        # Fallback: the position book already nets our leg.
+        if row is not None:
+            return str(row.get("status", "")).upper() in (
+                "COMPLETE", "EXECUTED", "FILLED")
+        # LIMIT orders require their own terminal order-book confirmation.
+        # Never infer a LIMIT fill from a pre-existing/netted position.
+        if str(getattr(order, "order_type", "")).upper() not in ("MKT", "MARKET"):
+            return False
+        # MKT fallback: the position book already nets our leg when the
+        # order row has not propagated yet.
         self.refresh_positions()
         pos = self.positions.get(order.symbol)
         return pos is not None and pos.quantity > 0
@@ -432,7 +455,7 @@ class MegaBullBroker(BaseBroker):
         )
 
     def poll_pending(self, symbol: Optional[str] = None) -> None:
-        """Re-check PENDING ACCEPTs; confirmeds become FILLED, rejections REJECTED."""
+        """Re-check PENDING/UNKNOWN orders; confirmed -> FILLED, rejected -> REJECTED."""
         pend = list(getattr(self, "_pending_orders", set()) or set())
         if not pend:
             return
@@ -441,24 +464,33 @@ class MegaBullBroker(BaseBroker):
                 remote = str(oid).split("megabull_")[-1]
                 row = self._order_row(remote)
                 status = str((row or {}).get("status", "")).upper() if row else ""
+                o = self.orders.get(oid)
+                if o is None:
+                    self._pending_orders.discard(oid)
+                    continue
+
                 if status in ("COMPLETE", "EXECUTED", "FILLED"):
-                    o = self.orders.get(oid)
-                    if o is not None:
-                        o.status = "FILLED"
-                        o.filled_at = o.placed_at
-                    self._pending_orders.discard(oid)  # type: ignore
+                    o.status = STATUS_FILLED
+                    o.filled_at = o.placed_at
+                    self._pending_orders.discard(oid)
                     # now the mirror can be trusted to net this leg
-                    if o is not None:
-                        self._seed_mirror_from_order(
-                            o.symbol, o.side, int(o.quantity),
-                            float(o.price or 0.0))
+                    self._seed_mirror_from_order(
+                        o.symbol, o.side, int(o.quantity),
+                        float(o.price or 0.0))
                 elif status in ("REJECTED", "CANCELLED", "FAILED"):
-                    o = self.orders.get(oid)
-                    if o is not None:
-                        o.status = "REJECTED"
-                        o.error = f"remote status {status}"
-                    self._pending_orders.discard(oid)  # type: ignore
-                # else: still pending — keep it in the set, stay uncertain
+                    o.status = STATUS_REJECTED
+                    o.error = f"remote status {status}"
+                    self._pending_orders.discard(oid)
+                elif status in ("PENDING", "PLACED", "ACCEPTED", "QUEUED", "OPEN"):
+                    # Still pending - update status if it was UNKNOWN
+                    if o.status == STATUS_UNKNOWN:
+                        o.status = STATUS_PENDING
+                        o.error = ""
+                else:
+                    # Row not found or unknown status
+                    # If we have a remote_id but no row, it might be stale
+                    # Keep as PENDING/UNKNOWN, don't remove from pending set
+                    pass
             except Exception as exc:
                 logger.warning("poll_pending %s failed: %s", oid, exc)
 

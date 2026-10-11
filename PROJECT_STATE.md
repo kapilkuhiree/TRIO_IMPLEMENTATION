@@ -1,61 +1,44 @@
 # TRIO — Project State
-**Commit:** `fix/production-hardening` (see `git log`; based on `origin/main 6851d82`).
-**Tests:** 214 passed (`python -m pytest -q --basetemp ... -p no:randomly`), compile clean.
-**Last update:** 2026-10-10 (unified execution/risk lifecycle + restart-safe rebuild).
+**Commit:** `f9778a6` (MegaBull state machine + reconciliation + idempotent close + weekly loss + equity snapshots).
+**Tests:** 221 passed (`python -m pytest -q --basetemp ... -p no:randomly`), compile clean.
+**Last update:** 2026-10-11 (Phase 1 Integrity Layer complete).
 
 ## Modes right now
-- **Broker:** `config broker.provider: megabull` (remote paper), tests pin `paper`.
-  Unknown provider raises at startup; missing key raises; `mode: live` needs
-  `TRIO_LIVE=1` / `live_confirmed`. PENDING/PLACED/ACCEPTED never booked as fills.
-- **Options:** `config options.enabled: false` (separate experiment E). Chain code,
-  bidask fill, `round_trip_cost` and remote/megabull legs remain, but the session
-  attaches no legs and `execute_option_plan` only fires on explicit config.
-  Shadow fallback records are tagged `venue: local_shadow` and never enter risk/equity.
-- **Shorts:** `config trading.allow_shorts: false` (long-only validation A first).
-  CNC settlement rule clips/skips SELL without holdings; shorts need their own
-  multi-regime proof before `allow_shorts: true` returns.
-- **Market clock:** `config/market.yaml` authoritative —
-  `open 09:15 | entry_start 09:20 | entry_cutoff 15:00 (excl) | hard_flat 15:10 | close 15:30`,
-  IST only. Invalid/wrong-TZ → management-only. Legacy `forward_test` fallback kept.
-- **Risk:** T1 `0.8R 50%→breakeven` live; T2 `1.5R 30%→trail` shadow
-  (`ladder.enabled_phase2: false`). Realized + marked-unrealized daily halt
-  (5%), max positions (5, dynamic), per-symbol 20%, per-sector 40%, plus
-  consecutive-loss and drawdown halts. Halts are per-reason:
-  `daily_loss`/`consecutive_loss`/`drawdown` = session-persistent;
-  `max_positions` = dynamic; `broker_uncertain` = until reconciliation.
-  Restart rebuilds everything from broker + JSONL with order_id dedup + IST day
-  mapping (consec losses/wins, watermark, partials, sector, risk amounts).
+- **Broker:** `config broker.provider: paper` (local paper default). MegaBull via
+  `TRIO_BROKER_PROVIDER=megabull` + `MEGABULL_API_KEY`. Unknown provider raises.
+  **Order state machine**: SUBMITTED → PENDING → FILLED/REJECTED/UNKNOWN. 
+  PENDING/UNKNOWN never book risk or fire alerts; only FILLED triggers `record_confirmed_fill()`.
+- **Options:** `config options.enabled: false` (Experiment E). Shadow fallback active.
+- **Shorts:** `config trading.allow_shorts: false` (Experiment A long-only).
+- **Market clock:** `config/market.yaml` authoritative — IST only.
+- **Risk:** T1 live; T2 shadow (`enabled_phase2: false`). 
+  Halts: daily_loss (5%), weekly_loss (configurable), max_positions (dynamic),
+  consecutive_loss, drawdown (from high watermark), broker_uncertain.
+  **Weekly rollover implemented** (ISO week, restart-safe via equity_snapshot.json).
+  **High watermark persistence**: restored from `output/equity_snapshot.json` on restart.
 
 ## Execution (single lifecycle — no more path forks)
-`src/execution_lifecycle.py` owns: `reconcile_broker` (refresh + PENDING/UNKNOWN
-scan + `broker_uncertain` halt + risk rebuild) → `preflight` (halt/max/dup/
-sector/margin) → `submit_candidate` (CNC clip, place, pending≠filled, confirm,
-register, audit, alert) → `record_confirmed_close` (pnl/consec/position/halts/
-log/alert-once). `scan_once`, `execute_plan`, live rescans all call it. Sector
-is transactional: every confirmed fill updates the proposed portfolio in-pass.
-The ladder guard is broker-agnostic: it decides for local AND MegaBull; each
-broker only executes `close_position`. `_manage_open_positions` stop/target
-paths also route through `record_confirmed_close`.
+`src/execution_lifecycle.py`: `reconcile_broker` (2 clean refreshes for remote,
+1 for paper; unresolved orders → uncertain) → `preflight` → `submit_candidate`
+→ `record_confirmed_close` (idempotent via close_id/order_id dedup).
+Ladder guard broker-agnostic; each broker only executes `close_position`.
 
 ## Backtest (execution-realistic)
-Next-bar `Open` fills (never same-bar), stop gaps pay the worse open,
-stop-before-target on shared bars, notional costs per leg, unrealized in
-equity, Sharpe annualized by bars-per-year, `skipped_bars: N`. Exact-value
-tests pin entry/exit/slippage/commission/gap/EOD traces.
+Next-bar `Open` fills, stop gaps, stop-before-target, notional costs per leg,
+unrealized equity, Sharpe by bars/year, `skipped_bars`. Exact-value tests.
 
 ## Known defects / open work (honest)
-- Session cadence/jackson `09:40/11:00/13:00` rescans proven only on paper;
-  remote-pending storms need the UNKNOWN_REMOTE_STATE poll loop tested live.
-- Weekly-loss scheduler keys off `weekly_pnl` but has no weekly rollover job yet.
-- Sector map covers NIFTY 50; unknown symbols fall back to `Unknown`.
-- Zerodha adapter is a stub — `provider: zerodha` raises today by design.
-- Strategy evidence: 5y daily long OOS + 21-day short replay + short single
-  live-paper win is NOT a joint proof of shorts+megabull+ladder+options+rescans.
-  Follow the A→H experiment ladder in config comments before combining features.
+- Exit policy module (`src/exit_policy.py`) exists but **not yet wired into
+  `PaperTrader` guard or `Backtester`** (migration planned incremental).
+- Weak test assertions remain (`or True`, `>= 0`) — need exact behavioral checks.
+- Failure-injection suite started (`test_broker_failures.py`: 3 tests); needs
+  expansion (partial fill, restart mid-confirmation, corrupt ledger, alert outage).
+- Sector map covers NIFTY 50; unknown symbols → `Unknown` sector.
+- Strategy evidence: Experiment A (long-only local paper) not yet run 60 sessions.
 
-## Next action
-1. Merge `fix/production-hardening` → `main` after one green CI + smoke.
-2. Run experiment A (long-only equity, local paper) forward-paper with costs;
-   ship separate long/short drawdown + regime analysis before enabling B–H.
-3. Failure-injection suite: timeout, accepted-but-unconfirmed, delayed refresh,
-   duplicate close, partial remote fill, restart, corrupt ledger, alert outage.
+## Next action (P0 → P3)
+P0: Wire `exit_policy` incrementally (T1 first) into `PaperTrader` & `Backtester`.
+P0: Expand `test_broker_failures.py` (partial fill, restart, corrupt ledger, alert outage).
+P1: Replace all weak assertions with exact behavioral checks.
+P2: Run Experiment A forward-paper (60 sessions) with costs.
+P3: CI quality gates, exchange calendar, operator runbook.

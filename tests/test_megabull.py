@@ -197,6 +197,16 @@ def test_mkt_exit_carries_a_price_field(tmp_path):
     assert exit_posts[-1]["price"] == 699.0  # close caller's print
 
 
+def test_mkt_fill_still_confirms_immediately(tmp_path):
+    b, sess = _broker(tmp_path)
+
+    order = b.place_order("ONGC.NS", "BUY", 5, order_type="MKT", price=222.0)
+
+    assert order.status == "FILLED"
+    assert b.positions["ONGC.NS"].quantity == 5
+    assert not b._pending_orders
+
+
 def test_missing_key_rejects_without_network(tmp_path):
     b = MegaBullBroker(api_key="",
                        instrument_cache=Path(tmp_path) / "x.csv")
@@ -297,6 +307,19 @@ def test_fill_confirmed_by_remote_id_row(tmp_path):
     # polling transitions order to FILLED
     b.poll_pending()
     assert order.status == "FILLED"
+
+
+def test_limit_fill_requires_its_remote_row_not_existing_position(tmp_path):
+    """A pre-existing position cannot confirm a separate LIMIT order."""
+    b, sess = _broker(tmp_path)
+    sess._net("633601", "SELL", 10, 222.0)
+    b.refresh_positions()
+
+    order = b.place_order("ONGC.NS", "SELL", 45, price=222.0)
+
+    assert order.status == "PENDING"
+    assert order.order_id in b._pending_orders
+    assert b.positions["ONGC.NS"].quantity == 10
 
 
 def test_close_unconfirmed_when_exit_still_pending(tmp_path):
