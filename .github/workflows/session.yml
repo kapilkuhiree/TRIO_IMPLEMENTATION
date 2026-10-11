@@ -2,12 +2,13 @@ name: TRIO session
 
 # One long job for the NSE session: reads the premarket plan, places the
 # orders at the open, then manages stops/targets/partials every minute until
-# the 15:10 IST square-off. Cron is UTC: 03:40 UTC = 09:10 IST, Mon-Fri.
+# the 15:10 IST square-off. Cron is UTC: 03:48 UTC = 09:18 IST, Mon-Fri.
+# Keep runtime below GitHub's hard 6h job cap so digest/state persistence runs.
 # Public repo => unlimited minutes, so a ~6h job is free.
 
 on:
   schedule:
-    - cron: "40 3 * * 1-5"
+    - cron: "48 3 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -40,7 +41,7 @@ jobs:
         run: pip install -r requirements-server.txt
 
       - name: Run session (place plan + manage to EOD)
-        run: python scripts/session.py --interval 60 --max-seconds 21600
+        run: python scripts/session.py --interval 60 --max-seconds 21300
 
       - name: Send daily digest
         if: always()
