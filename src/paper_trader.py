@@ -1075,25 +1075,35 @@ class PaperTrader:
                 pass
         except Exception as exc:
             logger.warning("Live rescan (%s) failed: %s", slot, exc)
-            try:
-                from src.alerts import send_telegram
-                send_telegram(
-                    f"🔍 *Live Market Scan ({slot} IST)*\n\n"
-                    f"Scan failed ({exc}). Still managing open positions.")
-            except Exception:
-                pass
+            for _send in (
+                lambda m: __import__("src.alerts", fromlist=["send_telegram"]).send_telegram(m),
+                lambda m: __import__("src.alerts", fromlist=["send_options_telegram"]).send_options_telegram(m),
+            ):
+                try:
+                    _send(f"🔍 *Live Market Scan ({slot} IST)*\n\n"
+                          f"Scan failed ({exc}). Still managing open positions.")
+                except Exception:
+                    pass
             return []
         if not cands:
             logger.info("Live rescan (%s): scanned, nothing met the bar.", slot)
-            try:
-                from src.alerts import send_telegram
-                send_telegram(
-                    f"🔍 *Live Market Scan ({slot} IST)*\n\n"
-                    f"Scanned the live market — no new setup met the bar. "
-                    f"Open positions: `{len(self.broker.positions)}`. "
-                    f"Still watching stops, targets & the NSE options chain.")
-            except Exception:
-                pass
+            for _kind, _sender in (
+                ("equity", lambda m: __import__("src.alerts", fromlist=["send_telegram"]).send_telegram(m)),
+                ("options", lambda m: __import__("src.alerts", fromlist=["send_options_telegram"]).send_options_telegram(m)),
+            ):
+                try:
+                    if _kind == "equity":
+                        _sender(
+                            f"🔍 *Live Market Scan — Equity ({slot} IST)*\n\n"
+                            f"No new setup met the bar. "
+                            f"Open equity positions: `{len(self.broker.positions)}`.")
+                    else:
+                        _sender(
+                            f"🔍 *Live Market Scan — Options (8877508167, {slot} IST)*\n\n"
+                            f"No new NIFTY spread met the bar. "
+                            f"Still watching the NSE options chain.")
+                except Exception:
+                    pass
             return []
         # Trade the fresh candidates (equity + options) right now.
         placed_eq = self.execute_plan({"candidates": cands})
@@ -1105,25 +1115,41 @@ class PaperTrader:
                     {"candidates": cands}, opt_broker=opt_broker)
         except Exception as exc:
             logger.warning("Live rescan (%s) options leg failed: %s", slot, exc)
+        # Split deliver: equity verdict -> old bot, options verdict -> new bot (8877508167)
         try:
-            from src.alerts import send_telegram
-            lines = [f"🔍 *Live Market Scan ({slot} IST) — found "
-                     f"{len(cands)} setup(s), traded now:*"]
+            from src.alerts import send_telegram as _send_eq
+            from src.alerts import send_options_telegram as _send_opt
+            # Equity verdict
+            eq_lines = [f"🔍 *Live Market Scan — Equity ({slot} IST) — found "
+                        f"{len(cands)} setup(s), traded now:*"]
             for c in cands[:5]:
-                lines.append(
+                eq_lines.append(
                     f"• {c.get('symbol')} {c.get('action')} "
                     f"@{c.get('entry_price')} conf {c.get('confidence')} "
                     f"rank {c.get('rank')}")
-                opt = c.get("option_legs") or {}
-                if opt.get("strategy") and opt.get("strategy") != "none":
-                    legs = " + ".join(
-                        f"{l.get('side')} {l.get('strike')}{l.get('kind')}"
-                        for l in (opt.get("legs") or []))
-                    lines.append(f"  + {opt.get('strategy')} {legs} "
-                                 f"debit {opt.get('net_debit')}")
-            lines.append(f"Equity orders: {len(placed_eq)} | "
-                         f"Options spreads: {len(placed_opt)}")
-            send_telegram("\n".join(lines))
+            eq_lines.append(f"Equity orders: {len(placed_eq)}")
+            _send_eq("\n".join(eq_lines))
+            # Options verdict (separate channel)
+            has_opt = any((c.get("option_legs") or {}).get("strategy") not in (None, "", "none")
+                          for c in cands)
+            if has_opt:
+                opt_lines = [f"🔍 *Live Market Scan — Options (8877508167, {slot} IST) — "
+                             f"found {len(cands)} spread(s), traded now:*"]
+                for c in cands[:5]:
+                    opt = c.get("option_legs") or {}
+                    if opt.get("strategy") and opt.get("strategy") != "none":
+                        legs = " + ".join(
+                            f"{l.get('side')} {l.get('strike')}{l.get('kind')}"
+                            for l in (opt.get("legs") or []))
+                        opt_lines.append(
+                            f"• {c.get('symbol')} {opt.get('strategy')} {legs} "
+                            f"debit {opt.get('net_debit')}")
+                opt_lines.append(f"Options spreads: {len(placed_opt)}")
+                _send_opt("\n".join(opt_lines))
+            else:
+                _send_opt(
+                    f"🔍 *Live Market Scan — Options (8877508167, {slot} IST)*\n\n"
+                    f"No new NIFTY spread met the bar — still watching the chain.")
         except Exception:
             pass
         return cands
