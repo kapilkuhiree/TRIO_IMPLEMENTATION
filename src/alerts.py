@@ -20,6 +20,13 @@ from src.utils import get_env, get_logger, ist_display, load_config
 logger = get_logger("alerts")
 
 
+def _redact_telegram_token(text: Any) -> str:
+    """Remove Telegram bot tokens from exception strings before logging."""
+    import re
+    s = "" if text is None else str(text)
+    return re.sub(r"/bot\d+:[A-Za-z0-9_-]+/", "/bot<redacted>/", s)
+
+
 # ---------------------------------------------------------------------------
 # Markdown escaping (Telegram legacy Markdown)
 # ---------------------------------------------------------------------------
@@ -95,7 +102,8 @@ def _send_telegram_kind(message: str, kind: str,
             ok_any = True
         except Exception as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
-            logger.error("Telegram send failed for %s: %s", cid, exc)
+            logger.error("Telegram send failed for %s: %s", cid,
+                         _redact_telegram_token(exc))
             _record_delivery(cid, ok=False, blocked=(status == 403), kind=kind)
     if ok_any:
         logger.info("Telegram alert sent to %d recipient(s) (kind=%s)",
@@ -316,7 +324,8 @@ def _handle_joins_kind(kind: str = "equity") -> List[str]:
         resp.raise_for_status()
         updates = resp.json().get("result", [])
     except Exception as exc:
-        logger.warning("Telegram getUpdates failed (kind=%s): %s", kind, exc)
+        logger.warning("Telegram getUpdates failed (kind=%s): %s", kind,
+                       _redact_telegram_token(exc))
         return []
 
     new_ids: List[str] = []
@@ -337,7 +346,8 @@ def _handle_joins_kind(kind: str = "equity") -> List[str]:
                 logger.info("Welcomed new Telegram subscriber %s (kind=%s)",
                             cid, kind)
             except Exception as exc:
-                logger.warning("Welcome message failed for %s: %s", cid, exc)
+                logger.warning("Welcome message failed for %s: %s", cid,
+                               _redact_telegram_token(exc))
     data["chats"] = chats
     data["offset"] = max_id
     _save_subscribers(data, kind)
