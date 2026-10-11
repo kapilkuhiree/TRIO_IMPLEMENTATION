@@ -79,7 +79,9 @@ def reconcile_broker(trader) -> Dict[str, Any]:
     tid = _get_trader_id(trader)
     is_paper = (getattr(broker, "provider_name", "paper") == "paper")
     required_consecutive = 1 if is_paper else 2
-    state = _refresh_state.setdefault(tid, {"consecutive_successes": required_consecutive, "last_empty_at": 0.0})
+    # Start at zero: a remote broker needs two independently successful
+    # refreshes before an uncertainty halt may be cleared.
+    state = _refresh_state.setdefault(tid, {"consecutive_successes": 0, "last_empty_at": 0.0})
 
     if broker is None:
         return out
@@ -130,16 +132,6 @@ def reconcile_broker(trader) -> Dict[str, Any]:
         rs_current = get_risk_state()
         has_pending_or_uncertain = bool(pending) or getattr(rs_current, "halt_active", False) and "broker_uncertain" in getattr(rs_current, "halts", {})
 
-        if pending or state["consecutive_successes"] < required_consecutive:
-            reason = f"{len(pending)} pending/unknown position(s)" if pending else f"warming up refresh confidence ({state['consecutive_successes']}/{required_consecutive})"
-            set_broker_uncertain(reason)
-            out["uncertain"] = True
-        elif is_empty_book and has_pending_or_uncertain and not is_paper:
-            # Empty response when remote and uncertain -> conservative keep uncertain
-            out["uncertain"] = True
-        else:
-            clear_broker_uncertain()
-
         # Rebuild from the now-refreshed mirror + ledger.
         try:
             from datetime import datetime, timezone, timedelta as _td
@@ -155,6 +147,23 @@ def reconcile_broker(trader) -> Dict[str, Any]:
             trader._proposed = dict(getattr(rs, "positions", {}) or {})
         except Exception:
             pass
+
+        # Rebuild resets the in-memory RiskState. Apply the broker uncertainty
+        # decision *after* rebuilding so a pending/ambiguous remote book cannot
+        # accidentally lose its safety halt.
+        if pending or state["consecutive_successes"] < required_consecutive:
+            reason = (f"{len(pending)} pending/unknown position(s)"
+                      if pending else
+                      f"warming up refresh confidence "
+                      f"({state['consecutive_successes']}/{required_consecutive})")
+            set_broker_uncertain(reason)
+            out["uncertain"] = True
+        elif is_empty_book and has_pending_or_uncertain and not is_paper:
+            # Empty response when remote and uncertain -> conservative keep uncertain.
+            set_broker_uncertain("remote position book empty while state is uncertain")
+            out["uncertain"] = True
+        else:
+            clear_broker_uncertain()
     except Exception as exc:
         logger.warning("reconcile: risk rebuild failed: %s", exc)
     return out
@@ -236,15 +245,19 @@ def preflight(trader, candidate: Dict[str, Any],
     try:
         if would_breach_sector(sym, qty, entry, existing=base):
             return False, "sector-exposure"
-    except Exception:
-        pass
+    except Exception as exc:
+        # A risk calculation failure must not become permission to trade.
+        logger.error("sector preflight failed for %s: %s", sym, exc)
+        return False, "sector-check-failed"
 
     try:
         bal = broker.get_balance() if broker is not None else {}
         if float(bal.get("available", 1)) <= 0:
             return False, "margin-exhausted"
-    except Exception:
-        pass
+    except Exception as exc:
+        # Unknown available margin is unsafe; fail closed rather than submit.
+        logger.error("margin preflight failed for %s: %s", sym, exc)
+        return False, "margin-check-failed"
     return True, ""
 
 

@@ -65,7 +65,8 @@ class RiskState:
         """Return ISO week ID (YYYY-Www)."""
         from datetime import datetime
         d = datetime.strptime(date_str, "%Y-%m-%d")
-        return d.strftime("%Y-W%W")
+        iso_year, iso_week, _ = d.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
 
     def update_weekly(self, today_str: str, daily_pnl: float) -> None:
         """Handle weekly rollover."""

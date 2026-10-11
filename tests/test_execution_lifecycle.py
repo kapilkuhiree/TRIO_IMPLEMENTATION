@@ -229,3 +229,33 @@ def test_record_confirmed_close_idempotent():
     pnl_after2 = get_risk_state().daily_pnl
     assert pnl_after1 == pnl_before + 100.0
     assert pnl_after2 == pnl_after1
+
+
+def test_remote_reconcile_keeps_uncertainty_after_rebuild():
+    """Risk rebuild must not erase a pending/unknown broker halt."""
+    class _Remote:
+        provider_name = "megabull"
+        positions = {}
+        closed_trades = []
+        _pending_orders = {"megabull_1"}
+
+        def refresh_positions(self):
+            return None
+
+    t = _trader()
+    t.broker = _Remote()
+    result = reconcile_broker(t)
+    assert result["uncertain"] is True
+    assert get_risk_state().halt_active is True
+    assert "broker_uncertain" in get_risk_state().halts
+
+
+def test_preflight_fails_closed_when_risk_checks_error():
+    from unittest.mock import patch
+    t = _trader()
+    with patch("src.risk_manager.would_breach_sector",
+               side_effect=RuntimeError("sector data unavailable")):
+        result = submit_candidate(t, _cand("RISK"), proposed={})
+    assert result["status"] == "SKIP"
+    assert result["reason"] == "sector-check-failed"
+    assert get_risk_state().open_positions == 0
