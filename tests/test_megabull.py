@@ -165,10 +165,8 @@ def test_place_order_body_shape_mis_limit(tmp_path):
     b, sess = _broker(tmp_path)
     order = b.place_order("ONGC.NS", "SELL", 45, price=222.0,
                           stop_loss=224.06, target=218.51)
-    # Accepted remotely (verified against live HTTP earlier); the exchange
-    # fills it when the limit is touched — therefore the local status is
-    # FILLED-on-accept and the position mirror only nets executed legs.
-    assert order.status == "FILLED"
+    # Fix #1: unconfirmed LIMIT orders return PENDING until the exchange confirms.
+    assert order.status == "PENDING"
     assert order.broker == "megabull"
     assert order.order_id.startswith("megabull_")
     url, body = sess.posts[0]
@@ -283,7 +281,7 @@ def test_fill_confirmed_by_remote_id_row(tmp_path):
     identical). A row still PENDING, or absent, is NOT a fill."""
     b, sess = _broker(tmp_path)
     order = b.place_order("ONGC.NS", "SELL", 45, price=222.0)
-    assert order.status == "FILLED"  # accepted LIMIT (fills when touched)
+    assert order.status == "PENDING"  # unconfirmed LIMIT is pending
     remote = str(order.order_id).split("megabull_")[-1]
     row = b._order_row(remote)
     assert row is not None and row["status"] == "PENDING"
@@ -296,6 +294,9 @@ def test_fill_confirmed_by_remote_id_row(tmp_path):
     sess.open_orders = [r for r in sess.open_orders
                         if str(r["id"]) != remote]
     assert b._fill_confirmed(order) is True
+    # polling transitions order to FILLED
+    b.poll_pending()
+    assert order.status == "FILLED"
 
 
 def test_close_unconfirmed_when_exit_still_pending(tmp_path):
@@ -314,7 +315,7 @@ def test_close_unconfirmed_when_exit_still_pending(tmp_path):
          patch.object(b, "place_order",
                       side_effect=lambda *a, **k:
                       orig(*a, **{**k, "order_type": "LIMIT"})), \
-         patch("src.broker.megabull.sleep", return_value=None):
+         patch("time.sleep", return_value=None):
         rec = b.close_position("HDFCBANK.NS", 699.0, "target-hit")
     assert rec == {}
     assert b.closed_trades == []

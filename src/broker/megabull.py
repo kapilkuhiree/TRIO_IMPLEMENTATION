@@ -25,9 +25,9 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 import csv
 import logging
 import time
-from time import sleep
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
@@ -66,6 +66,7 @@ class MegaBullBroker(BaseBroker):
         self.orders: Dict[str, BrokerOrder] = {}
         self.positions: Dict[str, Position] = {}
         self.closed_trades: List[Dict[str, Any]] = []
+        self._pending_orders: Set[str] = set()  # remote LIMIT accepted, not yet confirmed
         self._tokens: Dict[str, str] = {}  # TRADINGSYMBOL -> instrumentToken
         self._session = session or _QuietSession()
         default_cache = Path("output") / "instruments_cache.csv"
@@ -261,32 +262,78 @@ class MegaBullBroker(BaseBroker):
                                 f"order API failed: {exc}", otype)
 
         remote_id = str((data or {}).get("id", ""))
-        order = BrokerOrder(
+        placed_at = utc_now()
+        confirmed = False
+        # Build a provisional order to run the confirmation check (row lookup
+        # + position-book fallback). This avoids duplicating the confirmed-slot
+        # logic that Close uses (_exit_confirmed) for entry ambiguity.
+        _probe = BrokerOrder(
             order_id=f"megabull_{remote_id or int(time.time() * 1000)}",
             symbol=symbol, side=side.upper(), quantity=int(quantity),
             order_type=otype, price=float(price or 0.0),
             stop_loss=stop_loss or 0.0, target=target or 0.0,
             status="FILLED", broker="megabull",
-            placed_at=utc_now(), filled_at=utc_now(),
+            placed_at=placed_at, filled_at=placed_at,
         )
-        self.orders[order.order_id] = order
-        logger.info("MegaBull order %s (remote %s): %s %d x %s (reason=%s)",
-                    order.order_id, remote_id, order.side, quantity,
-                    symbol, reason)
-        # After-hours the sim queues accepted orders: /position/my can lag
-        # minutes behind an ACCEPTED fill (proved live 2026-10-06: order
-        # 771075 COMPLETE but invisible for 60s+). First confirm the fill
-        # executed (order book), and ONLY then seed the mirror so the row
-        # is closable. An accepted-but-unexecuted order leaves NO seed —
-        # the exit path stays honest.
-        if self._fill_confirmed(order):
+        try:
+            confirmed = self._fill_confirmed(_probe)
+        except Exception:
+            confirmed = False
+        row_status = ""
+        try:
+            row = self._order_row(remote_id) if remote_id else None
+            row_status = str((row or {}).get("status", "")).upper()
+        except Exception:
+            row_status = ""
+        # Lifecycle (fix #1): REMOTE_ACCEPTED != FILLED. Only a confirmed
+        # entry is FILLED; an accepted LIMIT/SL that is still PENDING, or a
+        # row that cannot be read, stays PENDING/UNKNOWN so the caller
+        # (submit_candidate) never books risk or fires an alert until the
+        # mirror confirms the leg.
+        if confirmed:
+            status = "FILLED"
+            filled_at = placed_at
             self._seed_mirror_from_order(symbol, side.upper(),
                                          int(quantity), float(price or 0.0))
+        elif row_status in ("PENDING", "PLACED", "ACCEPTED", "QUEUED", "OPEN"):
+            status = "PENDING"
+            filled_at = ""
+        elif not row_status and remote_id:
+            # Remote accepted but not yet visible in /order/my — treat as
+            # PENDING (poll-able), not UNKNOWN until proven stale.
+            status = "PENDING"
+            filled_at = ""
+        else:
+            status = "PENDING"
+            filled_at = ""
+        order = BrokerOrder(
+            order_id=f"megabull_{remote_id or int(time.time() * 1000)}",
+            symbol=symbol, side=side.upper(), quantity=int(quantity),
+            order_type=otype, price=float(price or 0.0),
+            stop_loss=stop_loss or 0.0, target=target or 0.0,
+            status=status, broker="megabull",
+            placed_at=placed_at, filled_at=filled_at,
+        )
+        self.orders[order.order_id] = order
+        logger.info("MegaBull order %s (remote %s, row=%s, confirmed=%s): "
+                    "%s %d x %s -> %s (reason=%s)",
+                    order.order_id, remote_id, row_status or "?",
+                    confirmed, order.side, quantity, symbol,
+                    status, reason)
+        # An accepted-but-unexecuted order leaves NO seed — the exit path
+        # stays honest. A confirmed one refreshes so the row is closable.
         self.refresh_positions()
         pos = self.positions.get(symbol)
         logger.info("Post-order mirror for %s: %s",
                     symbol, (pos.side, pos.quantity, pos.avg_price)
                     if pos else None)
+        if status == "PENDING":
+            # Mark the book UNKNOWN so reconcile_broker can gate new entries
+            # until the exchange propagates (see execution_lifecycle.py:63-88).
+            try:
+                self._pending_orders.add(order.order_id)  # type: ignore
+            except Exception:
+                pass
         return order
 
     def _order_row(self, remote_id: str) -> Optional[Dict[str, Any]]:
@@ -354,7 +401,7 @@ class MegaBullBroker(BaseBroker):
             pos = self.positions.get(symbol)
             if pos is None or pos.quantity <= 0:
                 return True
-            sleep(2 + attempt * 2)
+            time.sleep(2 + attempt * 2)
         logger.warning("Exit unconfirmed for %s after retries "
                        "(remote still shows %s)", symbol,
                        self.positions.get(symbol))
@@ -384,8 +431,45 @@ class MegaBullBroker(BaseBroker):
             current_price=price or 0.0,
         )
 
+    def poll_pending(self, symbol: Optional[str] = None) -> None:
+        """Re-check PENDING ACCEPTs; confirmeds become FILLED, rejections REJECTED."""
+        pend = list(getattr(self, "_pending_orders", set()) or set())
+        if not pend:
+            return
+        for oid in pend:
+            try:
+                remote = str(oid).split("megabull_")[-1]
+                row = self._order_row(remote)
+                status = str((row or {}).get("status", "")).upper() if row else ""
+                if status in ("COMPLETE", "EXECUTED", "FILLED"):
+                    o = self.orders.get(oid)
+                    if o is not None:
+                        o.status = "FILLED"
+                        o.filled_at = o.placed_at
+                    self._pending_orders.discard(oid)  # type: ignore
+                    # now the mirror can be trusted to net this leg
+                    if o is not None:
+                        self._seed_mirror_from_order(
+                            o.symbol, o.side, int(o.quantity),
+                            float(o.price or 0.0))
+                elif status in ("REJECTED", "CANCELLED", "FAILED"):
+                    o = self.orders.get(oid)
+                    if o is not None:
+                        o.status = "REJECTED"
+                        o.error = f"remote status {status}"
+                    self._pending_orders.discard(oid)  # type: ignore
+                # else: still pending — keep it in the set, stay uncertain
+            except Exception as exc:
+                logger.warning("poll_pending %s failed: %s", oid, exc)
+
     def refresh_positions(self) -> None:
         """Rebuild the local position mirror from /api/position/my."""
+        # Pending fills get a second look before every book refresh so a
+        # fill that completed since place_order isn't stranded as PENDING.
+        try:
+            self.poll_pending()  # type: ignore
+        except Exception:
+            pass
         if getattr(self, "_auth_failed", False):
             return  # key is bad: mirror stays, scan loop stays fast
         try:
@@ -396,7 +480,14 @@ class MegaBullBroker(BaseBroker):
         if isinstance(data, list):
             items = data  # API sometimes returns a bare list
         else:
-            items = (data or {}).get("value", [])
+            items = (data or {}).get("value", []) if isinstance(data, dict) else []
+            if not isinstance(items, list):
+                items = []
+        # Schema gate: an unrecognized shape (empty dict without `value`) is
+        # a stale/partial response, not a flat book.
+        if isinstance(data, dict) and not data and "value" not in data:
+            logger.warning("Position refresh: unrecognized empty dict — stale, not flat")
+            return
         fresh: Dict[str, Position] = {}
         token_to_symbol = {v: k for k, v in self._tokens.items()}
         for it in items or []:
