@@ -1183,7 +1183,7 @@ class PaperTrader:
         start = time.time()
         plan_done = plan is None  # no plan -> nothing to execute
         market_open_alerted = False
-        live_scan_times = ["09:40", "11:00", "13:00"]
+        live_scan_times = ["09:40", "10:15", "11:00", "12:00", "13:00", "14:00"]
 
         while True:
             try:
