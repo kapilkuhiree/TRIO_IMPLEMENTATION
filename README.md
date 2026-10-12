@@ -94,12 +94,18 @@ python -m compileall -q src scripts main.py
 
 ## Plan & Session
 
-* Premarket writes `output/plans/YYYY-MM-DD.json` (scan stats `requested/failed/scanned`).
+* Premarket writes the next valid NSE session plan to
+  `output/plans/YYYY-MM-DD.json` (scan stats `requested/failed/scanned`).
+  Equity execution stays capped at `max_positions_to_open`; options inspect
+  the wider `options_max_candidates` ranked pool independently.
 * Session reads today's plan; without `--allow-stale-plan` stale fallbacks are rejected
   (explicit `validate_stale`: age, price deviation, stop/qty checks).
 * Live re-scans at `09:40/11:00/13:00 IST` augment the plan; good-morning and routing
   alerts go to Telegram; EOD digest via `scripts/digest.py`.
 * Stale/rejected/pending orders never consume risk and never count as fills.
+  Remote refresh failures keep the broker uncertain and block new entries.
+  Confirmed risk snapshots and option idempotency keys persist under
+  `output/equity_snapshot.json` and `output/runtime/`.
 
 ## Risk Limits
 

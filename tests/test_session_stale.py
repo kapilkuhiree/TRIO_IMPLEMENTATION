@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.plan import find_latest_plan, validate_stale
+from src.plan import find_latest_plan, validate_stale, next_trading_day_ist_str
 
 
 def test_find_latest_rejects_future_file(tmp_path):
@@ -45,6 +45,13 @@ def test_validate_stale_ok():
     assert validate_stale(cand, "2026-10-10", live_price=100.2) is None
 
 
+def test_next_trading_day_skips_weekend_and_configured_holiday():
+    with patch("src.utils.load_config", return_value={
+            "market": {"holidays": ["2026-10-12"]}}):
+        # Friday -> Monday, but Monday is configured as a holiday -> Tuesday.
+        assert next_trading_day_ist_str("2026-10-09") == "2026-10-13"
+
+
 def test_premarket_plan_has_requested_and_failed():
     """build_plan must surface requested/failed alongside scanned."""
     from scripts.premarket import build_plan
@@ -64,6 +71,43 @@ def test_premarket_plan_has_requested_and_failed():
     assert plan["requested"] == 3
     assert plan["scanned"] == 3
     assert "failed" in plan
+
+
+def test_premarket_keeps_equity_cap_but_builds_wider_option_pool():
+    """Options can inspect more ranked ideas without widening equity orders."""
+    from types import SimpleNamespace
+    from src.signal_engine import TradeSignal
+    from src.screener import RankedCandidate
+    from scripts.premarket import build_plan
+
+    def candidate(symbol, rank):
+        sig = TradeSignal(symbol=symbol, action="BUY", entry_price=100.0,
+                          confidence=80)
+        return RankedCandidate(rank=rank, signal=sig, edge_atr=2.0,
+                               setup_name="pullback-long")
+
+    screened = [candidate("A.NS", 120), candidate("B.NS", 110),
+                candidate("C.NS", 100)]
+    option_pick = SimpleNamespace(to_dict=lambda: {
+        "strategy": "long-call", "underlying": "NIFTY", "legs": []})
+    with patch("scripts.premarket.resolve_basket",
+               return_value=["A.NS", "B.NS", "C.NS"]), \
+         patch("scripts.premarket.screen", return_value=screened), \
+         patch("scripts.premarket.load_config", return_value={
+             "screener": {"min_rank": 60.0, "min_confidence": 70,
+                          "max_positions_to_open": 1,
+                          "options_max_candidates": 3,
+                          "options_min_rank": 60.0,
+                          "options_min_confidence": 70},
+             "options": {"enabled": True, "underlying": "NIFTY"},
+         }), \
+         patch("src.options_chain.fetch_chain", return_value={"ok": True}), \
+         patch("src.options_chain.nearest_expiry", return_value="30-Oct-2026"), \
+         patch("src.options_selector.select", return_value=option_pick):
+        plan = build_plan("nifty100", "1d", 1)
+
+    assert len(plan["candidates"]) == 1
+    assert len(plan["option_candidates"]) == 3
 
 
 def _ohlcv():

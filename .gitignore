@@ -47,6 +47,9 @@ output/*
 !output/dashboard_state.json
 !output/subscribers.json
 !output/subscribers_options.json
+!output/equity_snapshot.json
+!output/runtime/
+!output/runtime/*.json
 output/plans/*
 !output/plans/*.json
 

@@ -199,6 +199,21 @@ def main() -> None:
                     f"  + {_c.get('symbol')}: {_opt.get('strategy')} {_legs} "
                     f"debit {_opt.get('net_debit')} "
                     f"maxLoss {_opt.get('maxLoss')}")
+        _primary_symbols = {c.get("symbol") for c in
+                            (plan or {}).get("candidates", []) or []}
+        for _c in (plan or {}).get("option_candidates", []) or []:
+            if _c.get("symbol") in _primary_symbols:
+                continue
+            _opt = _c.get("option_legs") or {}
+            if _opt.get("strategy") and _opt.get("strategy") != "none":
+                _legs = " + ".join(
+                    f"{_l.get('side')} {_l.get('strike')}{_l.get('kind')}"
+                    f"@{_l.get('premium')}"
+                    for _l in (_opt.get("legs") or []))
+                _opt_lines.append(
+                    f"  + {_c.get('symbol')}: {_opt.get('strategy')} {_legs} "
+                    f"debit {_opt.get('net_debit')} "
+                    f"maxLoss {_opt.get('maxLoss')}")
 
         eq_prov = (cfg.get("broker", {}) or {}).get("provider", "megabull").upper()
         opt_prov = (cfg.get("options", {}) or {}).get("broker", "megabull").upper()
@@ -249,9 +264,12 @@ def main() -> None:
     opt_broker = None
     try:
         opt_cfg = cfg.get("options", {}) or {}
+        option_candidates = (plan or {}).get("option_candidates")
+        if option_candidates is None:
+            option_candidates = (plan or {}).get("candidates", []) or []
         if opt_cfg.get("enabled", True) and plan is not None and any(
                 (c.get("option_legs") or {}).get("strategy") not in
-                (None, "", "none") for c in plan.get("candidates", []) or []):
+                (None, "", "none") for c in option_candidates):
             which = str(opt_cfg.get("broker", "paper")).strip().lower()
             opt_lot = int(opt_cfg.get("lot_size", 50))
             if which == "megabull":
@@ -335,7 +353,9 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Options EOD square-off failed: %s", exc)
         if plan is not None and not plan.get("executed"):
-            mark_executed(plan, [])
+            order_ids = list(getattr(trader, "_last_plan_order_ids", []) or [])
+            order_ids.extend(getattr(trader, "_last_option_order_ids", []) or [])
+            mark_executed(plan, order_ids, date=date)
         logger.info("Session job finished at %s",
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
 

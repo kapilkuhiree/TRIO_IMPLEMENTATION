@@ -549,8 +549,14 @@ class MegaBullBroker(BaseBroker):
             except Exception as exc:
                 logger.warning("poll_pending %s failed: %s", oid, exc)
 
-    def refresh_positions(self) -> None:
-        """Rebuild the local position mirror from /api/position/my."""
+    def refresh_positions(self) -> bool:
+        """Rebuild the local position mirror from /api/position/my.
+
+        Returns ``True`` only when the response was fetched and matched a
+        recognized schema.  A stale mirror must never be reported as a
+        successful reconciliation because the execution lifecycle uses this
+        result to decide whether new orders may be submitted.
+        """
         # Pending fills get a second look before every book refresh so a
         # fill that completed since place_order isn't stranded as PENDING.
         try:
@@ -558,23 +564,21 @@ class MegaBullBroker(BaseBroker):
         except Exception:
             pass
         if getattr(self, "_auth_failed", False):
-            return  # key is bad: mirror stays, scan loop stays fast
+            return False  # key is bad: mirror stays, scan loop stays fast
         try:
             data = self._get("/api/position/my")
         except Exception as exc:  # noqa: BLE001 - mirror may go stale
             logger.warning("Position refresh failed: %s", exc)
-            return
+            return False
         if isinstance(data, list):
             items = data  # API sometimes returns a bare list
+        elif isinstance(data, dict) and "value" in data and isinstance(data["value"], list):
+            items = data["value"]
         else:
-            items = (data or {}).get("value", []) if isinstance(data, dict) else []
-            if not isinstance(items, list):
-                items = []
-        # Schema gate: an unrecognized shape (empty dict without `value`) is
-        # a stale/partial response, not a flat book.
-        if isinstance(data, dict) and not data and "value" not in data:
-            logger.warning("Position refresh: unrecognized empty dict — stale, not flat")
-            return
+            # An unrecognized shape, including an empty dict, is a stale or
+            # partial response rather than proof that the account is flat.
+            logger.warning("Position refresh: unrecognized response shape — stale, not flat")
+            return False
         fresh: Dict[str, Position] = {}
         token_to_symbol = {v: k for k, v in self._tokens.items()}
         for it in items or []:
@@ -622,6 +626,7 @@ class MegaBullBroker(BaseBroker):
                 pnl_pct=(pnl / (avg * abs(qty)) * 100) if avg and qty else 0.0,
             )
         self.positions = fresh
+        return True
 
     def close_position(self, symbol: str, price: float,
                        reason: str = "close",

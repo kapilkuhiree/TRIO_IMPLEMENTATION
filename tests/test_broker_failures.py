@@ -30,6 +30,25 @@ def test_megabull_refresh_resolves_option_symbol_from_instrument_name(tmp_path):
     assert b.positions["NIFTY26O1322500CE.NS"].quantity == 65
 
 
+def test_megabull_refresh_reports_network_failure_as_unhealthy():
+    """A stale remote mirror must not look like a successful flat refresh."""
+    b = MegaBullBroker(api_key="fake")
+    b.positions["RELIANCE.NS"] = Position(
+        symbol="RELIANCE.NS", side="LONG", quantity=2,
+        avg_price=100.0, current_price=100.0)
+    with patch.object(b, "_get", side_effect=TimeoutError("network down")):
+        assert b.refresh_positions() is False
+    assert "RELIANCE.NS" in b.positions
+
+
+def test_megabull_refresh_accepts_explicit_empty_position_list_as_flat():
+    """A recognized empty list is valid evidence of a flat remote book."""
+    b = MegaBullBroker(api_key="fake")
+    with patch.object(b, "_get", return_value=[]):
+        assert b.refresh_positions() is True
+    assert b.positions == {}
+
+
 def test_megabull_close_position_matches_canonical_key(tmp_path):
     """close_position must find the position when caller omits the .NS suffix."""
     b = MegaBullBroker(api_key="fake")

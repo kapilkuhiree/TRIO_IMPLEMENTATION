@@ -1,0 +1,25 @@
+name: TRIO quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CI dependencies
+        run: pip install -r requirements-server.txt pytest
+      - name: Compile
+        run: python -m compileall -q src scripts main.py
+      - name: Test
+        run: python -m pytest -q --basetemp /tmp/trio-pytest

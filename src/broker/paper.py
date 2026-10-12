@@ -70,6 +70,7 @@ class PaperBroker(BaseBroker):
         qty_closed: int,
         price: float,
         reason: str,
+        close_id: str = "",
     ) -> Dict[str, Any]:
         """Append a closed-trade record and fire the Telegram exit alert.
 
@@ -88,6 +89,8 @@ class PaperBroker(BaseBroker):
         closed_at = utc_now()
         entry_at = self._entry_time(symbol)
         record = {
+            "order_id": close_id,
+            "close_id": close_id,
             "symbol": symbol,
             "side": side,
             "quantity": qty_closed,
@@ -220,7 +223,8 @@ class PaperBroker(BaseBroker):
                 # Buyback is an obligation: always honoured, even if the
                 # cash ledger is temporarily short (never strand a short).
                 self.capital -= price * qty_closed
-                self._record_close(symbol, pos, qty_closed, price, reason)
+                self._record_close(symbol, pos, qty_closed, price, reason,
+                                   close_id=order_id)
                 pos.quantity -= qty_closed
                 if pos.quantity <= 0:
                     del self.positions[symbol]
@@ -249,7 +253,8 @@ class PaperBroker(BaseBroker):
                         "SELL %d exceeds LONG %d on %s — clipping to %d",
                         quantity, pos.quantity, symbol, qty_closed)
                 self.capital += price * qty_closed
-                self._record_close(symbol, pos, qty_closed, price, reason)
+                self._record_close(symbol, pos, qty_closed, price, reason,
+                                   close_id=order_id)
                 pos.quantity -= qty_closed
                 if pos.quantity <= 0:
                     del self.positions[symbol]

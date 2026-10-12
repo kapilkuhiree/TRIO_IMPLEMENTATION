@@ -24,3 +24,7 @@ vaderSentiment>=3.3.2
 # HTTP (broker + alerts + news)
 requests>=2.31.0
 feedparser>=6.0.0
+
+# Dashboard and CI smoke checks
+Flask>=3.0
+pytest>=8.0
