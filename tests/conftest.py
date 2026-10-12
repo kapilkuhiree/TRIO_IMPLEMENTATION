@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("TRIO_BROKER_PROVIDER", "paper")
+os.environ["TRIO_REMOTE_REQUIRED"] = "0"
 
 # Hard guarantee: every PaperTrader built inside a test run writes to the
 # *_test sidecar ledger, never the live output/trade_log.jsonl. On 2026-10-06

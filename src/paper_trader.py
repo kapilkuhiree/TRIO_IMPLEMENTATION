@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.utils import get_logger, load_config, utc_now
+from src.utils import (get_logger, load_config, utc_now, remote_paper_required,
+                       local_option_shadow_allowed)
 from src.data_fetcher import fetch_market_data
 from src.indicators import compute_indicators
 from src.sentiment import analyze_sentiment
@@ -66,6 +67,9 @@ class PaperTrader:
             raise ValueError(
                 f"Unknown broker provider '{raw}' — allowed: {sorted(allowed)}. "
                 f"Refusing to trade silently on a typoed simulator.")
+        if remote_paper_required(cfg):
+            from src.remote_paper import validate_remote_config
+            validate_remote_config(cfg, provider=provider)
         # MegaBull paper requires intent: env or config "megabull" plus a
         # non-empty API key, otherwise fail-closed before any order.
         if provider == "megabull":
@@ -90,6 +94,9 @@ class PaperTrader:
             self.broker = MegaBullBroker(
                 api_key=api_key,
                 initial_capital=capital,
+                state_path=(Path(cfg.get("general", {}).get("output_dir", "output"))
+                            / "runtime" / "megabull.json")
+                if remote_paper_required(cfg) else None,
             )
             logger.info("Broker provider: MegaBull (remote paper fills).")
         else:
@@ -135,6 +142,8 @@ class PaperTrader:
             return set(data.get(session_date, []) or [])
         except Exception as exc:
             logger.warning("Options registry unreadable: %s", exc)
+            if remote_paper_required():
+                raise RuntimeError("Cannot reconcile options registry") from exc
             return set()
 
     def _save_option_registry(self, session_date: str) -> None:
@@ -153,6 +162,8 @@ class PaperTrader:
             tmp.replace(path)
         except Exception as exc:
             logger.warning("Options registry write failed: %s", exc)
+            if remote_paper_required():
+                raise RuntimeError("Cannot persist options intent") from exc
 
     @staticmethod
     def _option_registry_key(provider: str, sid_key: tuple) -> str:
@@ -303,7 +314,7 @@ class PaperTrader:
             # must be told explicitly to close.
             return []
         closed = self.square_off_session(reason="eod-squareoff")
-        self._eod_squared = True
+        self._eod_squared = not bool(self.broker.positions)
         logger.info("EOD square-off: closed %d position(s).", len(closed))
         return closed
 
@@ -969,6 +980,18 @@ class PaperTrader:
         if plan.get("executed"):
             logger.info("execute_option_plan: plan already marked executed; skipping")
             return []
+        cfg = load_config()
+        required = remote_paper_required(cfg)
+        if required and not self._session_open():
+            return []
+        if opt_broker is None:
+            if required or getattr(self.broker, "provider_name", "") == "megabull":
+                from src.remote_paper import make_options_broker
+                opt_broker = make_options_broker(self, cfg)
+                self.opt_broker = opt_broker
+        if required:
+            if getattr(opt_broker, "provider_name", "") != "megabull_options":
+                raise RuntimeError("Remote-only options require MegaBullOptionsBroker")
         if opt_broker is None:
             try:
                 from src.broker.options_paper import OptionsPaperBroker
@@ -984,7 +1007,8 @@ class PaperTrader:
         # session, across the main book AND every shadow book. The set is
         # keyed by provider so a MegaBull-held spread and a local shadow
         # never collide.
-        session_date = str(plan.get("date") or utc_now()[:10])
+        from src.plan import today_ist_str
+        session_date = str(plan.get("date") or today_ist_str())
         if not hasattr(self, "_opt_spreads_placed"):
             self._opt_spreads_placed = set()
         if not hasattr(self, "_opt_registry_keys"):
@@ -1047,7 +1071,7 @@ class PaperTrader:
                                 "shadow already held).", cand.get("symbol"),
                                 pick.strategy)
                     continue
-                if len(self._opt_spreads_placed) >= max_spreads:
+                if max(len(self._opt_spreads_placed), len(self._opt_registry_keys)) >= max_spreads:
                     logger.info(
                         "execute_option_plan: session cap (%d spreads) "
                         "reached — SKIP %s.", max_spreads,
@@ -1063,6 +1087,20 @@ class PaperTrader:
                 lots = 1
                 if pick.net_debit > 0 and risk_amt > 0:
                     lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
+                if required:
+                    from src.execution_lifecycle import reconcile_broker
+                    if reconcile_broker(self).get("uncertain"):
+                        break
+                    if get_risk_state().halt_active:
+                        break
+                    balance = self.broker.get_balance(strict=True)
+                    if balance["available"] < pick.net_debit * lots * lot_sz:
+                        self._log_event("skip", {"asset": "options", "reason": "margin-exhausted"})
+                        continue
+                    # Persist the intent BEFORE sending legs. An interrupted
+                    # submit must never be automatically retried as a new spread.
+                    self._opt_registry_keys.add(registry_key)
+                    self._save_option_registry(session_date)
                 order = opt_broker.open_spread(pick, lots=lots,
                                                reason="options-plan")
                 if order.status == "FILLED":
@@ -1074,14 +1112,22 @@ class PaperTrader:
                     self._log_event("skip", {
                         "symbol": cand.get("symbol"), "asset": "options",
                         "strategy": pick.strategy,
-                        "reason": f"rejected: {order.error}"})
+                        "order_id": order.order_id, "status": order.status,
+                        "reason": f"{order.status}: {order.error}"})
+                    try:
+                        from src.alerts import send_options_telegram
+                        send_options_telegram(
+                            f"MegaBull paper option {order.status}: {cand.get('symbol')} "
+                            f"{pick.strategy}\n{order.error}\nNo local shadow trade opened.")
+                    except Exception as exc:
+                        logger.warning("Options rejection alert failed: %s", exc)
                     # MegaBull silently rejects option legs (endpoint
                     # refused lots=1/units=50/75 on 2026-10-08). When the
                     # remote broker is selected but a leg can't fill, keep
                     # the LOCAL paper sim as the shadow book so the
                     # overlay's P&L/marking stays testable and the equity
                     # session is never blocked.
-                    if "megabull" in str(
+                    if local_option_shadow_allowed(cfg) and "megabull" in str(
                             getattr(opt_broker, "provider_name", "")).lower():
                         try:
                             from src.broker.options_paper import (
@@ -1255,7 +1301,7 @@ class PaperTrader:
                 except Exception:
                     pass
             return []
-        if not cands:
+        if not cands and not option_cands:
             logger.info("Live rescan (%s): scanned, nothing met the bar.", slot)
             for _kind, _sender in (
                 ("equity", lambda m: __import__("src.alerts", fromlist=["send_telegram"]).send_telegram(m)),
@@ -1343,9 +1389,7 @@ class PaperTrader:
         guard tick — used by scripts/session.py to mark option spreads to
         the live chain mid. Never raises out of this loop.
         """
-        if self._session_open():
-            self.execute_plan(plan)
-        else:
+        if not self._session_open():
             logger.info("Session is CLOSED — plan execution delayed "
                         "until the next open (managing only).")
             # Still rebuild stop/target for any positions held, so the guard
@@ -1363,8 +1407,12 @@ class PaperTrader:
                 ist_now = datetime.now(_tz(_td(hours=5, minutes=30)))
                 now_str = ist_now.strftime("%H:%M")
 
-                if not plan_done and self._session_open():
+                from src.execution_lifecycle import reconcile_broker
+                ready = not reconcile_broker(self).get("uncertain")
+                if not plan_done and self._session_open() and ready:
                     self.execute_plan(plan)
+                    if getattr(self, "opt_broker", None) is not None:
+                        self.execute_option_plan(plan, opt_broker=self.opt_broker)
                     plan_done = True
                     if not market_open_alerted:
                         _open_msg = "🔔 *Market Open (09:15 IST)*\n\nNSE session has started! TRIO is now active, orders dispatched, and position tracking is live."
@@ -1412,7 +1460,7 @@ class PaperTrader:
             # Stop only when the MARKET is closed, not when entries stop.
             # (_session_open/can_enter flips False at 15:00 but hard-flat is
             # 15:10 — breaking there skipped the forced square-off.)
-            if plan_done and not self._market_still_running():
+            if not self._market_still_running():
                 logger.info("Market closed — final square-off.")
                 self._maybe_eod_square_off()
                 break

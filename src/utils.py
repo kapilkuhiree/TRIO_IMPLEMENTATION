@@ -106,6 +106,51 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     return cfg
 
 
+def _bool_setting(value: Any, default: bool = False) -> bool:
+    """Convert config/environment-style values to a strict boolean."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def remote_paper_required(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether execution must remain on the remote paper broker.
+
+    GitHub Actions sets the environment override explicitly.  The config
+    default keeps local/manual runs aligned with the repository's configured
+    MegaBull experiment while tests can opt out safely.
+    """
+    cfg = cfg if cfg is not None else load_config()
+    raw = os.environ.get("TRIO_REMOTE_REQUIRED")
+    if raw is not None:
+        return _bool_setting(raw)
+    return _bool_setting(
+        (cfg.get("execution", {}) or {}).get("remote_paper_required"),
+        default=False,
+    )
+
+
+def local_option_shadow_allowed(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether a rejected remote option may use a local shadow book.
+
+    Remote-only sessions explicitly disable this.  The opt-in exists only for
+    offline strategy tests and legacy local-paper experiments.
+    """
+    cfg = cfg if cfg is not None else load_config()
+    raw = os.environ.get("TRIO_ALLOW_LOCAL_OPTION_SHADOW")
+    if raw is not None:
+        allowed = _bool_setting(raw)
+    else:
+        allowed = _bool_setting(
+            (cfg.get("execution", {}) or {}).get(
+                "allow_local_option_shadow"),
+            default=False,
+        )
+    return allowed and not remote_paper_required(cfg)
+
+
 def get_config_section(section: str) -> Dict[str, Any]:
     """Get a top-level section from the config."""
     cfg = load_config()

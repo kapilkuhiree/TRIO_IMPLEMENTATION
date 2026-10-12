@@ -93,6 +93,10 @@ def reconcile_broker(trader) -> Dict[str, Any]:
         # is safe for the in-memory paper broker but not for a remote book.
         if refresh_result is False:
             refresh_ok = False
+        if not is_paper and refresh_result is not True:
+            refresh_ok = False
+        if hasattr(broker, "refresh_orders") and broker.refresh_orders() is not True:
+            refresh_ok = False
     except AttributeError:
         if not is_paper:
             refresh_ok = False
@@ -118,6 +122,9 @@ def reconcile_broker(trader) -> Dict[str, Any]:
 
     if refresh_ok:
         state["consecutive_successes"] += 1
+    else:
+        state["consecutive_successes"] = 0
+        out["uncertain"] = True
 
     try:
         positions_dict = getattr(broker, "positions", {}) or {}
@@ -171,6 +178,7 @@ def reconcile_broker(trader) -> Dict[str, Any]:
             clear_broker_uncertain()
     except Exception as exc:
         logger.warning("reconcile: risk rebuild failed: %s", exc)
+        out["uncertain"] = True
     return out
 
 
@@ -256,7 +264,9 @@ def preflight(trader, candidate: Dict[str, Any],
         return False, "sector-check-failed"
 
     try:
-        bal = broker.get_balance() if broker is not None else {}
+        bal = (broker.get_balance(strict=True)
+               if getattr(broker, "provider_name", "") == "megabull"
+               else broker.get_balance()) if broker is not None else {}
         if float(bal.get("available", 1)) <= 0:
             return False, "margin-exhausted"
     except Exception as exc:
@@ -309,6 +319,7 @@ def submit_candidate(trader, candidate: Dict[str, Any],
     try:
         order = broker.place_order(
             symbol=sym, side=action, quantity=qty,
+            order_type="MKT" if getattr(broker, "provider_name", "") == "megabull" else "LIMIT",
             price=candidate.get("entry_price"),
             stop_loss=candidate.get("stop_loss"), target=candidate.get("target"),
             reason=reason)
