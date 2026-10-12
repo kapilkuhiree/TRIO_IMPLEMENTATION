@@ -150,12 +150,14 @@ class MegaBullOptionsBroker(BaseBroker):
                     reason: str = "options-plan") -> BrokerOrder:
         """Open one spread with both legs as remote MegaBull paper orders.
 
-        Quantity semantics: MegaBull buysell refused lots=1, units=50 and
-        units=75 on 2026-10-08 ("Invalid quantity ... lot size"), so the
-        FIRST acceptance teaches _option_lots by probing lots against the
-        configured lot_size; until then orders here report REJECTED and
-        the session skips options (fail-closed), exactly like tonight's
-        raw probes. Every leg confirms by remote id; on ANY leg failure
+        Units are REMOTE quantities: MegaBull validates option orders against the
+        exchange lot size, so 1 lot must be sent as `lot_size` UNITS. Proved
+        live 2026-10-12 against NIFTY 13-Oct-2026 22500 CE: qty=1 was
+        REJECTED (HTTP 400 "quantity based on lot size") while qty=65
+        (config lot_size) FILLED. Passing `lots` here is what produced every
+        "Invalid quantity" rejection logged on 2026-10-08.
+
+        Quantity semantics: every leg confirms by remote id; on ANY leg failure
         confirmed sister legs are unwound before returning REJECTED.
         """
         try:
@@ -189,6 +191,7 @@ class MegaBullOptionsBroker(BaseBroker):
             return self._reject(sid, lots, net,
                                 "already holding this spread")
 
+        units = max(1, int(lots) * max(1, int(self.lot_size)))
         opened: List[Dict[str, Any]] = []
         for leg in legs:
             mega_symbol = option_symbol(underlying, expiry,
@@ -202,7 +205,7 @@ class MegaBullOptionsBroker(BaseBroker):
                     sid, lots, net,
                     f"no MegaBull instrument for {mega_symbol}: {exc}")
             order = self.mega.place_order(
-                mega_symbol, str(leg.get("side") or "BUY"), lots,
+                mega_symbol, str(leg.get("side") or "BUY"), units,
                 order_type="MKT",
                 price=float(leg.get("premium") or net or 0.0) or None,
                 reason=reason)
@@ -215,7 +218,8 @@ class MegaBullOptionsBroker(BaseBroker):
                                        float(leg.get("premium") or net or 0.0))
             leg_rec = {"mega_symbol": mega_symbol,
                        "side": str(leg.get("side") or "BUY"),
-                       "lots": lots, "price": entry_px, "confirmed": True,
+                       "lots": lots, "units": units,
+                       "price": entry_px, "confirmed": True,
                        "order_id": order.order_id}
             opened.append(leg_rec)
             self.orders[order.order_id] = order

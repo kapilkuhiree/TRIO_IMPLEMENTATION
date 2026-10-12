@@ -75,6 +75,7 @@ class MegaBullBroker(BaseBroker):
         self.closed_trades: List[Dict[str, Any]] = []
         self._pending_orders: Set[str] = set()  # remote LIMIT accepted, not yet confirmed
         self._tokens: Dict[str, str] = {}  # TRADINGSYMBOL -> instrumentToken
+        self._name_map_cache: Optional[Dict[str, str]] = None  # instName -> sym
         self._session = session or _QuietSession()
         default_cache = Path("output") / "instruments_cache.csv"
         self.instrument_cache = instrument_cache or default_cache
@@ -430,6 +431,59 @@ class MegaBullBroker(BaseBroker):
                        self.positions.get(symbol))
         return False
 
+    def _mirror_key(self, symbol: str) -> str:
+        """Canonical mirror key for a symbol (always the <SYM>.NS form).
+
+        Seeded positions and refreshed positions MUST use the same key or the
+        seed is orphaned by the next refresh. Proved live 2026-10-12: a seed
+        under "NIFTY26O1322500CE" and a refresh under
+        "NIFTY26O1322500CE.NS" were treated as two different positions.
+        """
+        tsym = self.to_trading_symbol(symbol)
+        return f"{tsym}.NS" if tsym else str(symbol or "")
+
+    def _name_map(self) -> Dict[str, str]:
+        """instrumentName -> tradingSymbol, built from the instrument cache.
+
+        /api/position/my sometimes omits `tradingSymbol` and returns only the
+        descriptive `instrumentName` ("NIFTY 13 OCT 22500 CE"). Without a
+        mapping the mirror key becomes unresolvable, so an exit on a position
+        opened in an EARLIER process (fresh runner => cold token cache) fails
+        with "No MegaBull instrument for ...". The cache CSV carries both
+        columns, so we can always resolve the real tradable symbol.
+        """
+        if self._name_map_cache is not None:
+            return self._name_map_cache
+        out: Dict[str, str] = {}
+        try:
+            if self.instrument_cache.exists():
+                with open(self.instrument_cache, encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        nm = (row.get("instrumentName") or "").strip().upper()
+                        ts = (row.get("tradingSymbol") or "").strip()
+                        if nm and ts:
+                            out.setdefault(nm, ts)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Instrument name map unreadable (%s)", exc)
+        self._name_map_cache = out
+        return out
+
+    def _resolve_symbol(self, item: Dict[str, Any],
+                        token_to_symbol: Dict[str, str]) -> str:
+        """Tradable symbol for one position row (best-effort, never raises)."""
+        tsym = str(item.get("tradingSymbol", "") or "").strip()
+        if tsym:
+            return tsym
+        tok = str(item.get("instrumentToken", "") or "").strip()
+        if tok and tok in token_to_symbol:
+            return token_to_symbol[tok]
+        nm = str(item.get("instrumentName", "") or "").strip().upper()
+        if nm:
+            hit = self._name_map().get(nm)
+            if hit:
+                return hit
+        return str(item.get("instrumentName", "") or "").strip()
+
     def _seed_mirror_from_order(self, symbol: str, side: str,
                                 quantity: int, price: float) -> None:
         """Optimistic position entry from an accepted order.
@@ -447,8 +501,9 @@ class MegaBullBroker(BaseBroker):
                 if price:
                     pos.current_price = price
             return
-        self.positions[symbol] = Position(
-            symbol=symbol,
+        key = self._mirror_key(symbol)
+        self.positions[key] = Position(
+            symbol=key,
             side="SHORT" if side == "SELL" else "LONG",
             quantity=quantity, avg_price=price or 0.0,
             current_price=price or 0.0,
@@ -546,12 +601,10 @@ class MegaBullBroker(BaseBroker):
                 # for shorts when there is no affirmative BUY marker.
                 is_short = qty < 0
             # instrumentName is the COMPANY name (e.g. "HDFC Bank Ltd"),
-            # not the tradable symbol — resolve the symbol from
-            # tradingSymbol first, falling back to the token map cache.
-            tsym = str(it.get("tradingSymbol", "")
-                       or token_to_symbol.get(
-                           str(it.get("instrumentToken", "")), "")
-                       or it.get("instrumentName", ""))
+            # not the tradable symbol — resolve the real symbol from
+            # tradingSymbol, then the token map, then the cache-backed
+            # instrumentName map (options: "NIFTY 13 OCT 22500 CE").
+            tsym = self._resolve_symbol(it, token_to_symbol)
             symbol = (f"{tsym}.NS" if tsym and not tsym.endswith((".NS", " 50", " BANK"))
                       else tsym)
             try:
@@ -586,7 +639,10 @@ class MegaBullBroker(BaseBroker):
         """
         before = self.positions.get(symbol)  # snapshot incl. entry seed
         self.refresh_positions()
-        live = self.positions.get(symbol)
+        key = self._mirror_key(symbol)
+        if before is None and key != symbol:
+            before = self.positions.get(key)
+        live = self.positions.get(symbol) or self.positions.get(key)
         if live is not None and live.quantity > 0:
             pos = live  # exchange truth wins whenever it has the row
         else:
@@ -596,7 +652,7 @@ class MegaBullBroker(BaseBroker):
             # flat book (never seeded) stays flat.
             pos = before if before is not None and before.quantity > 0 else None
             if pos is not None:
-                self.positions[symbol] = pos  # restore seed for exit math
+                self.positions[key] = pos  # restore seed for exit math
         if pos is None or pos.quantity <= 0:
             return {}
         qty = int(pos.quantity * fraction)
