@@ -71,6 +71,10 @@ trading:
 short_shadow:
   only: false
 
+# Max concurrent positions allowed in the session
+risk_management:
+  max_open_positions: 3
+
 # Broker provider. "megabull" routes all fills to the MegaBull free paper
 # API (MIS intraday; account holds Rs5,00,000 virtual, key in .env as
 # MEGABULL_API_KEY — never paste it here). "paper" keeps the local
@@ -87,10 +91,10 @@ broker:
 # composite-short 1.0, other 0.5). Entries inside 0.25 ATR of their stop
 # score zero. An empty screen (nothing met the bar) is normal.
 screener:
-  basket: "nifty50"          # basket name in src/screener.py, or a raw list
-  max_positions_to_open: 2   # sure-only: 2 parallel positions, not 3
-  min_rank: 60.0             # was 40 — filters weak edge
-  min_confidence: 70         # was 60 — requires high conviction; yesterday's 3 had 71/71/66 so only top-2 passed
+  basket: "nifty100"          # basket name in src/screener.py, or a raw list
+  max_positions_to_open: 3   # sure-only: 3 parallel positions, not 2
+  min_rank: 55.0             # was 40 — filters weak edge (lowered for more setups)
+  min_confidence: 70         # was 60 — requires high conviction; keeps loss filter tight
   # Shadow thresholds (log-only): compare sure-only vs old and extreme
   shadow_thresholds:
     - { name: "legacy_60_40", min_confidence: 60, min_rank: 40 }
