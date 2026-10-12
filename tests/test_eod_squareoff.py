@@ -42,6 +42,26 @@ def test_eod_squares_off_once_after_close():
     assert len(t.broker.closed_trades) == 1
 
 
+def test_session_loop_survives_the_entry_cutoff_to_hard_flat():
+    """The loop must keep ticking between entry_cutoff (15:00) and hard_flat.
+
+    Regression: run_session used to break on `not _session_open()`, which goes
+    False at entry_cutoff 15:00 — ten minutes BEFORE the 15:10 hard-flat — so
+    positions were left open and never force-squared.
+    """
+    t = _trader_with_position()
+    # 15:00-15:09: entries are over but the market is still open.
+    assert t._session_open(now_ist=dtime(15, 5)) is False
+    assert t._market_still_running(now_ist=dtime(15, 5)) is True
+    # At/after the close the loop may stop, but never while holding stock.
+    assert t._market_still_running(now_ist=dtime(15, 35)) is True
+    with patch("src.paper_trader.fetch_market_data") as md:
+        md.return_value.latest_price = 110.0
+        t._maybe_eod_square_off(now_ist=dtime(15, 35))
+    assert t.broker.positions == {}
+    assert t._market_still_running(now_ist=dtime(15, 35)) is False
+
+
 def test_no_eod_before_session_end():
     t = _trader_with_position()
     # Lunch break (12:30): market closed, but it is NOT end of day.

@@ -278,6 +278,29 @@ class PaperTrader:
         except Exception:
             return False
 
+    def _market_still_running(self, now_ist=None) -> bool:
+        """True while the session loop must keep ticking.
+
+        Deliberately NOT ``_session_open()`` (can_enter). Entries stop at
+        ``entry_cutoff`` (15:00) but the hard-flat square-off is at 15:10 and
+        the market closes at 15:30. A loop that exits when can_enter goes
+        False therefore stopped managing ten minutes BEFORE the forced exit,
+        leaving positions open and un-squared for the tail of the session.
+
+        Keep ticking until the market is actually closed — and never exit
+        while still holding stock.
+        """
+        try:
+            from src.market_clock import market_clock_from_config
+            clock = market_clock_from_config(load_config())
+            if not clock.is_closed(now_ist):
+                return True
+            # Market closed: only stop once the book is flat.
+            return bool(self.broker.positions)
+        except Exception:
+            # Fail-safe: an unreadable clock must not strand live positions.
+            return True
+
     def _manage_open_positions(self) -> None:
         """Check trailing stops, fixed stops and targets on open positions.
 
@@ -1302,9 +1325,11 @@ class PaperTrader:
                                        hook_exc)
             except Exception as exc:
                 logger.error("run_session tick failed: %s", exc)
-            # Session closed after open -> final square-off and exit.
-            if plan_done and not self._session_open():
-                logger.info("Session closed — final square-off.")
+            # Stop only when the MARKET is closed, not when entries stop.
+            # (_session_open/can_enter flips False at 15:00 but hard-flat is
+            # 15:10 — breaking there skipped the forced square-off.)
+            if plan_done and not self._market_still_running():
+                logger.info("Market closed — final square-off.")
                 self._maybe_eod_square_off()
                 break
             if max_seconds and (time.time() - start) >= max_seconds:
