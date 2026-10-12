@@ -50,18 +50,17 @@ jobs:
       - name: Persist state to repo
         if: always()
         run: |
+          set -euo pipefail
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
-          git add -A output/dashboard_state.json output/plans output/subscribers.json output/subscribers_options.json
-          git stash push -m "bot-state" --keep-index || true
-          git fetch origin main || true
-          # 2026-10-09: rebase --autostash failed on unmerged state files
-          # (exit 128, digest lost). Merge instead: bot files are
-          # append/overwrite state, so "ours" always wins and the push
-          # can never die on a rebase conflict again.
-          git merge -X ours --no-edit origin/main || \
-            (git checkout --ours -- output/ && git add -A output/ && \
-             git -c core.editor=true merge --continue) || true
-          git stash pop || true
-          git diff --cached --quiet || git commit -m "session state $(date -u +%F)"
-          git push || (git pull --no-rebase -X ours || true; git push) || true
+          git add -A output/dashboard_state.json output/plans output/subscribers.json output/subscribers_options.json output/equity_snapshot.json output/runtime
+          git fetch origin main
+          if ! git merge -X ours --no-edit origin/main; then
+            git checkout --ours -- output/
+            git add -A output/
+            git -c core.editor=true merge --continue
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "session state $(date -u +%F)"
+          fi
+          git push origin HEAD:main

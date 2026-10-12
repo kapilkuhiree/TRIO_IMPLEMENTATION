@@ -12,7 +12,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils import get_logger, load_config, utc_now
 
@@ -79,6 +79,18 @@ class RiskState:
 
 # Global risk state
 _risk_state = RiskState()
+
+
+def _risk_snapshot_path():
+    """Return the configured restart-safe risk snapshot path."""
+    from pathlib import Path
+    try:
+        cfg = load_config()
+        path = (cfg.get("logging", {}) or {}).get(
+            "risk_snapshot", "output/equity_snapshot.json")
+    except Exception:
+        path = "output/equity_snapshot.json"
+    return Path(path)
 
 
 def get_risk_state() -> RiskState:
@@ -171,7 +183,7 @@ def rebuild_from_ledger(
             return ""
 
     seen: Dict[str, float] = {}
-    ordered_pnls: List[float] = []
+    ordered_events: List[Tuple[float, float]] = []
     # 1) broker records first
     for r in (closed_trades or []):
         try:
@@ -184,7 +196,14 @@ def rebuild_from_ledger(
                 continue
             v = float(r.get("pnl") or 0.0)
             seen[k] = v
-            ordered_pnls.append(v)
+            try:
+                dt = _DT.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_TZZ.utc)
+                order_ts = dt.timestamp()
+            except Exception:
+                order_ts = 0.0
+            ordered_events.append((order_ts, v))
         except Exception:
             continue
     # 2) JSONL ledger (UTC ts -> IST day; test-mode rows ignored; never double-sum)
@@ -213,33 +232,63 @@ def rebuild_from_ledger(
                     continue
                 v = float(rec.get("pnl") or 0.0)
                 seen[k] = v
-                ordered_pnls.append(v)
+                try:
+                    dt = _DT.fromisoformat(str(rec.get("ts") or "").replace(
+                        "Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_TZZ.utc)
+                    order_ts = dt.timestamp()
+                except Exception:
+                    order_ts = 0.0
+                ordered_events.append((order_ts, v))
     except Exception:
         pass
 
     _risk_state.daily_pnl = round(sum(seen.values()), 2)
-    # Restore high watermark
     _risk_state.high_watermark = max(_risk_state.daily_pnl, 0.0)
+    snapshot_restored = False
     try:
-        from pathlib import Path as _P
-        snap_path = _P("output/equity_snapshot.json")
-        if snap_path.exists():
+        snap_path = _risk_snapshot_path()
+        if snap_path.exists() and __import__("os").environ.get(
+                "TRIO_TEST_MODE") != "1":
             import json as _j
             snap = _j.loads(snap_path.read_text(encoding="utf-8"))
-            _risk_state.high_watermark = float(snap.get("high_watermark", _risk_state.high_watermark))
+            snap_date = str(snap.get("snapshot_date") or
+                            snap.get("last_session_date") or "")
+            snap_week = str(snap.get("last_week_id") or "")
+            current_week = _risk_state._get_week_id(str(today))
+            # The watermark and weekly budget survive a date rollover; daily
+            # P&L and the current-day streak are restored only for a restart
+            # within the same session.
+            _risk_state.high_watermark = max(
+                _risk_state.high_watermark,
+                float(snap.get("high_watermark", 0.0) or 0.0))
+            if snap_week == current_week:
+                _risk_state.weekly_realized_pnl = float(snap.get(
+                    "weekly_realized_pnl", 0.0))
+                _risk_state.last_week_id = snap_week
+            if snap_date == str(today):
+                _risk_state.daily_pnl = float(snap.get(
+                    "daily_pnl", _risk_state.daily_pnl))
+                _risk_state.consecutive_losses = int(snap.get(
+                    "consecutive_losses", 0) or 0)
+                _risk_state.consecutive_wins = int(snap.get(
+                    "consecutive_wins", 0) or 0)
+                snapshot_restored = True
     except Exception:
         pass
 
     # Consecutive losses / wins from the time-ordered close sequence.
-    _risk_state.consecutive_losses = 0
-    _risk_state.consecutive_wins = 0
-    for v in ordered_pnls:
-        if v < 0:
-            _risk_state.consecutive_losses += 1
-            _risk_state.consecutive_wins = 0
-        elif v > 0:
-            _risk_state.consecutive_wins += 1
-            _risk_state.consecutive_losses = 0
+    if not snapshot_restored:
+        _risk_state.consecutive_losses = 0
+        _risk_state.consecutive_wins = 0
+        for _, v in sorted(ordered_events, key=lambda item: item[0]):
+            if v < 0:
+                _risk_state.consecutive_losses += 1
+                _risk_state.consecutive_wins = 0
+            elif v > 0:
+                _risk_state.consecutive_wins += 1
+                _risk_state.consecutive_losses = 0
     _check_halt()
     return _risk_state
 
@@ -255,10 +304,11 @@ def on_broker_retry_failed(symbol: str) -> bool:
 
 def _save_equity_snapshot() -> None:
     """Persist equity snapshot for restart watermark recovery."""
+    if __import__("os").environ.get("TRIO_TEST_MODE") == "1":
+        return
     try:
-        from pathlib import Path as _P
         import json as _j
-        snap_path = _P("output/equity_snapshot.json")
+        snap_path = _risk_snapshot_path()
         snap_path.parent.mkdir(parents=True, exist_ok=True)
         snap = {
             "high_watermark": _risk_state.high_watermark,
@@ -266,8 +316,13 @@ def _save_equity_snapshot() -> None:
             "weekly_realized_pnl": _risk_state.weekly_realized_pnl,
             "last_week_id": _risk_state.last_week_id,
             "last_session_date": _risk_state.last_session_date,
+            "snapshot_date": _risk_state.last_session_date,
+            "consecutive_losses": _risk_state.consecutive_losses,
+            "consecutive_wins": _risk_state.consecutive_wins,
         }
-        snap_path.write_text(_j.dumps(snap), encoding="utf-8")
+        tmp = snap_path.with_suffix(snap_path.suffix + ".tmp")
+        tmp.write_text(_j.dumps(snap), encoding="utf-8")
+        tmp.replace(snap_path)
     except Exception:
         pass
 
@@ -284,6 +339,7 @@ def update_pnl(pnl: float) -> None:
         from datetime import datetime, timedelta, timezone as _tz
         IST = _tz(timedelta(hours=5, minutes=30))
         today = datetime.now(IST).strftime("%Y-%m-%d")
+        _risk_state.last_session_date = today
         _risk_state.update_weekly(today, pnl)
     except Exception:
         pass

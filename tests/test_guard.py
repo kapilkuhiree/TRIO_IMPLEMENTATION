@@ -109,6 +109,45 @@ def test_ladder_targets_derived():
     assert ladder_targets(100, 110, "SELL")["T1"] == 92.0
 
 
+def test_ladder_preserves_original_quantity_for_t2_and_counts_partial_once():
+    """T2 is 30% of the entry size, and a partial close is booked once."""
+    from unittest.mock import patch
+    from src.risk_manager import reset_risk_state
+
+    reset_risk_state()
+    t = _paper_trader()
+    t.broker.orders["test_id"] = _order_for("RELIANCE.NS", 90.0, 130.0)
+    t.broker.positions["RELIANCE.NS"] = SimpleNamespace(
+        quantity=10, side="LONG", avg_price=100.0, current_price=100.0,
+        pnl=0.0, pnl_pct=0.0, halved=False)
+    cfg = {"risk_management": {"ladder": {
+        "enabled_phase2": True, "t1_at_r": 0.8, "t2_at_r": 1.5,
+        "t1_fraction": 0.5, "t2_fraction": 0.3,
+        "trailing_after_t2": {"atr_multiplier": 3.0},
+    }}}
+    md = SimpleNamespace(latest_price=109.0, ohlcv=None)
+    with patch("src.paper_trader.fetch_market_data", return_value=md), \
+         patch("src.paper_trader.load_config", return_value=cfg), \
+         patch("src.alerts.send_exit_alert"):
+        t._guard_open_positions()
+
+    assert t.broker.positions["RELIANCE.NS"].quantity == 5
+    assert t.broker.positions["RELIANCE.NS"].booked_pnl == 45.0
+
+    # The next guard sees the preserved original size (10), so T2 closes 3,
+    # not int(5 * 0.3) == 1.
+    md.latest_price = 115.0
+    with patch("src.paper_trader.fetch_market_data", return_value=md), \
+         patch("src.paper_trader.load_config", return_value=cfg), \
+         patch("src.paper_trader.compute_indicators", return_value=SimpleNamespace(
+             indicators={"atr_14": SimpleNamespace(value=1.0)})), \
+         patch("src.alerts.send_exit_alert"):
+        t._guard_open_positions()
+
+    assert t.broker.positions["RELIANCE.NS"].quantity == 2
+    assert t.broker.positions["RELIANCE.NS"].booked_pnl == 90.0
+
+
 # ---------------------------------------------------------------------------
 # Phase 1.1 — ladder / guard regressions (pt_r + tgt NameError fix)
 # ---------------------------------------------------------------------------
@@ -149,7 +188,7 @@ def test_guard_t2_partial_and_trailing():
          patch("src.alerts.send_exit_alert"):
         t._guard_open_positions()               # T2
     assert getattr(pos, "ladder_t2_hit", False) is True
-    assert pos.quantity == 4                    # int(5 * 0.30) = 1 closed
+    assert pos.quantity == 2                    # 3 of original 10 closed
     assert t.broker.orders["test_id"].stop_loss == 110.0  # 116 - 3*2
 
 

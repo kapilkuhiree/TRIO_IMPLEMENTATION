@@ -231,7 +231,7 @@ class MegaBullOptionsBroker(BaseBroker):
             "strategy": strat, "expiry": expiry, "legs": legs,
             "remote_legs": [{"mega_symbol": l["mega_symbol"],
                              "side": l["side"], "lots": l["lots"],
-                             "price": l["price"]}
+                             "price": l["price"], "closed": False}
                             for l in opened],
             "underlying": underlying,
             "net_debit": net, "lots": lots,
@@ -280,16 +280,27 @@ class MegaBullOptionsBroker(BaseBroker):
         remote_ok = True
         if remote:
             for leg in remote:
+                # A previous retry may already have confirmed this leg.  Do
+                # not send a second opposite order for it.
+                if leg.get("closed"):
+                    continue
                 exit_side = "SELL" if leg.get("side") == "BUY" else "BUY"
-                if not self._close_remote(
+                if self._close_remote(
                         leg.get("mega_symbol", ""), exit_side,
                         int(leg.get("lots") or lots),
                         float(mid) or float(leg.get("price") or 0.0),
                         reason):
+                    leg["closed"] = True
+                else:
                     remote_ok = False
-        if remote and not remote_ok:
-            logger.warning("Spread %s partially closed remotely; "
-                           "booking with remote-mid", spread_id)
+        if remote and (not remote_ok or
+                       any(not leg.get("closed") for leg in remote)):
+            # Keep the local spread and its remote-leg state intact.  Booking a
+            # close here would hide an orphaned option leg and make the next
+            # process believe the account is flat when it is not.
+            logger.error("Spread %s close is uncertain; keeping it open for "
+                         "retry", spread_id)
+            return {}
         gross = (float(mid) - debit) * lots * self.lot_size
         # Net of round-trip cost (spec §3), mirroring options_paper and the
         # backtest so the shared digest never mixes gross and net P&L.

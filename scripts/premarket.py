@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.utils import load_env, load_config, utc_now, get_logger  # noqa: E402
 from src.screener import screen, resolve_basket  # noqa: E402
-from src.plan import save_plan, today_ist_str  # noqa: E402
+from src.plan import (save_plan, today_ist_str, next_trading_day_ist_str)  # noqa: E402
 
 load_env()
 logger = get_logger("premarket")
@@ -49,8 +49,33 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     except Exception:
         pass
 
-    candidates = screen(symbols=symbols, timeframe=timeframe, top_n=top_n)
-    cand_dicts = [c.to_dict() for c in candidates]
+    opt_cfg = cfg.get("options", {}) or {}
+    options_on = with_options and bool(opt_cfg.get("enabled", True))
+    options_top_n = int(sc_cfg.get("options_max_candidates", 6) or 6)
+    options_min_rank = float(sc_cfg.get(
+        "options_min_rank", sc_cfg.get("min_rank", 60.0)))
+    options_min_conf = int(sc_cfg.get(
+        "options_min_confidence", sc_cfg.get("min_confidence", 70)) or 0)
+    equity_min_rank = float(sc_cfg.get("min_rank", 60.0))
+    equity_min_conf = int(sc_cfg.get("min_confidence", 70) or 0)
+    scan_top_n = max(int(top_n), options_top_n if options_on else int(top_n))
+    scan_min_rank = min(equity_min_rank,
+                        options_min_rank if options_on else equity_min_rank)
+    scan_min_conf = min(equity_min_conf,
+                        options_min_conf if options_on else equity_min_conf)
+    screened = screen(symbols=symbols, timeframe=timeframe,
+                      top_n=scan_top_n, min_rank=scan_min_rank,
+                      min_confidence=scan_min_conf)
+    equity_candidates = [c for c in screened
+                         if c.rank >= equity_min_rank
+                         and int(getattr(c.signal, "confidence", 0) or 0)
+                         >= equity_min_conf][:int(top_n)]
+    option_candidates = [c for c in screened
+                         if c.rank >= options_min_rank
+                         and int(getattr(c.signal, "confidence", 0) or 0)
+                         >= options_min_conf][:options_top_n] if options_on else []
+    cand_dicts = [c.to_dict() for c in equity_candidates]
+    option_dicts = [c.to_dict() for c in option_candidates]
 
     # Real counters from the screener (fetch/screen failures only). The old
     # formula (`requested - len(candidates)`) reported ~99 "failed" on every
@@ -74,16 +99,14 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         n_actionable = len(cand_dicts)
 
     # Options overlay (shadow until proven): attach legs per candidate.
-    opt_cfg = cfg.get("options", {}) or {}
-    options_on = with_options and bool(opt_cfg.get("enabled", True))
-    if options_on and cand_dicts:
+    if options_on and option_dicts:
         try:
             from src.options_chain import fetch_chain, nearest_expiry
             from src.options_selector import select
             chain = fetch_chain(str(opt_cfg.get("underlying", "NIFTY")))
             if chain is not None:
                 expiry = nearest_expiry(chain) or ""
-                for i, c in enumerate(cand_dicts):
+                for c in option_dicts:
                     try:
                         from src.signal_engine import TradeSignal
                         from src.data_fetcher import fetch_market_data
@@ -138,6 +161,7 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         "min_rank": sc_cfg.get("min_rank", 40.0),
         "min_confidence": sc_cfg.get("min_confidence", 60),
         "candidates": cand_dicts,
+        "option_candidates": option_dicts,
         "executed": False,
         "asset": "equity+options",
     }
@@ -152,7 +176,8 @@ def format_summary(plan: Dict[str, Any], kind: str = "all") -> str:
     lines = [f"*TRIO premarket plan — {plan['date']}{tag}*",
              f"Universe: {plan['universe']} ({plan['scanned']} scanned, {_fail} failed, {plan.get('requested', _req)} requested) "
              f"on {plan['timeframe']}"]
-    cands = plan.get("candidates", []) or []
+    cands = (plan.get("option_candidates", []) or []) if kind == "options" \
+        else (plan.get("candidates", []) or [])
     if kind == "options":
         opts = [c for c in cands if (c.get("option_legs") or {}).get("strategy") not in (None, "", "none")]
         if not opts:
@@ -226,7 +251,9 @@ def main() -> None:
     logger.info("Premarket scan: universe=%s timeframe=%s top_n=%d",
                 universe, args.timeframe, top_n)
     plan = build_plan(universe, args.timeframe, top_n)
-    path = save_plan(plan)
+    # The post-close premarket run belongs to the next valid NSE session.
+    plan["date"] = next_trading_day_ist_str()
+    path = save_plan(plan, date=plan["date"])
     print(f"Plan written: {path}")
     print(format_summary(plan))
 

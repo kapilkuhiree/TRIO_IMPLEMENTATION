@@ -40,6 +40,25 @@ def today_ist_str() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
+def next_trading_day_ist_str(start: Optional[str] = None) -> str:
+    """Return the next NSE session date, skipping weekends and holidays."""
+    from src.utils import load_config
+
+    if start:
+        current = datetime.strptime(str(start), "%Y-%m-%d").date()
+    else:
+        current = datetime.now(IST).date()
+    try:
+        holidays = set(str(x) for x in (load_config().get(
+            "market", {}).get("holidays", []) or []))
+    except Exception:
+        holidays = set()
+    current += timedelta(days=1)
+    while current.weekday() >= 5 or current.isoformat() in holidays:
+        current += timedelta(days=1)
+    return current.isoformat()
+
+
 def plan_path(date: Optional[str] = None, plan_dir: Optional[Path] = None) -> Path:
     """Path to a plan file for a given date (defaults to today IST)."""
     d = plan_dir or PLAN_DIR

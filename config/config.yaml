@@ -15,6 +15,7 @@ general:
 # after any session for a full right/wrong audit.
 logging:
   trade_log: "output/trade_log.jsonl"
+  risk_snapshot: "output/equity_snapshot.json"
 
 # Forward (paper) testing schedule. The loop only trades inside the NSE
 # session below. Daily (1d) scans work on the previous close any time;
@@ -91,6 +92,11 @@ screener:
   max_positions_to_open: 2   # sure-only: 2 parallel positions, not 3
   min_rank: 60.0             # was 40 — filters weak edge
   min_confidence: 70         # was 60 — requires high conviction; yesterday's 3 had 71/71/66 so only top-2 passed
+  # Options may inspect a wider ranked pool without increasing equity entries.
+  # The equity path still executes only max_positions_to_open candidates.
+  options_max_candidates: 6
+  options_min_rank: 60.0
+  options_min_confidence: 70
   # Shadow thresholds (log-only): compare sure-only vs old and extreme
   shadow_thresholds:
     - { name: "legacy_60_40", min_confidence: 60, min_rank: 40 }

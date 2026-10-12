@@ -170,6 +170,22 @@ def test_rebuild_restores_consecutive_losses():
     assert s.consecutive_wins == 0
 
 
+def test_rebuild_orders_close_events_before_restoring_streak():
+    """Ledger input order is not a reliable proxy for close chronology."""
+    from unittest.mock import patch
+    records = [
+        {"pnl": 25.0, "closed_at": "2026-10-10T10:05:00+05:30",
+         "order_id": "later"},
+        {"pnl": -10.0, "closed_at": "2026-10-10T10:00:00+05:30",
+         "order_id": "earlier"},
+    ]
+    with patch("src.risk_manager.load_config", return_value={
+            "risk_management": {"capital": 100000}}):
+        s = rebuild_from_ledger({}, records, today="2026-10-10")
+    assert s.consecutive_wins == 1
+    assert s.consecutive_losses == 0
+
+
 def test_rebuild_ist_mapping_utc():
     from unittest.mock import patch as _p
     import json
@@ -248,6 +264,23 @@ def test_remote_reconcile_keeps_uncertainty_after_rebuild():
     assert result["uncertain"] is True
     assert get_risk_state().halt_active is True
     assert "broker_uncertain" in get_risk_state().halts
+
+
+def test_remote_reconcile_keeps_uncertainty_when_refresh_reports_failure():
+    class _Remote:
+        provider_name = "megabull"
+        positions = {}
+        closed_trades = []
+        _pending_orders = set()
+
+        def refresh_positions(self):
+            return False
+
+    t = _trader()
+    t.broker = _Remote()
+    result = reconcile_broker(t)
+    assert result["uncertain"] is True
+    assert get_risk_state().halts["broker_uncertain"]
 
 
 def test_preflight_fails_closed_when_risk_checks_error():

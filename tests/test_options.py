@@ -382,10 +382,40 @@ def test_megabull_options_rejects_without_network(tmp_path):
     shadows = [r for r in placed if r.get("shadow")]
     assert len(shadows) == 1
     assert len(getattr(trader, "_opt_shadows", [])) == 1
+    assert trader.execute_option_plan(plan, opt_broker=b) == []
     lines = [json.loads(x) for x in
              (tmp_path / "trade_log.jsonl").read_text().splitlines() if x]
     orders = [r for r in lines if r.get("event") == "order"]
     assert any(o.get("asset") == "options" for o in orders)
+
+
+def test_megabull_options_failed_close_keeps_spread_open():
+    """A failed remote leg close must remain retryable, never booked flat."""
+    from src.broker.megabull_options import MegaBullOptionsBroker
+    from src.broker.base import Position
+
+    class _CloseFailMega:
+        positions = {}
+        provider_name = "megabull"
+
+        def close_position(self, *args, **kwargs):
+            return {}
+
+    mega = _CloseFailMega()
+    broker = MegaBullOptionsBroker(mega, lot_size=50)
+    sid = "OPT_long-call_30-Oct-2026_25000x0"
+    broker.positions[sid] = Position(
+        symbol=sid, side="LONG", quantity=1, avg_price=100.0,
+        current_price=100.0)
+    broker.spreads[sid] = {
+        "strategy": "long-call",
+        "remote_legs": [{"mega_symbol": "NIFTY26O3025000CE",
+                          "side": "BUY", "lots": 1, "price": 100.0,
+                          "closed": False}],
+    }
+    assert broker.close_spread(sid, 95.0, "eod-squareoff") == {}
+    assert sid in broker.positions
+    assert broker.closed_trades == []
 
 
 def test_option_plan_idempotent_across_passes(tmp_path):
