@@ -75,8 +75,11 @@ short_shadow:
 # API (MIS intraday; account holds Rs5,00,000 virtual, key in .env as
 # MEGABULL_API_KEY — never paste it here). "paper" keeps the local
 # in-memory simulator (offline default for the test suite).
+#
+# NOTE: the test suite is unaffected — tests/conftest.py pins
+# TRIO_BROKER_PROVIDER=paper, which takes precedence over this value.
 broker:
-  provider: "paper"
+  provider: "megabull"
   base_url: "https://api.megabull.in"
 
 # Screener: scan the basket, rank setups by quality, trade only the best.
