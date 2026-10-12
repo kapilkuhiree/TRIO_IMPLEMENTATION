@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-13",
+  "generated_at": "2026-10-12T12:12:20.564294+00:00",
+  "universe": "nifty100",
+  "timeframe": "1d",
+  "scanned": 100,
+  "requested": 100,
+  "failed": 3,
+  "actionable": 0,
+  "min_rank": 60.0,
+  "min_confidence": 70,
+  "candidates": [],
+  "option_candidates": [],
+  "executed": false,
+  "asset": "equity+options"
+}
