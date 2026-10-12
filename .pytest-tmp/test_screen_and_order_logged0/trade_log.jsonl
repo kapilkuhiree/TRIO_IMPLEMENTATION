@@ -1,2 +1,0 @@
-{"ts": "2026-10-12T04:06:25.202705+00:00", "event": "screen", "mode": "paper", "broker": "paper", "scanned": 1, "candidates": [{"symbol": "RELIANCE.NS", "action": "BUY", "rank": 90.0, "setup": "pullback-long", "confidence": 80}]}
-{"ts": "2026-10-12T04:06:25.204326+00:00", "event": "order", "mode": "paper", "broker": "paper", "symbol": "RELIANCE.NS", "action": "BUY", "entry": 100.0, "stop": 95.0, "target": 107.5, "qty": 10, "rank": 90.0, "setup": "pullback-long", "confidence": 80, "order_id": "paper_2710b198"}

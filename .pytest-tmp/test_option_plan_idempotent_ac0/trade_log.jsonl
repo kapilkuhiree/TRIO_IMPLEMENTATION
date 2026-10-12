@@ -1,1 +1,0 @@
-{"ts": "2026-10-12T04:05:58.324961+00:00", "event": "order", "mode": "paper", "broker": "paper", "symbol": "NIFTY", "asset": "options", "strategy": "long-put", "expiry": "30-Oct-2026", "net_debit": 110.0, "lots": 13, "maxLoss": 5500.0, "maxGain": 0.0, "order_id": "opt_8d287b0d", "rank": 90.0, "setup": "pullback", "venue": "options_paper"}

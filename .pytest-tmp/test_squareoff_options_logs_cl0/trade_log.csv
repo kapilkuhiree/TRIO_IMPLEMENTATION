@@ -1,3 +1,0 @@
-ts,event,mode,broker,asset,strategy,symbol,action,entry,stop,target,qty,rank,setup,confidence,exit,pnl,pnl_pct,reason,result,price,rr,decision,scanned,candidates,positions,session_open
-2026-10-12T04:05:58.355147+00:00,order,paper,paper,options,long-put,NIFTY,,,,,,90.0,pullback,,,,,,,,,,,,,
-2026-10-12T04:05:58.356130+00:00,close,paper,paper,options,long-put,OPT_long-put_30-Oct-2026_25000x0,,112.03,,,,,,,100.0,-7957.0,-10.93,eod-squareoff,FAIL,,,,,,,

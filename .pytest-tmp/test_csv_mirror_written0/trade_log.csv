@@ -1,2 +1,0 @@
-ts,event,mode,broker,asset,strategy,symbol,action,entry,stop,target,qty,rank,setup,confidence,exit,pnl,pnl_pct,reason,result,price,rr,decision,scanned,candidates,positions,session_open
-2026-10-12T04:06:25.254418+00:00,order,paper,paper,,,X,BUY,1.0,,,,,,,,,,,,,,,,,,
