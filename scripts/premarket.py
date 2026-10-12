@@ -41,8 +41,37 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     sc_cfg = cfg.get("screener", {})
     symbols = resolve_basket(universe)
 
+    # Clear any stale counters first: if screen() is patched/mocked it records
+    # nothing, and we must not report a previous scan's numbers.
+    try:
+        from src.screener import reset_last_stats
+        reset_last_stats()
+    except Exception:
+        pass
+
     candidates = screen(symbols=symbols, timeframe=timeframe, top_n=top_n)
     cand_dicts = [c.to_dict() for c in candidates]
+
+    # Real counters from the screener (fetch/screen failures only). The old
+    # formula (`requested - len(candidates)`) reported ~99 "failed" on every
+    # 100-symbol basket because screen() returns only the top-N picks — so a
+    # healthy scan looked like a total data outage in the Telegram summary.
+    try:
+        from src.screener import get_last_stats
+        stats = get_last_stats()
+    except Exception:
+        stats = {}
+    # `scanned` = symbols we attempted (== requested). `failed` = genuine
+    # fetch/screen errors from the screener, NOT "didn't make the top N".
+    n_scanned = len(symbols)
+    if "requested" in stats:
+        n_failed = int(stats.get("failed", 0) or 0)
+        n_actionable = int(stats.get("actionable", len(cand_dicts)) or 0)
+    else:
+        # No stats available (mocked/legacy screen). Assume no fetch failures
+        # rather than inventing a bogus count.
+        n_failed = 0
+        n_actionable = len(cand_dicts)
 
     # Options overlay (shadow until proven): attach legs per candidate.
     opt_cfg = cfg.get("options", {}) or {}
@@ -94,18 +123,18 @@ def build_plan(universe: str, timeframe: str, top_n: int,
             logger.warning("Options overlay unavailable: %s", exc)
 
     # Screener already logs per-symbol failures; surface the same number
-    # here so Telegram/dashboard and the JSON file all agree.
-    # Failed is the gap between requested symbols and the surviving candidates
-    # when both are driven by the same fetch. A later pass will make the
-    # screener return (candidates, stats) and we can copy stats["failed"] here.
+    # here so Telegram/dashboard and the JSON file all agree. `scanned` is
+    # what actually fetched, `actionable` is what cleared confidence+rank,
+    # and `failed` is genuine fetch/screen errors only.
     return {
         "date": today_ist_str(),
         "generated_at": utc_now(),
         "universe": universe,
         "timeframe": timeframe,
-        "scanned": len(symbols),
+        "scanned": n_scanned,
         "requested": len(symbols),
-        "failed": max(0, len(symbols) - len(cand_dicts)),
+        "failed": n_failed,
+        "actionable": n_actionable,
         "min_rank": sc_cfg.get("min_rank", 40.0),
         "min_confidence": sc_cfg.get("min_confidence", 60),
         "candidates": cand_dicts,

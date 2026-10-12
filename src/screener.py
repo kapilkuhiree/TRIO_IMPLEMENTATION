@@ -57,6 +57,49 @@ from src.risk_manager import apply_risk_management
 logger = get_logger("screener")
 
 # ---------------------------------------------------------------------------
+# Last-screen stats
+#
+# screen() returns only the top-N candidates, so callers previously had no
+# way to tell "99 symbols failed to fetch" apart from "99 symbols fetched
+# fine but did not meet the bar". build_plan() assumed the worst and
+# reported `failed = requested - len(candidates)`, which is always ~99
+# whenever top_n < basket size. screen() now records the REAL numbers here
+# so plan/Telegram summaries report true fetch failures.
+#
+# Read it with get_last_stats() immediately after screen() returns.
+# ---------------------------------------------------------------------------
+
+_LAST_STATS: Dict[str, Any] = {}
+
+
+def get_last_stats() -> Dict[str, Any]:
+    """Return the real counters from the most recent screen() call."""
+    return dict(_LAST_STATS)
+
+
+def reset_last_stats() -> None:
+    """Clear the stats buffer.
+
+    Call this before screen() so a stale result from an earlier scan (or a
+    mocked screen() that records nothing) can never be misread as this
+    scan's numbers.
+    """
+    _LAST_STATS.clear()
+
+
+def _record_stats(requested: int, scanned: int, failed: int,
+                  actionable: int, picked: int) -> None:
+    _LAST_STATS.clear()
+    _LAST_STATS.update({
+        "requested": int(requested),
+        "scanned": int(scanned),
+        "failed": int(failed),
+        "actionable": int(actionable),
+        "picked": int(picked),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Baskets (constituent snapshot, Oct 2026; unknown tickers are skipped)
 # ---------------------------------------------------------------------------
 
@@ -340,6 +383,7 @@ def screen(symbols: Optional[List[str]] = None,
                     pass
             scored.sort(key=lambda c: c.rank, reverse=True)
             picked = scored[:top_n]
+            _record_stats(len(symbols), scanned, failed, len(scored), len(picked))
             logger.info("Screen %s %s: %d scanned, %d failed, %d actionable, %d picked",
                         len(symbols), timeframe, scanned, failed, len(scored), len(picked))
             return picked
@@ -392,6 +436,7 @@ def screen(symbols: Optional[List[str]] = None,
     scored.sort(key=lambda c: c.rank, reverse=True)
     picked = scored[:top_n]
 
+    _record_stats(len(symbols), scanned, failed, len(scored), len(picked))
     logger.info("Screen %s %s: %d scanned, %d failed, %d actionable, %d picked",
                 len(symbols), timeframe, scanned, failed,
                 len(scored), len(picked))
