@@ -1,0 +1,1 @@
+{"ts": "2026-10-12T04:06:25.221772+00:00", "event": "close", "mode": "paper", "broker": "paper", "symbol": "RELIANCE.NS", "side": "LONG", "quantity": 10, "entry": 100.0, "exit": 85.0, "pnl": -150.0, "pnl_pct": -15.0, "reason": "stop-hit", "result": "FAIL", "entry_time": "2026-10-12T04:06:25.219961+00:00", "closed_at": "2026-10-12T04:06:25.220591+00:00", "holding_minutes": 0}

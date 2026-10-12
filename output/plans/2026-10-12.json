@@ -1,58 +1,15 @@
 {
   "date": "2026-10-12",
-  "generated_at": "2026-10-11T17:57:28.773394+00:00",
+  "generated_at": "2026-10-12T04:18:00.264349+00:00",
   "universe": "nifty100",
   "timeframe": "1d",
   "scanned": 100,
   "requested": 100,
-  "failed": 99,
+  "failed": 3,
+  "actionable": 0,
   "min_rank": 60.0,
   "min_confidence": 70,
-  "candidates": [
-    {
-      "symbol": "FEDERALBNK.NS",
-      "action": "BUY",
-      "entry_price": 330.0,
-      "stop_loss": 312.97,
-      "target": 355.54,
-      "target_t1": 343.62,
-      "target_t2": 355.54,
-      "target_t3": 372.57,
-      "trailing_stop": false,
-      "position_size": 303,
-      "risk_amount": 5160.09,
-      "risk_reward_ratio": "1:1.5",
-      "confidence": 75,
-      "composite_score": 0.5,
-      "reasoning": [
-        "9/17 technical indicators bullish (tech_score=0.50)",
-        "  sma_9: bullish (value=322.51666937934027)",
-        "  sma_21: bearish (value=330.01190476190476)",
-        "  sma_50: bearish (value=343.25700622558594)",
-        "  sma_200: bullish (value=304.6052809906006)",
-        "  ema_9: bullish (value=324.706883643393)",
-        "  ema_21: bullish (value=329.45129527247286)",
-        "  ema_50: bearish (value=334.5971104463096)",
-        "  ema_200: bullish (value=305.2790612747766)",
-        "  macd: bullish (value=-5.616478666566991)",
-        "  adx_14: bullish (value=54.79984335585072)",
-        "  vwap: bullish (value=242.03715635566599)",
-        "  obv: bullish (value=918584859.0)",
-        "Composite score: 0.5000"
-      ],
-      "risk_check": {
-        "daily_loss_remaining": 25000.0,
-        "open_positions": 0,
-        "max_positions": 5,
-        "halt_active": false
-      },
-      "generated_at": "2026-10-11T17:57:24.601279+00:00",
-      "disclaimer": "Educational only. Not financial advice.",
-      "rank": 231.3,
-      "edge_atr": 2.06,
-      "setup_name": "pullback-long"
-    }
-  ],
+  "candidates": [],
   "executed": false,
   "asset": "equity+options"
 }

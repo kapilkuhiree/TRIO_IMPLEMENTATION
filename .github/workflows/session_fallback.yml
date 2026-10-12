@@ -1,0 +1,86 @@
+name: TRIO session fallback
+
+# WHY THIS EXISTS
+# The primary trigger is the local Windows task "TRIO-Session-Trigger"
+# (trigger_session.ps1 -> `gh workflow run session.yml`) at 09:18 IST,
+# because GitHub's `schedule:` cron is wildly unreliable here:
+#     session   cron 03:40 UTC -> actually started 10:52 UTC (~7h12m late)
+#     premarket cron 10:00 UTC -> actually started 16:42 UTC (~6h43m late)
+# A 7h delay wakes the bot after the 15:00 entry cutoff and the 15:10
+# hard-flat, so it trades nothing.
+#
+# This workflow is the backup for when the PC is off/asleep. It fires at
+# SEVERAL staggered times and dispatches session.yml only if no session run
+# exists for today yet — so it is a no-op whenever the primary trigger
+# (or an earlier fallback tick) already started the session.
+#
+# Cron is UTC: 03:50 / 03:55 / 04:05 / 04:15 UTC = 09:20 / 09:25 / 09:35 /
+# 09:45 IST. Staggering raises the odds that at least one tick lands inside
+# the 09:20-15:00 entry window.
+#
+# Safety: never dispatches after 14:00 IST (entry cutoff), so a badly
+# delayed tick cannot start a pointless all-day job.
+
+on:
+  schedule:
+    - cron: "50 3 * * 1-5"    # 09:20 IST
+    - cron: "55 3 * * 1-5"    # 09:25 IST
+    - cron: "5 4 * * 1-5"     # 09:35 IST
+    - cron: "15 4 * * 1-5"    # 09:45 IST
+  workflow_dispatch:
+
+# Distinct concurrency group: must NOT queue behind the 6h session run
+# that holds the "trio-state" group.
+concurrency:
+  group: trio-fallback
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Dispatch session only if today's session has not started
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          TODAY_UTC=$(date -u +%F)
+          NOW_IST=$(TZ=Asia/Kolkata date +%H:%M)
+          echo "UTC date : $TODAY_UTC"
+          echo "IST time : $NOW_IST"
+
+          # 1. Too late to be useful -> never start a pointless all-day job.
+          if [ "$NOW_IST" \> "14:00" ]; then
+            echo "Past entry cutoff (14:00 IST) - not dispatching."
+            exit 0
+          fi
+
+          # 2. Already started today? (primary Windows task, an earlier
+          #    fallback tick, or cron itself). Then this tick is a no-op.
+          EXISTING=$(gh run list --workflow session.yml --limit 20 \
+                       --json createdAt,status \
+                     | jq -r --arg d "$TODAY_UTC" \
+                       '.[] | select(.createdAt | startswith($d)) | .status' \
+                     | paste -sd, - || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Session already has a run today (status: $EXISTING) - nothing to do."
+            exit 0
+          fi
+
+          # 3. Nothing running today -> start the session.
+          echo "No session run today - dispatching session.yml."
+          if gh workflow run session.yml --ref main; then
+            echo "Dispatched successfully."
+          else
+            echo "Dispatch FAILED (gh exited non-zero)."
+            exit 1
+          fi
