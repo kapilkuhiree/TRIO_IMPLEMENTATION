@@ -103,7 +103,7 @@ screener:
 # taxes and theta all need their own proof AFTER the equity system is proven.
 # Keep options EXPLICIT: set enabled: true only for the options experiment.
 options:
-  enabled: false              # attach option_legs to screened candidates
+  enabled: true              # attach option_legs to screened candidates
   # Which book the index options execute on:
   #   "paper"    -> local options_paper sim (chain-mid fills; legacy)
   #   "megabull" -> MegaBull remote paper so the NIFTY position is VISIBLE

@@ -1,7 +1,7 @@
 # TRIO — Project State
 **Commit:** `f9778a6` (MegaBull state machine + reconciliation + idempotent close + weekly loss + equity snapshots).
-**Tests:** 221 passed (`python -m pytest -q --basetemp ... -p no:randomly`), compile clean.
-**Last update:** 2026-10-11 (Phase 1 Integrity Layer complete).
+**Tests:** 243 passed (`python -m pytest -q --basetemp ... -p no:randomly`), compile clean.
+**Last update:** 2026-10-11 (remote reconciliation hardening + fail-closed preflight).
 
 ## Modes right now
 - **Broker:** `config broker.provider: paper` (local paper default). MegaBull via
@@ -33,6 +33,9 @@ unrealized equity, Sharpe by bars/year, `skipped_bars`. Exact-value tests.
 - Weak test assertions remain (`or True`, `>= 0`) — need exact behavioral checks.
 - Failure-injection suite started (`test_broker_failures.py`: 3 tests); needs
   expansion (partial fill, restart mid-confirmation, corrupt ledger, alert outage).
+- Weekly-loss accounting and equity snapshots are implemented; live broker
+  behavior still needs a remote paper soak test with delayed/partial fills.
+- Risk preflight now fails closed if sector or margin calculations raise.
 - Sector map covers NIFTY 50; unknown symbols → `Unknown` sector.
 - Strategy evidence: Experiment A (long-only local paper) not yet run 60 sessions.
 
