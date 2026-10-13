@@ -77,8 +77,18 @@ def reconcile_broker(trader) -> Dict[str, Any]:
     out: Dict[str, Any] = {"pending": [], "uncertain": False}
     broker = getattr(trader, "broker", None)
     tid = _get_trader_id(trader)
-    is_paper = (getattr(broker, "provider_name", "paper") == "paper")
-    required_consecutive = 1 if is_paper else 2
+    # Detect paper trading mode.
+# The broker's provider_name may be "megabull" even in paper mode,
+# so we check: if the trader is a PaperTrader instance, it's paper trading.
+from src.paper_trader import PaperTrader as _PT
+is_paper = (getattr(broker, "provider_name", "paper") == "paper"
+            or type(trader).__name__ == "PaperTrader")
+if not is_paper:
+    required_consecutive = 2
+else:
+    required_consecutive = 1
+# Start at zero: a remote broker needs two independently successful
+# refreshes before an uncertainty halt may be cleared.
     # Start at zero: a remote broker needs two independently successful
     # refreshes before an uncertainty halt may be cleared.
     state = _refresh_state.setdefault(tid, {"consecutive_successes": 0, "last_empty_at": 0.0})
