@@ -52,8 +52,8 @@ symbols:
   - "BAJFINANCE.NS"
   - "HCLTECH.NS"
 
-# Trading account model. Shorts DISABLED by default for production
-# validation (long-only equity first). Evidence ladder:
+# Trading account model. Shorts ENABLED for wider scan (see: allow_shorts: true).
+# Evidence ladder:
 #   A. long-only equity, local paper   <- VALIDATE FIRST
 #   B. short-only equity               <- needs multi-regime + swaps/lots of trades
 #   C. long+short, D. MegaBull equity, E. options, F/G. ladder phases, H. live rescans
@@ -62,7 +62,7 @@ symbols:
 # CNC/delivery accounts CANNOT short: the paper loop still clips/skips SELL
 # without holdings (see settlement tests).
 trading:
-  allow_shorts: false
+  allow_shorts: true
 
 # Short-shadow validation: when only=true, day_session replay *skips*
 # SELL entries (records them as short-shadow intent in the debug ledger)
