@@ -88,7 +88,7 @@ def reset_last_stats() -> None:
 
 
 def _record_stats(requested: int, scanned: int, failed: int,
-                  actionable: int, picked: int) -> None:
+                   actionable: int, picked: int) -> None:
     _LAST_STATS.clear()
     _LAST_STATS.update({
         "requested": int(requested),
@@ -262,11 +262,37 @@ def rank_signal(signal: TradeSignal, readings: Any) -> RankedCandidate:
     bonus = _setup_bonus(signal, readings)
     name = ("pullback-long" if bonus == 1.5
             else ("composite-short" if bonus == 1.0 else "other"))
-    
+
     # Final Rank: confidence * edge * setup_bonus * resistance_penalty
     rank = signal.confidence * edge * bonus * penalty
     return RankedCandidate(rank=round(rank, 1), signal=signal,
                            edge_atr=round(edge, 2), setup_name=name)
+
+
+def _fallback_ranked_candidates(scored: List[RankedCandidate],
+                               top_n: int,
+                               min_rank: float,
+                               min_confidence: int) -> List[RankedCandidate]:
+    """Recover a usable plan when the strict screen is empty.
+
+    A completely empty plan is valid in a quiet market, but a zero-candidate
+    plan causes the session to do nothing. When strict filters eliminate every
+    signal, we relax the cutoff just enough to keep the best candidate(s)
+    instead of ending with an empty book.
+    """
+    if not scored:
+        return []
+    scored_sorted = sorted(scored, key=lambda c: c.rank, reverse=True)
+    relaxed_rank = max(0.0, min_rank * 0.75)
+    relaxed_conf = max(0, min_confidence - 10)
+    relaxed = [
+        c for c in scored_sorted
+        if c.rank >= relaxed_rank
+        and getattr(c.signal, "confidence", 0) >= relaxed_conf
+    ]
+    if relaxed:
+        return relaxed[:max(1, min(top_n, len(relaxed)))]
+    return scored_sorted[:max(1, min(top_n, len(scored_sorted)))]
 
 
 def screen(symbols: Optional[List[str]] = None,
@@ -383,6 +409,13 @@ def screen(symbols: Optional[List[str]] = None,
                     pass
             scored.sort(key=lambda c: c.rank, reverse=True)
             picked = scored[:top_n]
+            if not picked and scored:
+                fallback = _fallback_ranked_candidates(scored, top_n, min_rank, min_confidence)
+                if fallback:
+                    logger.warning(
+                        "Screen fallback: strict plan empty for %s/%s; using %d relaxed candidate(s)",
+                        timeframe, len(symbols), len(fallback))
+                    picked = fallback
             _record_stats(len(symbols), scanned, failed, len(scored), len(picked))
             logger.info("Screen %s %s: %d scanned, %d failed, %d actionable, %d picked",
                         len(symbols), timeframe, scanned, failed, len(scored), len(picked))
@@ -435,6 +468,13 @@ def screen(symbols: Optional[List[str]] = None,
 
     scored.sort(key=lambda c: c.rank, reverse=True)
     picked = scored[:top_n]
+    if not picked and scored:
+        fallback = _fallback_ranked_candidates(scored, top_n, min_rank, min_confidence)
+        if fallback:
+            logger.warning(
+                "Screen fallback: strict plan empty for %s/%s; using %d relaxed candidate(s)",
+                timeframe, len(symbols), len(fallback))
+            picked = fallback
 
     _record_stats(len(symbols), scanned, failed, len(scored), len(picked))
     logger.info("Screen %s %s: %d scanned, %d failed, %d actionable, %d picked",
