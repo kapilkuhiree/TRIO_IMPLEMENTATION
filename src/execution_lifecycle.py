@@ -264,9 +264,9 @@ def preflight(trader, candidate: Dict[str, Any],
         return False, "sector-check-failed"
 
     try:
-        bal = (broker.get_balance(strict=True)
+        bal = (broker.get_balance()
                if getattr(broker, "provider_name", "") == "megabull"
-               else broker.get_balance()) if broker is not None else {}
+               else broker.get_balance(strict=True)) if broker is not None else {}
         if float(bal.get("available", 1)) <= 0:
             return False, "margin-exhausted"
     except Exception as exc:
