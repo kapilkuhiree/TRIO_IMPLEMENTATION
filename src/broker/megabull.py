@@ -1,1 +1,691 @@
-<full file content_placeholder>
+"""
+TRIO — MegaBull Paper Trading Broker Adapter
+
+Executes TRIO signals on MegaBull's free paper-trading REST API
+(base https://api.megabull.in, auth header `api-key`).
+
+- Auth:   ``MEGABULL_API_KEY`` env var (never in code or committed config).
+- Orders: POST /api/order/buysell, duration MIS (intraday; allows
+  short-first entries), orderTypes LIMIT / MKT / SL.
+- Exits:  opposite MIS order (no OCO/bracket exists); the caller loop
+  (guard/stops/targets/EOD square-off) drives them, exactly like the
+  local paper broker.
+- P&L:    authoritative on MegaBull's side (`/api/user/my` virtualMoney
+  + `/api/position/my` open P&L); every local close is also appended to
+  `closed_trades` with PASS/FAIL and fires the Telegram exit alert so the
+  dashboard and alerts behave identically across providers.
+
+Fail-closed: any network/parse error returns a REJECTED BrokerOrder with
+a clear message, and the caller falls back to skipping the trade — a
+remote outage never crashes the trading loop.
+
+DISCLAIMER: Educational purposes only. Not financial advice.
+"""
+
+import csv
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+import requests
+
+from src.broker.base import BaseBroker, BrokerOrder, Position
+from src.utils import get_logger, utc_now
+
+logger = get_logger("broker.megabull")
+
+BASE_URL = "https://api.megabull.in"
+DURATION = "MIS"  # intraday product: short selling allowed
+TIMEOUT = 15
+RETRIES = 2
+
+
+# Statuses
+STATUS_SUBMITTED = "SUBMITTED"
+STATUS_PENDING = "PENDING"
+STATUS_FILLED = "FILLED"
+STATUS_REJECTED = "REJECTED"
+STATUS_UNKNOWN = "UNKNOWN"
+
+
+class MegaBullBroker(BaseBroker):
+    """Paper fills executed remotely on the MegaBull simulator."""
+
+    provider_name = "megabull"
+
+    def __init__(
+        self,
+        api_key: str = "",
+        initial_capital: float = 500000.0,
+        base_url: str = BASE_URL,
+        instrument_cache: Optional[Path] = None,
+        session: Optional["requests.Session"] = None,
+        state_path: Optional[Path] = None,
+    ):
+        self.api_key = (api_key or "").strip()
+        self.initial_capital = initial_capital
+        self.capital = initial_capital  # local mirror; authoritative on their end
+        self.state_path = Path(state_path) if state_path is not None else None
+        if self.state_path is not None:
+            try:
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        # Set on the first 401: skips all further network calls until the
+        # key is fixed and the process restarts (auth failures are permanent
+        # for the lifetime of a bad key — don't burn scan time on retries).
+        self._auth_failed = False
+        self.base_url = base_url.rstrip("/")
+        self.orders: Dict[str, BrokerOrder] = {}
+        self.positions: Dict[str, Position] = {}
+        self.closed_trades: List[Dict[str, Any]] = []
+        self._pending_orders: Set[str] = set()  # remote LIMIT accepted, not yet confirmed
+        self._tokens: Dict[str, str] = {}  # TRADINGSYMBOL -> instrumentToken
+        self._name_map_cache: Optional[Dict[str, str]] = None  # instName -> sym
+        self._session = session or _QuietSession()
+        default_cache = Path("output") / "instruments_cache.csv"
+        self.instrument_cache = instrument_cache or default_cache
+        if not self.api_key:
+            logger.warning("MegaBullBroker created WITHOUT an API key — "
+                           "all orders will be rejected.")
+        logger.info("MegaBull broker initialized (base=%s)", self.base_url)
+
+    # ------------------------------------------------------------------
+    # low-level HTTP
+    # ------------------------------------------------------------------
+
+    def _headers(self) -> Dict[str, str]:
+        return {"api-key": self.api_key, "Content-Type": "application/json"}
+
+    def _get(self, path: str) -> Any:
+        url = f"{self.base_url}{path}"
+        last: Exception = RuntimeError("unreachable")
+        for i in range(RETRIES + 1):
+            try:
+                resp = self._session.get(url, headers=self._headers(),
+                                        timeout=TIMEOUT)
+                if resp.status_code == 401:
+                    self._auth_failed = True
+                    raise PermissionError("MegaBull 401: bad/expired api-key")
+                resp.raise_for_status()
+                return resp.json()
+            except PermissionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry then surface
+                last = exc
+                logger.warning("GET %s failed (attempt %d): %s", path, i + 1, exc)
+                time.sleep(1 + i)
+        raise last
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        url = f"{self.base_url}{path}"
+        last: Exception = RuntimeError("unreachable")
+        for i in range(RETRIES + 1):
+            try:
+                resp = self._session.post(url, headers=self._headers(),
+                                        json=body, timeout=TIMEOUT)
+                if resp.status_code == 401:
+                    self._auth_failed = True
+                    raise PermissionError("MegaBull 401: bad/expired api-key")
+                resp.raise_for_status()
+                return resp.json()
+            except PermissionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry then surface
+                last = exc
+                logger.warning("POST %s failed (attempt %d): %s", path, i + 1, exc)
+                time.sleep(1 + i)
+        raise last
+
+    # ------------------------------------------------------------------
+    # symbol <-> instrument token
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def to_trading_symbol(symbol: str) -> str:
+        """TRIO uses 'ONGC.NS'; MegaBull uses 'ONGC' (incl. 'M&M')."""
+        return symbol.replace(".NS", "").replace(".BO", "").strip().upper()
+
+    def _last_print(self, symbol: str) -> float:
+        """Best known print for required-price fields.
+
+        Prefers the mirrored position's mark (the sim's own feed price);
+        falls back to the most recent local order price; 0.0 only when
+        nothing is known (caller rejects before sending).
+        """
+        pos = self.positions.get(symbol)
+        if pos is not None and pos.current_price:
+            return float(pos.current_price)
+        prices = [o.price for o in self.orders.values()
+                  if getattr(o, "symbol", "") == symbol
+                  and (getattr(o, "price", 0) or 0) > 0]
+        return float(prices[-1]) if prices else 0.0
+
+    def token_for(self, symbol: str) -> str:
+        """Resolve the MegaBull instrument token, refreshing the CSV cache."""
+        tsym = self.to_trading_symbol(symbol)
+        if tsym in self._tokens:
+            return self._tokens[tsym]
+        if self.instrument_cache.exists():
+            try:
+                with open(self.instrument_cache, encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        if (row.get("tradingSymbol") or "").upper() == tsym:
+                            self._tokens[tsym] = row.get("instrumentToken", "")
+                            return self._tokens[tsym]
+            except (OSError, UnicodeDecodeError) as exc:
+                logger.warning("Instrument cache unreadable (%s), refetching", exc)
+        if getattr(self, "_auth_failed", False):
+            raise PermissionError(
+                "MegaBull 401: bad/expired api-key (cached list unavailable)")
+        logger.info("Refreshing MegaBull instrument list for %s ...", tsym)
+        info = self._get("/api/marketwatch/instruments")
+        url = (info or {}).get("downloadUrl", "")
+        if not url:
+            raise RuntimeError("MegaBull instruments: no downloadUrl")
+        resp = self._session.get(url, timeout=60)
+        resp.raise_for_status()
+        text = resp.text if isinstance(resp.text, str) else resp.content.decode()
+        self.instrument_cache.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.instrument_cache, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        for row in csv.DictReader(text.splitlines()):
+            key = (row.get("tradingSymbol") or "").upper()
+            tok = row.get("instrumentToken", "")
+            if key and tok:
+                self._tokens[key] = tok
+        if tsym not in self._tokens:
+            raise KeyError(f"No MegaBull instrument for {symbol} ({tsym})")
+        return self._tokens[tsym]
+
+    # ------------------------------------------------------------------
+    # BaseBroker interface
+    # ------------------------------------------------------------------
+
+    def _reject(self, symbol: str, side: str, quantity: int, price: float,
+                error: str, order_type: str = "LIMIT") -> BrokerOrder:
+        order = BrokerOrder(
+            order_id=f"megabull_rej_{int(time.time() * 1000)}",
+            symbol=symbol, side=side, quantity=quantity,
+            order_type=order_type, price=price,
+            status=STATUS_REJECTED, broker="megabull",
+            placed_at=utc_now(), error=error,
+        )
+        logger.warning("MegaBull REJECT %s %d x %s: %s", side, quantity,
+                       symbol, error)
+        return order
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str = "LIMIT",
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        target: Optional[float] = None,
+        reason: str = "order",
+    ) -> BrokerOrder:
+        """Send a MIS order to the MegaBull simulator.
+
+        State lifecycle: SUBMITTED -> PENDING -> FILLED | REJECTED | UNKNOWN
+        """
+        if not self.api_key:
+            return self._reject(symbol, side, quantity, price or 0.0,
+                                "MEGABULL_API_KEY missing")
+        try:
+            token = self.token_for(symbol)
+        except Exception as exc:  # noqa: BLE001 - surfaced as REJECTED
+            return self._reject(symbol, side, quantity, price or 0.0,
+                                f"instrument resolution failed: {exc}")
+
+        otype = (order_type or "LIMIT").upper()
+        if otype == "MARKET":
+            otype = "MKT"
+        body: Dict[str, Any] = {
+            "instrumentToken": str(token),
+            "qty": int(quantity),
+            "type": side.upper(),
+            "duration": DURATION,
+            "orderType": otype,
+        }
+        if otype == "MKT" and not price:
+            price = self._last_print(symbol)
+        if otype == "LIMIT":
+            if not price:
+                return self._reject(symbol, side, quantity, 0.0,
+                                    "LIMIT order needs a price", otype)
+            body["price"] = float(price)
+        elif otype == "MKT":
+            body["price"] = float(price)
+        elif otype == "SL":
+            trig = stop_loss or price
+            if not trig:
+                return self._reject(symbol, side, quantity, 0.0,
+                                    "SL order needs a trigger price", otype)
+            body["triggerPrice"] = float(trig)
+            if price:
+                body["price"] = float(price)
+
+        placed_at = utc_now()
+        temp_id = f"megabull_{int(time.time() * 1000)}"
+        order = BrokerOrder(
+            order_id=temp_id,
+            symbol=symbol, side=side.upper(), quantity=int(quantity),
+            order_type=otype, price=float(price or 0.0),
+            stop_loss=stop_loss or 0.0, target=target or 0.0,
+            status=STATUS_SUBMITTED, broker="megabull",
+            placed_at=placed_at, filled_at="",
+        )
+        self.orders[order.order_id] = order
+
+        try:
+            data = self._post("/api/order/buysell", body)
+        except Exception as exc:  # noqa: BLE001 - fail-closed
+            order.status = STATUS_REJECTED
+            order.error = f"order API failed: {exc}"
+            return order
+
+        remote_id = str((data or {}).get("id", ""))
+        final_id = f"megabull_{remote_id or temp_id.split('_')[-1]}"
+        if final_id != temp_id:
+            self.orders.pop(temp_id, None)
+            order.order_id = final_id
+            self.orders[final_id] = order
+
+        confirmed = False
+        try:
+            _probe = BrokerOrder(
+                order_id=final_id,
+                symbol=symbol, side=side.upper(), quantity=int(quantity),
+                order_type=otype, price=float(price or 0.0),
+                stop_loss=stop_loss or 0.0, target=target or 0.0,
+                status=STATUS_FILLED, broker="megabull",
+                placed_at=placed_at, filled_at=placed_at,
+            )
+            confirmed = self._fill_confirmed(_probe)
+        except Exception:
+            confirmed = False
+
+        row_status = ""
+        try:
+            row = self._order_row(remote_id) if remote_id else None
+            row_status = str((row or {}).get("status", "")).upper()
+        except Exception:
+            row_status = ""
+
+        if confirmed:
+            order.status = STATUS_FILLED
+            order.filled_at = placed_at
+            self._seed_mirror_from_order(symbol, side.upper(),
+                                        int(quantity), float(price or 0.0))
+        elif row_status in ("PENDING", "PLACED", "ACCEPTED", "QUEUED", "OPEN"):
+            order.status = STATUS_PENDING
+            order.filled_at = ""
+            self._pending_orders.add(order.order_id)
+        elif not row_status and remote_id:
+            order.status = STATUS_UNKNOWN
+            order.filled_at = ""
+            order.error = "Remote order not visible in order book after submission"
+            self._pending_orders.add(order.order_id)
+        else:
+            order.status = STATUS_UNKNOWN
+            order.filled_at = ""
+            order.error = "Ambiguous remote state"
+            self._pending_orders.add(order.order_id)
+
+        logger.info("MegaBull order %s (remote %s, row=%s, confirmed=%s): "
+                    "%s %d x %s -> %s (reason=%s)",
+                    order.order_id, remote_id, row_status or "?",
+                    confirmed, order.side, quantity, symbol,
+                    order.status, reason)
+
+        self.refresh_positions()
+        pos = self.positions.get(symbol)
+        logger.info("Post-order mirror for %s: %s",
+                    symbol, (pos.side, pos.quantity, pos.avg_price)
+                    if pos else None)
+        return order
+
+    def _order_row(self, remote_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one order row by remote id, searching open + executed."""
+        try:
+            data = self._get("/api/order/my") or {}
+        except Exception as exc:  # noqa: BLE001 - caller decides
+            logger.warning("Order lookup failed: %s", exc)
+            return None
+        for o in (data.get("open", []) or []) + \
+                (data.get("executed", []) or []):
+            if str(o.get("id", "")) == str(remote_id):
+                return o
+        return None
+
+    def _remote_id(self, order: BrokerOrder) -> str:
+        return str(order.order_id).split("megabull_")[-1]
+
+    def _fill_confirmed(self, order: BrokerOrder) -> bool:
+        row = self._order_row(self._remote_id(order))
+        if row is not None:
+            return str(row.get("status", "")).upper() in (
+                "COMPLETE", "EXECUTED", "FILLED")
+        if str(getattr(order, "order_type", "")).upper() not in ("MKT", "MARKET"):
+            return False
+        self.refresh_positions()
+        pos = self.positions.get(order.symbol)
+        return pos is not None and pos.quantity > 0
+
+    def _exit_confirmed(self, order: BrokerOrder, symbol: str,
+                        qty: int) -> bool:
+        want = self._remote_id(order)
+        for attempt in range(4):
+            rows: List[Dict[str, Any]] = []
+            try:
+                data = self._get("/api/order/my") or {}
+                rows = (data.get("open", []) or []) + \
+                    (data.get("executed", []) or [])
+            except Exception as exc:  # noqa: BLE001 - retry, then unsafe
+                logger.warning("Exit confirmation check failed: %s", exc)
+            else:
+                for o in rows:
+                    if str(o.get("id", "")) == want and \
+                            str(o.get("status", "")).upper() in (
+                                "COMPLETE", "EXECUTED", "FILLED"):
+                        return True
+            self.refresh_positions()
+            pos = self.positions.get(symbol)
+            if pos is None or pos.quantity <= 0:
+                return True
+            time.sleep(2 + attempt * 2)
+        logger.warning("Exit unconfirmed for %s after retries "
+                       "(remote still shows %s)", symbol,
+                       self.positions.get(symbol))
+        return False
+
+    def _mirror_key(self, symbol: str) -> str:
+        tsym = self.to_trading_symbol(symbol)
+        return f"{tsym}.NS" if tsym else str(symbol or "")
+
+    def _name_map(self) -> Dict[str, str]:
+        if self._name_map_cache is not None:
+            return self._name_map_cache
+        out: Dict[str, str] = {}
+        try:
+            if self.instrument_cache.exists():
+                with open(self.instrument_cache, encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        nm = (row.get("instrumentName") or "").strip().upper()
+                        ts = (row.get("tradingSymbol") or "").strip()
+                        if nm and ts:
+                            out.setdefault(nm, ts)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Instrument name map unreadable (%s)", exc)
+        self._name_map_cache = out
+        return out
+
+    def _resolve_symbol(self, item: Dict[str, Any],
+                        token_to_symbol: Dict[str, str]) -> str:
+        tsym = str(item.get("tradingSymbol", "") or "").strip()
+        if tsym:
+            return tsym
+        tok = str(item.get("instrumentToken", "") or "").strip()
+        if tok and tok in token_to_symbol:
+            return token_to_symbol[tok]
+        nm = str(item.get("instrumentName", "") or "").strip().upper()
+        if nm:
+            hit = self._name_map().get(nm)
+            if hit:
+                return hit
+        return str(item.get("instrumentName", "") or "").strip()
+
+    def _seed_mirror_from_order(self, symbol: str, side: str,
+                                quantity: int, price: float) -> None:
+        if symbol in self.positions:
+            pos = self.positions[symbol]
+            if ((side == "BUY" and pos.side == "SHORT")
+                    or (side == "SELL" and pos.side == "LONG")):
+                pos.quantity = max(pos.quantity, quantity)
+                if price:
+                    pos.current_price = price
+            return
+        key = self._mirror_key(symbol)
+        self.positions[key] = Position(
+            symbol=key,
+            side="SHORT" if side == "SELL" else "LONG",
+            quantity=quantity, avg_price=price or 0.0,
+            current_price=price or 0.0,
+        )
+
+    def poll_pending(self, symbol: Optional[str] = None) -> None:
+        pend = list(getattr(self, "_pending_orders", set()) or set())
+        if not pend:
+            return
+        for oid in pend:
+            try:
+                remote = str(oid).split("megabull_")[-1]
+                row = self._order_row(remote)
+                status = str((row or {}).get("status", "")).upper() if row else ""
+                o = self.orders.get(oid)
+                if o is None:
+                    self._pending_orders.discard(oid)
+                    continue
+
+                if status in ("COMPLETE", "EXECUTED", "FILLED"):
+                    o.status = STATUS_FILLED
+                    o.filled_at = o.placed_at
+                    self._pending_orders.discard(oid)
+                    self._seed_mirror_from_order(
+                        o.symbol, o.side, int(o.quantity),
+                        float(o.price or 0.0))
+                elif status in ("REJECTED", "CANCELLED", "FAILED"):
+                    o.status = STATUS_REJECTED
+                    o.error = f"remote status {status}"
+                    self._pending_orders.discard(oid)
+                elif status in ("PENDING", "PLACED", "ACCEPTED", "QUEUED", "OPEN"):
+                    if o.status == STATUS_UNKNOWN:
+                        o.status = STATUS_PENDING
+                        o.error = ""
+            except Exception as exc:
+                logger.warning("poll_pending %s failed: %s", oid, exc)
+
+    def refresh_positions(self) -> bool:
+        try:
+            self.poll_pending()  # type: ignore
+        except Exception:
+            pass
+        if getattr(self, "_auth_failed", False):
+            return False
+        try:
+            data = self._get("/api/position/my")
+        except Exception as exc:  # noqa: BLE001 - mirror may go stale
+            logger.warning("Position refresh failed: %s", exc)
+            return False
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and "value" in data and isinstance(data["value"], list):
+            items = data["value"]
+        else:
+            logger.warning("Position refresh: unrecognized response shape — stale, not flat")
+            return False
+        fresh: Dict[str, Position] = {}
+        token_to_symbol = {v: k for k, v in self._tokens.items()}
+        for it in items or []:
+            try:
+                qty = int(float(it.get("qty", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if qty == 0:
+                continue
+            side_txt = str(it.get("type", "")).upper()
+            if side_txt.startswith(("SELL", "SHORT")):
+                is_short = True
+            elif side_txt.startswith("BUY"):
+                is_short = qty < 0
+            else:
+                is_short = qty < 0
+            tsym = self._resolve_symbol(it, token_to_symbol)
+            symbol = (f"{tsym}.NS" if tsym and not tsym.endswith((".NS", " 50", " BANK"))
+                      else tsym)
+            try:
+                avg = float(it.get("priceAvg") or it.get("avgBuyPrice") or 0.0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            try:
+                pnl = float(it.get("pl", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            fresh[symbol] = Position(
+                symbol=symbol, side="SHORT" if is_short else "LONG",
+                quantity=abs(qty), avg_price=avg, current_price=avg,
+                pnl=pnl,
+                pnl_pct=(pnl / (avg * abs(qty)) * 100) if avg and qty else 0.0,
+            )
+        self.positions = fresh
+        return True
+
+    def close_position(self, symbol: str, price: float,
+                       reason: str = "close",
+                       fraction: float = 1.0) -> Dict[str, Any]:
+        before = self.positions.get(symbol)
+        self.refresh_positions()
+        key = self._mirror_key(symbol)
+        if before is None and key != symbol:
+            before = self.positions.get(key)
+        live = self.positions.get(symbol) or self.positions.get(key)
+        if live is not None and live.quantity > 0:
+            pos = live
+        else:
+            pos = before if before is not None and before.quantity > 0 else None
+            if pos is not None:
+                self.positions[key] = pos
+        if pos is None or pos.quantity <= 0:
+            return {}
+        qty = int(pos.quantity * fraction)
+        if qty <= 0:
+            return {}
+        entry = pos.avg_price
+        opp = "BUY" if pos.side == "SHORT" else "SELL"
+        order = self.place_order(symbol, opp, qty, order_type="MKT",
+                                price=price, reason=reason)
+        if order.status != "FILLED":
+            logger.warning("Close failed for %s: %s", symbol, order.error)
+            return {}
+        if not self._exit_confirmed(order, symbol, qty):
+            logger.warning("Close unconfirmed for %s (remote id %s) — keeping position open",
+                           symbol, order.order_id)
+            return {}
+        pnl = ((price - entry) if pos.side == "LONG" else (entry - price)) * qty
+        from src.utils import minutes_between
+
+        closed_at = utc_now()
+        entry_times = [getattr(o, "placed_at", "") for o in self.orders.values()
+                       if getattr(o, "symbol", "") == symbol
+                       and getattr(o, "status", "") == "FILLED"
+                       and getattr(o, "placed_at", "")]
+        entry_at = min(entry_times) if entry_times else ""
+        record = {
+            "symbol": symbol, "side": pos.side, "quantity": qty,
+            "entry": round(entry, 2), "exit": round(price, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / (entry * qty) * 100, 2)
+            if entry and qty else 0.0,
+            "reason": reason,
+            "result": "PASS" if pnl > 0 else "FAIL",
+            "entry_time": entry_at,
+            "closed_at": closed_at,
+            "holding_minutes": minutes_between(entry_at, closed_at),
+            "order_id": order.order_id,
+        }
+        self.closed_trades.append(record)
+        try:
+            from src.alerts import send_exit_alert
+            send_exit_alert(record)
+        except Exception as exc:  # noqa: BLE001 - alerts never break closes
+            logger.warning("Exit alert failed for %s: %s", symbol, exc)
+        self.refresh_positions()
+        return record
+
+    def get_positions(self) -> List[Position]:
+        self.refresh_positions()
+        return list(self.positions.values())
+
+    def get_balance(self) -> Dict[str, float]:
+        if getattr(self, "_auth_failed", False):
+            return {"total": self.capital, "available": self.capital,
+                    "used_margin": 0.0}
+        try:
+            user = self._get("/api/user/my") or {}
+            positions = self._get("/api/position/my") or {}
+            if isinstance(positions, list):
+                items = positions
+            else:
+                items = positions.get("value", [])
+            open_pnl = sum(float(it.get("pl", 0.0) or 0.0) for it in items or [])
+            vm = float(user.get("virtualMoney", self.initial_capital))
+            left = user.get("virtualMoneyLeft")
+            blocked = float(user.get("virtualMoneyBlocked", 0.0) or 0.0)
+            total = vm + open_pnl
+            if blocked <= 0 and items:
+                blocked = sum(
+                    abs(float(it.get("priceAvg", 0.0) or 0.0))
+                    * abs(int(it.get("qty", 0) or 0))
+                    for it in items)
+            available = float(left) if left is not None else (total - blocked)
+            return {"total": total, "available": available,
+                    "used_margin": blocked}
+        except Exception as exc:  # noqa: BLE001 - dashboard must not die
+            logger.warning("Balance fetch failed, using local mirror: %s", exc)
+            return {"total": self.capital, "available": self.capital,
+                    "used_margin": 0.0}
+
+    def cancel_order(self, order_id: str) -> BrokerOrder:
+        return BrokerOrder(order_id=order_id, status="NOT_FOUND",
+                           broker="megabull", error="cancel via web UI")
+
+    def update_position(self, symbol: str, current_price: float) -> None:
+        pos = self.positions.get(symbol)
+        if pos is None or not current_price:
+            return
+        pos.current_price = current_price
+        if pos.side == "LONG":
+            pos.pnl = (current_price - pos.avg_price) * pos.quantity
+        else:
+            pos.pnl = (pos.avg_price - current_price) * pos.quantity
+        if pos.avg_price > 0 and pos.quantity:
+            pos.pnl_pct = (pos.pnl / (pos.avg_price * pos.quantity)) * 100
+
+    def get_order_status(self, order_id: str) -> BrokerOrder:
+        if order_id in self.orders:
+            return self.orders[order_id]
+        return BrokerOrder(order_id=order_id, status="NOT_FOUND",
+                           broker="megabull", error="Order not found")
+
+
+class _QuietSession:
+    """Thin wrapper so tests can inject a fake without importing requests."""
+
+    def __init__(self) -> None:
+        self._s = requests.Session()
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self._s.get(url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        return self._s.post(url, **kwargs)
+
+    def put(self, url: str, **kwargs: Any) -> Any:
+        return self._s.put(url, **kwargs)
+
+
+def load_dotenv_key(name: str, env_path: Optional[Path] = None) -> str:
+    """Read one key from the local .env without extra dependencies."""
+    path = env_path or Path(".env")
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:  # noqa: BLE001 - missing .env is not fatal
+        logging.getLogger("broker.megabull").debug(".env not readable")
+    return ""
