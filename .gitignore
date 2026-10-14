@@ -50,6 +50,8 @@ output/*
 !output/equity_snapshot.json
 !output/runtime/
 !output/runtime/*.json
+!output/chain_diagnostics/
+!output/chain_diagnostics/*.json
 output/plans/*
 !output/plans/*.json
 

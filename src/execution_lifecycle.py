@@ -22,7 +22,9 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 """
 from __future__ import annotations
 
+import math
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils import get_logger, load_config
@@ -40,6 +42,29 @@ _refresh_state: Dict[int, Dict[str, Any]] = {}
 # Map of (trader_id, symbol, order_id/close_key) -> timestamp
 _processed_closes: Dict[Tuple[int, str, str], float] = {}
 _IDEMPOTENCY_TTL = 86400  # 24 hours
+
+
+def validate_available_balance(balance: Any) -> Tuple[Optional[float], str]:
+    """Validate an adapter balance without exposing its payload.
+
+    Returns ``(available, "")`` for a finite numeric value, including a
+    numeric string. Invalid schemas and values return ``margin-check-failed``;
+    finite non-positive values return ``margin-exhausted``.
+    """
+    if not isinstance(balance, Mapping) or "available" not in balance:
+        return None, "margin-check-failed"
+    raw_available = balance["available"]
+    if isinstance(raw_available, bool):
+        return None, "margin-check-failed"
+    try:
+        available = float(raw_available)
+    except (TypeError, ValueError, OverflowError):
+        return None, "margin-check-failed"
+    if not math.isfinite(available):
+        return None, "margin-check-failed"
+    if available <= 0:
+        return available, "margin-exhausted"
+    return available, ""
 
 
 def _get_trader_id(trader) -> int:
@@ -268,14 +293,17 @@ def preflight(trader, candidate: Dict[str, Any],
         return False, "sector-check-failed"
 
     try:
-        bal = (broker.get_balance()
-               if getattr(broker, "provider_name", "") == "megabull"
-               else broker.get_balance(strict=True)) if broker is not None else {}
-        if float(bal.get("available", 1)) <= 0:
-            return False, "margin-exhausted"
-    except Exception as exc:
+        # BaseBroker.get_balance() has no ``strict`` keyword.  Keep the
+        # preflight portable across the local paper broker and remote
+        # adapters; an invalid balance response is still rejected below.
+        bal = broker.get_balance() if broker is not None else None
+        _, margin_reason = validate_available_balance(bal)
+        if margin_reason:
+            return False, margin_reason
+    except Exception:
         # Unknown available margin is unsafe; fail closed rather than submit.
-        logger.error("margin preflight failed for %s: %s", sym, exc)
+        # Adapter exception text may contain a response body or credentials.
+        logger.error("margin preflight failed for %s", sym)
         return False, "margin-check-failed"
     return True, ""
 

@@ -184,12 +184,27 @@ def main() -> None:
         from src.alerts import send_telegram
         _cand_lines = []
         _opt_lines = []
+        _opt_rejection_lines = []
         for _c in (plan or {}).get("candidates", []) or []:
             _cand_lines.append(
                 f"{_c.get('symbol')} {_c.get('action')} "
                 f"@{_c.get('entry_price')} SL {_c.get('stop_loss')} "
                 f"TP {_c.get('target')} qty {_c.get('position_size')}")
             _opt = _c.get("option_legs") or {}
+            _diag = _c.get("option_diagnostic") or {}
+            if _opt.get("strategy") in (None, "", "none") and _diag:
+                _reasons = _diag.get("rejection_reasons") or _opt.get("reasoning") or [
+                    "unspecified_option_rejection"]
+                _opt_rejection_lines.append(
+                    f"  • {_c.get('symbol')}: "
+                    f"stage={_diag.get('selection_stage', 'contract_selection')} "
+                    f"reason={'; '.join(map(str, _reasons))}")
+                logger.warning(
+                    "Options candidate rejected: symbol=%s stage=%s reasons=%s",
+                    _c.get("symbol"),
+                    _diag.get("selection_stage", "contract_selection"),
+                    _reasons,
+                )
             if _opt.get("strategy") and _opt.get("strategy") != "none":
                 _legs = " + ".join(
                     f"{_l.get('side')} {_l.get('strike')}{_l.get('kind')}"
@@ -205,6 +220,20 @@ def main() -> None:
             if _c.get("symbol") in _primary_symbols:
                 continue
             _opt = _c.get("option_legs") or {}
+            _diag = _c.get("option_diagnostic") or {}
+            if _opt.get("strategy") in (None, "", "none"):
+                _reasons = _diag.get("rejection_reasons") or _opt.get("reasoning") or [
+                    "unspecified_option_rejection"]
+                _opt_rejection_lines.append(
+                    f"  • {_c.get('symbol')}: "
+                    f"stage={_diag.get('selection_stage', 'contract_selection')} "
+                    f"reason={'; '.join(map(str, _reasons))}")
+                logger.warning(
+                    "Options candidate rejected: symbol=%s stage=%s reasons=%s",
+                    _c.get("symbol"),
+                    _diag.get("selection_stage", "contract_selection"),
+                    _reasons,
+                )
             if _opt.get("strategy") and _opt.get("strategy") != "none":
                 _legs = " + ".join(
                     f"{_l.get('side')} {_l.get('strike')}{_l.get('kind')}"
@@ -242,6 +271,9 @@ def main() -> None:
         else:
             _options_msg.append("\n*NIFTY Options:* no spreads in today's plan "
                                 "(chain/expiry pending — live re-scans will fill in).")
+            if _opt_rejection_lines:
+                _options_msg.append("\n*Option candidate diagnostics:*")
+                _options_msg.extend(_opt_rejection_lines[:8])
         if not _cand_lines and not _opt_lines:
             _equity_msg.append("\nNo equity candidates — manage-only mode.")
         send_telegram("\n".join(_equity_msg))

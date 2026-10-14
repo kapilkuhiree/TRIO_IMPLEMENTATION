@@ -83,6 +83,25 @@ def test_broadcast_reaches_all_ids(tmp_path):
     assert sorted(calls) == ["111", "222"]
 
 
+def test_ci_credential_whitespace_and_quotes_are_normalized(tmp_path):
+    sub = _store(tmp_path, chats=["111"])
+    urls = []
+
+    def fake_post(url, json=None, timeout=None):
+        urls.append(url)
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        return m
+
+    with patch("src.alerts.load_config", return_value=_cfg(sub)), \
+         patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": '  "123:secret"\n',
+                                   "TELEGRAM_CHAT_ID": " 111 \n",
+                                   "TRIO_TEST_MODE": ""}), \
+         patch("requests.post", side_effect=fake_post):
+        assert alerts.send_telegram("hello") is True
+    assert urls == ["https://api.telegram.org/bot123:secret/sendMessage"]
+
+
 def test_blocked_recipient_does_not_break_others(tmp_path):
     import requests as rq
     sub = _store(tmp_path, chats=["111", "222"])
@@ -108,6 +127,35 @@ def test_blocked_recipient_does_not_break_others(tmp_path):
     data = json.loads(Path(sub).read_text(encoding="utf-8"))
     assert "222" not in data["chats"]
     assert "111" in data["chats"]
+
+
+def test_invalid_bot_endpoint_keeps_all_subscribers(tmp_path):
+    import requests as rq
+    sub = _store(tmp_path, chats=["111", "222"])
+    p = Path(sub)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["failures"] = {"111": 2}
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+    for status in (401, 404):
+        resp = rq.Response()
+        resp.status_code = status
+        resp.url = "https://api.telegram.org/bot123:secret/sendMessage"
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(json["chat_id"])
+            raise rq.exceptions.HTTPError(f"{status} for {url}", response=resp)
+
+        with patch("src.alerts.load_config", return_value=_cfg(sub)), \
+             patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "123:secret",
+                                       "TELEGRAM_CHAT_ID": "111",
+                                       "TRIO_TEST_MODE": ""}), \
+             patch("requests.post", side_effect=fake_post):
+            assert alerts.send_telegram("hello") is False
+
+        assert calls == ["111"]
+        assert json.loads(p.read_text(encoding="utf-8")) == data
 
 
 def test_three_strikes_removes_id(tmp_path):

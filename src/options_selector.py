@@ -81,6 +81,8 @@ class OptionTradeCandidate:
     rank: float = 0.0
     confidence: int = 0
     reasoning: List[str] = field(default_factory=list)
+    signal_underlying: str = ""
+    underlying_mapping: str = "configured_index_overlay"
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -98,6 +100,23 @@ def _opt_cfg() -> Dict[str, Any]:
         return load_config().get("options", {}) or {}
     except Exception:
         return {}
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    return str(symbol or "").strip().upper().removesuffix(".NS")
+
+
+def resolve_option_underlying(signal_symbol: Any,
+                              configured_underlying: Any = "NIFTY") -> Dict[str, str]:
+    """Describe the configured stock-signal to index-option overlay."""
+    signal = _normalize_symbol(signal_symbol)
+    option = _normalize_symbol(configured_underlying) or "NIFTY"
+    return {
+        "signal_underlying": signal,
+        "option_underlying": option,
+        "mapping": "same_underlying" if signal and signal == option
+        else "configured_index_overlay",
+    }
 
 
 def _dte_years(expiry: str) -> float:
@@ -183,7 +202,8 @@ def select(signal: Any, chain: Dict[str, Any],
            expiry: Optional[str] = None,
            iv_rank: Optional[float] = None,
            adx: Optional[float] = None,
-           hv_proxy: float = 0.20) -> OptionTradeCandidate:
+           hv_proxy: float = 0.20,
+           signal_underlying: Optional[str] = None) -> OptionTradeCandidate:
     """Map a spot signal to the best defined-risk options expression.
 
     Regime rule: trending (adx>=25) -> debit spread on the signal side;
@@ -197,11 +217,25 @@ def select(signal: Any, chain: Dict[str, Any],
                                     reasoning=["options disabled in config"])
     # NIFTY index ONLY — never stock options. Explicit guard: if config
     # drifts to anything else, refuse rather than trade the wrong book.
-    underlying = str(cfg.get("underlying", "NIFTY")).strip().upper()
+    mapping = resolve_option_underlying(
+        signal_underlying or getattr(signal, "symbol", ""),
+        cfg.get("underlying", "NIFTY"),
+    )
+    underlying = mapping["option_underlying"]
     if underlying != "NIFTY":
         return OptionTradeCandidate(strategy="none", underlying=underlying,
+                                    signal_underlying=mapping["signal_underlying"],
+                                    underlying_mapping=mapping["mapping"],
                                     reasoning=[f"index-only guard: {underlying} "
                                                "blocked, NIFTY only"])
+    chain_symbol = _normalize_symbol(chain.get("symbol", underlying))
+    if chain_symbol != underlying:
+        return OptionTradeCandidate(
+            strategy="none", underlying=underlying,
+            signal_underlying=mapping["signal_underlying"],
+            underlying_mapping=mapping["mapping"],
+            reasoning=[f"underlying mismatch: chain={chain_symbol or '?'} "
+                       f"expected={underlying}"])
     lot_size = int(cfg.get("lot_size", 50))
     oi_floor = int(cfg.get("min_oi", 1000))
     d_atm = float(cfg.get("delta_atm", 0.50))
@@ -213,15 +247,25 @@ def select(signal: Any, chain: Dict[str, Any],
     spot = float(chain.get("underlying") or 0.0)
     if not spot or not chain.get("by_expiry"):
         return OptionTradeCandidate(strategy="none", underlying=underlying,
+                                    signal_underlying=mapping["signal_underlying"],
+                                    underlying_mapping=mapping["mapping"],
                                     reasoning=["no chain data"])
     if not expiry:
         from src.options_chain import nearest_expiry
         expiry = nearest_expiry(chain) or ""
+    if expiry not in set(chain.get("expiries", []) or []):
+        return OptionTradeCandidate(
+            strategy="none", underlying=underlying, expiry=expiry or "",
+            signal_underlying=mapping["signal_underlying"],
+            underlying_mapping=mapping["mapping"],
+            reasoning=["invalid expiry"])
     rows = [r for r in (chain.get("by_expiry", {}).get(expiry, []) or [])]
     if not rows:
         return OptionTradeCandidate(strategy="none", underlying=underlying,
-                                    expiry=expiry or "",
-                                    reasoning=["no strikes for expiry"])
+                                     expiry=expiry or "",
+                                     signal_underlying=mapping["signal_underlying"],
+                                     underlying_mapping=mapping["mapping"],
+                                     reasoning=["zero strikes for expiry"])
 
     t = _dte_years(expiry or "")
     action = getattr(signal, "action", "HOLD")
@@ -244,12 +288,20 @@ def select(signal: Any, chain: Dict[str, Any],
                                      else r["strike"] >= spot) else 1))
             long_row = cands[0] if cands else long_row
         if long_row is None:
-            return OptionTradeCandidate(strategy="none", reasoning=["no ATM leg"])
+            return OptionTradeCandidate(
+                strategy="none", underlying=underlying,
+                signal_underlying=mapping["signal_underlying"],
+                underlying_mapping=mapping["mapping"],
+                reasoning=["no ATM leg"])
         short_row = _pick_by_delta(
             [r for r in rows if r["strike"] != long_row["strike"]],
             spot, kind_long, d_otm)
         if short_row is None:
-            return OptionTradeCandidate(strategy="none", reasoning=["no OTM leg"])
+            return OptionTradeCandidate(
+                strategy="none", underlying=underlying,
+                signal_underlying=mapping["signal_underlying"],
+                underlying_mapping=mapping["mapping"],
+                reasoning=["no OTM leg"])
         lq = _leg_quote(long_row, kind_long, t, spot, hv_proxy)
         sq = _leg_quote(short_row, kind_long, t, spot, hv_proxy)
         if lq["premium"] <= sq["premium"]:
@@ -297,6 +349,8 @@ def select(signal: Any, chain: Dict[str, Any],
             expiry=expiry or "", legs=legs, net_debit=m["net_debit"],
             maxLoss=m["maxLoss"], maxGain=m["maxGain"], breakeven=round(be, 2),
             margin=m["net_debit"] * lot_size, rank=rank, confidence=conf,
+            signal_underlying=mapping["signal_underlying"],
+            underlying_mapping=mapping["mapping"],
             reasoning=reasoning + [
                 f"{strat} {long_row['strike']}/{short_row['strike']} "
                 f"debit {m['net_debit']} maxLoss {m['maxLoss']} "
@@ -312,10 +366,16 @@ def select(signal: Any, chain: Dict[str, Any],
         row = _pick_by_delta(rows, spot, kind, d_long, side_prefer="ITM")
         if row is None:
             return OptionTradeCandidate(strategy="none",
+                                        underlying=underlying,
+                                        signal_underlying=mapping["signal_underlying"],
+                                        underlying_mapping=mapping["mapping"],
                                         reasoning=["no ITM leg"])
         q = _leg_quote(row, kind, t, spot, hv_proxy)
         if q["premium"] <= 0:
             return OptionTradeCandidate(strategy="none",
+                                        underlying=underlying,
+                                        signal_underlying=mapping["signal_underlying"],
+                                        underlying_mapping=mapping["mapping"],
                                         reasoning=["ITM leg unpriced"])
         if not _liquid(q, oi_floor):
             reasoning.append("thin ITM liquidity — sim-priced, size capped")
@@ -341,6 +401,8 @@ def select(signal: Any, chain: Dict[str, Any],
                             if kind == "CE"
                             else row["strike"] - premium, 2),
             margin=max_loss, rank=rank, confidence=conf,
+            signal_underlying=mapping["signal_underlying"],
+            underlying_mapping=mapping["mapping"],
             reasoning=reasoning + [
                 f"{strat} {row['strike']} ITM premium {premium} "
                 f"maxLoss {max_loss}"])
@@ -351,6 +413,8 @@ def select(signal: Any, chain: Dict[str, Any],
         if chop:
             return OptionTradeCandidate(strategy="none", underlying=underlying,
                                         spot=spot, expiry=expiry or "",
+                                        signal_underlying=mapping["signal_underlying"],
+                                        underlying_mapping=mapping["mapping"],
                                         reasoning=["chop regime — long-only "
                                                    "book sits out"])
         if action == "BUY":
@@ -359,6 +423,8 @@ def select(signal: Any, chain: Dict[str, Any],
             return build_long("PE")
         return OptionTradeCandidate(strategy="none", underlying=underlying,
                                     spot=spot, expiry=expiry or "",
+                                    signal_underlying=mapping["signal_underlying"],
+                                    underlying_mapping=mapping["mapping"],
                                     reasoning=["HOLD signal — no options "
                                                "expression"])
 
@@ -437,6 +503,8 @@ def select(signal: Any, chain: Dict[str, Any],
                 maxGain=round(credit * lot_size, 2),
                 breakeven=spot, margin=round(max_loss, 2),
                 rank=round(conf * 0.8 * liq, 1), confidence=conf,
+                signal_underlying=mapping["signal_underlying"],
+                underlying_mapping=mapping["mapping"],
                 reasoning=reasoning + [
                     f"chop regime (ADX<25) -> iron condor 16d, "
                     f"credit {credit} maxLoss {round(max_loss, 2)}"])
@@ -449,4 +517,6 @@ def select(signal: Any, chain: Dict[str, Any],
         return build_spread("PE")
     return OptionTradeCandidate(strategy="none", underlying=underlying,
                                 spot=spot, expiry=expiry or "",
+                                signal_underlying=mapping["signal_underlying"],
+                                underlying_mapping=mapping["mapping"],
                                 reasoning=["HOLD signal — no options expression"])

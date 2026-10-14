@@ -2,8 +2,14 @@
 TRIO — Execution lifecycle tests (unified entry/exit path)
 Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 """
+import math
 import sys
+from collections import UserDict
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -292,3 +298,111 @@ def test_preflight_fails_closed_when_risk_checks_error():
     assert result["status"] == "SKIP"
     assert result["reason"] == "sector-check-failed"
     assert get_risk_state().open_positions == 0
+
+
+class _BalanceBroker:
+    """Remote double deliberately exposing only no-argument get_balance()."""
+    provider_name = "megabull"
+
+    def __init__(self, balance):
+        self.balance = balance
+        self.positions = {}
+        self.balance_calls = 0
+        self.place_order = Mock(return_value=BrokerOrder(
+            order_id="remote-margin-1", status="FILLED", broker="megabull"))
+
+    def get_balance(self):
+        self.balance_calls += 1
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return self.balance
+
+
+@pytest.mark.parametrize("balance", [
+    pytest.param(None, id="null-response"),
+    pytest.param([], id="list-response"),
+    pytest.param(SimpleNamespace(get=lambda key, default=0: 100000),
+                 id="non-mapping-with-get"),
+    pytest.param({}, id="missing-available"),
+    pytest.param({"available": None}, id="null-available"),
+    pytest.param({"available": True}, id="true"),
+    pytest.param({"available": False}, id="false"),
+    pytest.param({"available": "not-a-number"}, id="non-numeric"),
+    pytest.param({"available": math.nan}, id="nan"),
+    pytest.param({"available": math.inf}, id="infinity"),
+    pytest.param({"available": -math.inf}, id="negative-infinity"),
+    pytest.param({"available": "NaN"}, id="nan-string"),
+    pytest.param({"available": "inf"}, id="infinity-string"),
+    pytest.param({"available": "-inf"}, id="negative-infinity-string"),
+])
+def test_preflight_rejects_invalid_available_balance(balance, monkeypatch):
+    """Invalid margin must block before submission and risk registration."""
+    broker = _BalanceBroker(balance)
+    trader = SimpleNamespace(broker=broker, _log_event=Mock())
+    register = Mock()
+    monkeypatch.setattr("src.risk_manager.add_position", register)
+    proposed = {}
+
+    assert preflight(trader, _cand(), proposed=proposed) == (
+        False, "margin-check-failed")
+    assert submit_candidate(trader, _cand(), proposed=proposed) == {
+        "status": "SKIP", "reason": "margin-check-failed"}
+    broker.place_order.assert_not_called()
+    register.assert_not_called()
+    assert get_risk_state().positions == {}
+    assert get_risk_state().open_positions == 0
+    assert proposed == {}
+
+
+def test_preflight_without_broker_fails_closed():
+    trader = SimpleNamespace(broker=None, _log_event=Mock())
+    assert preflight(trader, _cand(), proposed={}) == (
+        False, "margin-check-failed")
+    assert submit_candidate(trader, _cand(), proposed={}) == {
+        "status": "SKIP", "reason": "margin-check-failed"}
+    assert get_risk_state().positions == {}
+
+
+def test_preflight_balance_exception_blocks_without_logging_payload(caplog):
+    secret = "private-balance-response-marker"
+    broker = _BalanceBroker(RuntimeError(secret))
+    trader = SimpleNamespace(broker=broker, _log_event=Mock())
+
+    assert submit_candidate(trader, _cand(), proposed={}) == {
+        "status": "SKIP", "reason": "margin-check-failed"}
+    broker.place_order.assert_not_called()
+    assert get_risk_state().positions == {}
+    assert secret not in caplog.text
+    assert secret not in str(trader._log_event.call_args_list)
+
+
+@pytest.mark.parametrize("available", [0, -1, "0", "-1"])
+def test_preflight_distinguishes_exhausted_balance(available):
+    broker = _BalanceBroker({"available": available})
+    trader = SimpleNamespace(broker=broker, _log_event=Mock())
+
+    assert preflight(trader, _cand(), proposed={}) == (
+        False, "margin-exhausted")
+    assert submit_candidate(trader, _cand(), proposed={}) == {
+        "status": "SKIP", "reason": "margin-exhausted"}
+    broker.place_order.assert_not_called()
+    assert get_risk_state().positions == {}
+
+
+@pytest.mark.parametrize("balance", [
+    {"available": 100000}, {"available": 100000.25},
+    {"available": "100000.25"}, UserDict({"available": "1e5"}),
+])
+def test_valid_balance_submits_with_no_argument_remote_double(
+        balance, monkeypatch):
+    monkeypatch.setattr("src.alerts.send_signal_alert", Mock())
+    broker = _BalanceBroker(balance)
+    trader = SimpleNamespace(broker=broker, _log_event=Mock())
+
+    result = submit_candidate(trader, _cand(), proposed={})
+
+    assert result["status"] == "FILLED"
+    assert broker.balance_calls == 1
+    broker.place_order.assert_called_once()
+    assert get_risk_state().open_positions == 1
+    assert "X" in get_risk_state().positions

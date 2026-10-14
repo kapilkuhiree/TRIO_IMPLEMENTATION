@@ -26,6 +26,9 @@ jobs:
       TELEGRAM_OPTIONS_BOT_TOKEN: ${{ secrets.TELEGRAM_OPTIONS_BOT_TOKEN }}
       TELEGRAM_OPTIONS_CHAT_ID: ${{ secrets.TELEGRAM_OPTIONS_CHAT_ID }}
       MEGABULL_API_KEY: ${{ secrets.MEGABULL_API_KEY }}
+      TRIO_BROKER_PROVIDER: megabull
+      TRIO_REMOTE_REQUIRED: "1"
+      TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
       TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
@@ -38,13 +41,48 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-server.txt
 
+      - name: Validate Telegram bot tokens
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import requests
+
+          failures = []
+          for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_OPTIONS_BOT_TOKEN"):
+              value = (os.environ.get(name) or "").strip()
+              if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                  value = value[1:-1].strip()
+              if not value:
+                  if name == "TELEGRAM_BOT_TOKEN":
+                      failures.append(name)
+                  print(f"{name}: missing")
+                  continue
+              try:
+                  response = requests.get(
+                      f"https://api.telegram.org/bot{value}/getMe", timeout=10)
+                  payload = response.json()
+              except Exception as exc:
+                  print(f"{name}: request failed ({type(exc).__name__})")
+                  failures.append(name)
+                  continue
+              if response.status_code != 200 or not payload.get("ok"):
+                  description = payload.get("description", "HTTP error")
+                  print(f"{name}: rejected ({description})")
+                  failures.append(name)
+              else:
+                  print(f"{name}: valid")
+          if failures:
+              print("Update the rejected GitHub Actions secret(s) with the raw token from @BotFather.")
+              sys.exit(1)
+
       - name: Build premarket plan
         run: python scripts/premarket.py
 
       - name: Persist plan to repo
         run: |
           set -euo pipefail
-          mkdir -p output output/plans output/runtime
+          mkdir -p output output/plans output/runtime output/chain_diagnostics
           touch output/equity_snapshot.json
           touch output/runtime/.gitkeep
           git config user.name "trio-bot"
@@ -55,7 +93,8 @@ jobs:
             output/subscribers.json \
             output/subscribers_options.json \
             output/equity_snapshot.json \
-            output/runtime/.gitkeep
+            output/runtime/.gitkeep \
+            output/chain_diagnostics
           git fetch origin main
           if ! git merge -X ours --no-edit origin/main; then
             git checkout --ours -- output/

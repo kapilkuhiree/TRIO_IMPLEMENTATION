@@ -101,11 +101,19 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     # Options overlay (shadow until proven): attach legs per candidate.
     if options_on and option_dicts:
         try:
-            from src.options_chain import fetch_chain, nearest_expiry
+            from src.options_chain import (
+                fetch_chain,
+                nearest_expiry,
+                expiry_status,
+            )
             from src.options_selector import select
             chain = fetch_chain(str(opt_cfg.get("underlying", "NIFTY")))
             if chain is not None:
                 expiry = nearest_expiry(chain) or ""
+                chain_expiry_status = expiry_status(chain, expiry)
+                plan_chain_diagnostic = dict(chain.get("diagnostics") or {})
+                plan_chain_diagnostic["selected_expiry"] = expiry
+                plan_chain_diagnostic["selected_expiry_status"] = chain_expiry_status
                 for c in option_dicts:
                     try:
                         from src.signal_engine import TradeSignal
@@ -137,13 +145,62 @@ def build_plan(universe: str, timeframe: str, top_n: int,
                         pick = select(sig, chain, expiry=expiry,
                                       iv_rank=ivr, adx=adx_v)
                         c["option_legs"] = pick.to_dict()
+                        c["option_diagnostic"] = {
+                            "signal_underlying": c.get("symbol", ""),
+                            "option_underlying": pick.underlying,
+                            "underlying_mapping": pick.underlying_mapping,
+                            "requested_expiry": expiry,
+                            "expiry_status": chain_expiry_status,
+                            "selection_stage": (
+                                "selected" if pick.strategy not in (None, "", "none")
+                                else "contract_selection"),
+                            "rejection_reasons": list(pick.reasoning)
+                            if pick.strategy in (None, "", "none") else [],
+                        }
                         c["iv_rank"] = ivr
                         c["adx"] = adx_v
                     except Exception as exc:
+                        c["option_legs"] = {
+                            "strategy": "none",
+                            "underlying": str(opt_cfg.get("underlying", "NIFTY")).upper(),
+                            "expiry": expiry,
+                            "legs": [],
+                            "reasoning": [f"overlay_exception: {exc}"],
+                        }
+                        c["option_diagnostic"] = {
+                            "signal_underlying": c.get("symbol", ""),
+                            "option_underlying": str(
+                                opt_cfg.get("underlying", "NIFTY")).upper(),
+                            "underlying_mapping": "configured_index_overlay",
+                            "requested_expiry": expiry,
+                            "expiry_status": chain_expiry_status,
+                            "selection_stage": "overlay_exception",
+                            "rejection_reasons": [f"overlay_exception: {exc}"],
+                        }
                         logger.warning("Options overlay failed for %s: %s",
                                        c.get("symbol"), exc)
+                # Kept on the plan so the persisted artifact remains useful
+                # even when output/chain_cache is intentionally ignored.
+                chain_diagnostic = plan_chain_diagnostic
+            else:
+                chain_diagnostic = {
+                    "symbol": str(opt_cfg.get("underlying", "NIFTY")).upper(),
+                    "retrieval": {"success": False},
+                    "failure_reason": "chain_unavailable",
+                }
         except Exception as exc:
+            chain_diagnostic = {
+                "symbol": str(opt_cfg.get("underlying", "NIFTY")).upper(),
+                "retrieval": {"success": False},
+                "failure_reason": f"overlay_exception: {exc}",
+            }
             logger.warning("Options overlay unavailable: %s", exc)
+    else:
+        chain_diagnostic = {
+            "symbol": str(opt_cfg.get("underlying", "NIFTY")).upper(),
+            "retrieval": {"success": False},
+            "failure_reason": "options_disabled_or_no_candidates",
+        }
 
     # Screener already logs per-symbol failures; surface the same number
     # here so Telegram/dashboard and the JSON file all agree. `scanned` is
@@ -162,6 +219,13 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         "min_confidence": sc_cfg.get("min_confidence", 60),
         "candidates": cand_dicts,
         "option_candidates": option_dicts,
+        "options_mapping_policy": (
+            "configured_index_overlay: stock signals are expressed with the "
+            f"{str(opt_cfg.get('underlying', 'NIFTY')).upper()} index chain"
+            if options_on else "options_disabled"),
+        "option_chain_diagnostic": chain_diagnostic,
+        "options_pnl_readiness": "NOT_READY_FOR_OPTIONS_PNL",
+        "research_only": True,
         "executed": False,
         "asset": "equity+options",
     }

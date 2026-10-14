@@ -48,6 +48,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHAIN_CACHE_DIR = PROJECT_ROOT / "output" / "chain_cache"
+CHAIN_DIAGNOSTIC_DIR = PROJECT_ROOT / "output" / "chain_diagnostics"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +112,47 @@ def _cache_write(symbol: str, chain: Dict[str, Any]) -> None:
         logger.warning("Chain cache write failed for %s: %s", symbol, exc)
 
 
+def _write_chain_diagnostic(symbol: str, diagnostic: Dict[str, Any]) -> None:
+    """Persist a normalized, non-secret chain diagnostic for later replay.
+
+    The diagnostic intentionally stores contract counts and validation
+    outcomes, not credentials or broker data.  The plan also embeds the same
+    structure, so the premarket artifact remains available when cache files
+    are ignored by git.
+    """
+    try:
+        CHAIN_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+        path = CHAIN_DIAGNOSTIC_DIR / f"chain_{symbol.upper()}_latest.json"
+        path.write_text(json.dumps(diagnostic, indent=2, default=str),
+                        encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Chain diagnostic write failed for %s: %s", symbol, exc)
+
+
+def expiry_status(chain: Dict[str, Any], expiry: str) -> Dict[str, Any]:
+    """Return explicit exchange-listing and strike-availability status."""
+    expiry = str(expiry or "")
+    listed = expiry in set(chain.get("expiries", []) or [])
+    rows = strikes_for(chain, expiry)
+    ce_records = sum(1 for row in rows if row.get("CE"))
+    pe_records = sum(1 for row in rows if row.get("PE"))
+    if not listed:
+        reason = "invalid_expiry"
+    elif not rows:
+        reason = "zero_strikes_for_expiry"
+    else:
+        reason = "usable_strikes"
+    return {
+        "expiry": expiry,
+        "listed_by_exchange": listed,
+        "strike_rows": len(rows),
+        "ce_records": ce_records,
+        "pe_records": pe_records,
+        "usable": bool(rows and ce_records and pe_records),
+        "reason": reason,
+    }
+
+
 # ---------------------------------------------------------------------------
 # fetch
 # ---------------------------------------------------------------------------
@@ -158,7 +200,8 @@ def _expiries_for(s: "requests.Session", symbol: str) -> List[str]:
 
 
 def fetch_chain(symbol: str = "NIFTY",
-                use_cache: bool = True) -> Optional[Dict[str, Any]]:
+                use_cache: bool = True,
+                diagnostic_label: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch the full NSE option chain for an index symbol.
 
     Returns {"underlying": float, "expiries": [...], "by_expiry": {expiry:
@@ -176,6 +219,18 @@ def fetch_chain(symbol: str = "NIFTY",
     if use_cache:
         hit = _cache_fresh(symbol, ttl)
         if hit is not None:
+            hit = dict(hit)
+            hit.setdefault("symbol", symbol)
+            retrieval = {
+                **(hit.get("retrieval") or {}),
+                "served_from_cache": True,
+                "cache_ttl_minutes": ttl,
+            }
+            hit["retrieval"] = retrieval
+            cached_diag = dict(hit.get("diagnostics") or {})
+            cached_diag["retrieval"] = retrieval
+            cached_diag.setdefault("symbol", symbol)
+            _write_chain_diagnostic(symbol, cached_diag)
             return hit
 
     last: Exception = RuntimeError("unreachable")
@@ -187,70 +242,146 @@ def fetch_chain(symbol: str = "NIFTY",
             expiries = _expiries_for(s, symbol)
             # Fetch per-expiry via v3 (the shape NSE serves today), then the
             # legacy indices path as a last resort.
-            paths: List[str] = []
+            paths: List[tuple[str, str]] = []
             for exp in (expiries[:4] or [""]):
-                paths.append(
+                paths.append((
                     "/api/option-chain-v3?type=Indices&symbol={s}&expiry={e}"
                     .format(s=symbol, e=exp) if exp else
-                    "/api/option-chain-v3?type=Indices&symbol={s}".format(s=symbol))
-            paths.append("/api/option-chain-indices?symbol={s}".format(s=symbol))
-            data = None
-            for path in paths:
+                    "/api/option-chain-v3?type=Indices&symbol={s}".format(s=symbol),
+                    exp,
+                ))
+            paths.append(("/api/option-chain-indices?symbol={s}".format(s=symbol), ""))
+            responses: List[tuple[Dict[str, Any], str]] = []
+            response_diagnostics: List[Dict[str, Any]] = []
+            for path, requested_expiry in paths:
                 r = s.get(NSE_BASE + path, timeout=TIMEOUT)
+                response_diag = {
+                    "requested_expiry": requested_expiry or None,
+                    "path": path.split("?")[0],
+                    "http_status": r.status_code,
+                    "success": False,
+                    "strike_rows": 0,
+                    "ce_records": 0,
+                    "pe_records": 0,
+                    "validation_failures": [],
+                }
                 if r.status_code in (401, 403):
+                    response_diag["failure_reason"] = "access_denied"
+                    response_diagnostics.append(response_diag)
                     continue
                 if r.status_code == 404:
+                    response_diag["failure_reason"] = "endpoint_not_found"
+                    response_diagnostics.append(response_diag)
                     continue
-                r.raise_for_status()
+                try:
+                    r.raise_for_status()
+                except Exception as exc:
+                    response_diag["failure_reason"] = f"http_error: {exc}"
+                    response_diagnostics.append(response_diag)
+                    continue
                 try:
                     data = r.json()
-                except Exception:
+                except Exception as exc:
+                    response_diag["failure_reason"] = f"invalid_json: {exc}"
+                    response_diagnostics.append(response_diag)
                     continue
                 if (data.get("records") or data.get("filtered")
                         or data.get("data")):
-                    break
-                data = None
-            if data is None:
+                    responses.append((data, requested_expiry))
+                    response_diag["success"] = True
+                    response_diag["raw_expiry_dates"] = list(
+                        (data.get("records") or {}).get("expiryDates") or [])
+                    response_diagnostics.append(response_diag)
+                    # A response without an expiry parameter is an aggregate
+                    # fallback; do not make more duplicate requests after it.
+                    if not requested_expiry:
+                        break
+                else:
+                    response_diag["failure_reason"] = "empty_response"
+                    response_diagnostics.append(response_diag)
+            if not responses:
                 raise RuntimeError("all NSE chain paths 404/blocked")
-            rec = data.get("records", {}) or {}
-            underlying = float(rec.get("underlyingValue") or 0.0)
-            expiries = list(rec.get("expiryDates") or expiries or [])
-            # v3 nests rows under records.data; per-strike rows carry
-            # expiryDates (plural) but not expiryDate (singular) — the
-            # requested expiry is the grouping key (probed live 2026-10-08).
-            raw_rows = (rec.get("data")
-                        or (data.get("filtered", {}) or {}).get("data")
-                        or data.get("data") or [])
+            underlying = 0.0
             by_expiry: Dict[str, List[Dict[str, Any]]] = {}
-            for row in raw_rows:
-                exp = str(row.get("expiryDate") or "")
-                if not exp:
-                    eds = row.get("expiryDates") or ""
-                    exp = str(eds) if isinstance(eds, str) else ""
-                strike = row.get("strikePrice")
-                if not exp or strike is None:
-                    continue
-                by_expiry.setdefault(exp, []).append(
-                    _parse_strike_row(exp, strike, row))
-            # Per-expiry v3 calls return rows without an expiry tag at all
-            # (only expiryDates on the row). Attribute them to the expiry
-            # we asked for (first path's expiry).
-            if not by_expiry and raw_rows:
-                try:
-                    asked = (expiries or [""])[0]
-                except Exception:
-                    asked = ""
-                if asked:
-                    for row in raw_rows:
-                        strike = row.get("strikePrice")
-                        if strike is None:
-                            continue
-                        by_expiry.setdefault(asked, []).append(
-                            _parse_strike_row(asked, strike, row))
+            all_expiries = list(expiries or [])
+            for data, requested_expiry in responses:
+                rec = data.get("records", {}) or {}
+                underlying = float(rec.get("underlyingValue") or underlying or 0.0)
+                all_expiries.extend(list(rec.get("expiryDates") or []))
+                raw_rows = (rec.get("data")
+                            or (data.get("filtered", {}) or {}).get("data")
+                            or data.get("data") or [])
+                response_diag = next(
+                    (item for item in reversed(response_diagnostics)
+                     if item.get("requested_expiry") == (requested_expiry or None)
+                     and item.get("success")),
+                    None,
+                )
+                for row in raw_rows:
+                    explicit_expiry = str(row.get("expiryDate") or "")
+                    if (requested_expiry and explicit_expiry
+                            and explicit_expiry != requested_expiry):
+                        if response_diag is not None:
+                            response_diag["validation_failures"].append(
+                                f"expiry_mismatch:{explicit_expiry}")
+                        continue
+                    exp = explicit_expiry
+                    if not exp:
+                        eds = row.get("expiryDates") or ""
+                        if isinstance(eds, str) and eds in all_expiries:
+                            exp = eds
+                        elif requested_expiry:
+                            # Per-expiry responses may omit both singular and
+                            # usable plural expiry keys.  The request itself
+                            # is the authoritative grouping key.
+                            exp = requested_expiry
+                    strike = row.get("strikePrice")
+                    if not exp or strike is None:
+                        if response_diag is not None:
+                            response_diag["validation_failures"].append(
+                                "missing_expiry_or_strike")
+                        continue
+                    try:
+                        normalized = _parse_strike_row(exp, strike, row)
+                        if normalized["strike"] <= 0:
+                            raise ValueError("non-positive strike")
+                    except (TypeError, ValueError) as exc:
+                        if response_diag is not None:
+                            response_diag["validation_failures"].append(str(exc))
+                        continue
+                    by_expiry.setdefault(exp, []).append(normalized)
+                    if response_diag is not None:
+                        response_diag["strike_rows"] += 1
+                        response_diag["ce_records"] += int(bool(row.get("CE")))
+                        response_diag["pe_records"] += int(bool(row.get("PE")))
+            # Preserve order while removing duplicate expiry values returned by
+            # each per-expiry response.
+            expiries = list(dict.fromkeys(all_expiries))
             for rows in by_expiry.values():
                 rows.sort(key=lambda x: x["strike"])
-            chain = {"underlying": underlying, "expiries": expiries,
-                     "by_expiry": by_expiry, "source": "nse"}
+            retrieved_at = utc_now()
+            diagnostic = {
+                "schema_version": 1,
+                "retrieved_at": retrieved_at,
+                "symbol": symbol,
+                "underlying": underlying,
+                "requested_expiries": [
+                    item for item in expiries[:4] if item
+                ],
+                "responses": response_diagnostics,
+                "expiry_status": {},
+                "freshness": {"ttl_minutes": ttl, "fresh": True},
+            }
+            chain = {"underlying": underlying, "symbol": symbol,
+                     "expiries": expiries, "by_expiry": by_expiry,
+                     "source": "nse", "retrieved_at": retrieved_at,
+                     "diagnostics": diagnostic}
+            diagnostic["expiry_status"] = {
+                exp: expiry_status(chain, exp) for exp in expiries[:4]
+            }
+            if diagnostic_label:
+                diagnostic["label"] = diagnostic_label
+            _write_chain_diagnostic(symbol, diagnostic)
             _cache_write(symbol, chain)
             logger.info("NSE chain %s: spot %.1f, %d expiries",
                         symbol, underlying, len(expiries))
@@ -266,6 +397,16 @@ def fetch_chain(symbol: str = "NIFTY",
                            attempt + 1, exc)
             time.sleep(1 + attempt)
     logger.error("NSE chain unavailable for %s: %s", symbol, last)
+    _write_chain_diagnostic(symbol, {
+        "schema_version": 1,
+        "retrieved_at": utc_now(),
+        "symbol": symbol,
+        "retrieval": {"success": False, "served_from_cache": False},
+        "failure_reason": str(last),
+        "responses": [],
+        "expiry_status": {},
+        "freshness": {"ttl_minutes": ttl, "fresh": False},
+    })
     return None
 
 

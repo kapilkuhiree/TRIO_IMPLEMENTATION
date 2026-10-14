@@ -354,14 +354,17 @@ def test_megabull_options_single_long(tmp_path):
     assert rec["result"] == "PASS" and rec["asset"] == "options"
 
 
-def test_megabull_options_rejects_without_network(tmp_path):
-    """The 2026-10-08 silent-fallback: when MegaBull refuses option legs
-    (endpoint rejects all lots/units variants), open_spread reports
-    REJECTED and leaves NO orphan leg behind — the session then books the
-    local shadow sim and keeps running."""
+def test_megabull_options_rejects_without_network(tmp_path, monkeypatch):
+    """Explicit opt-in offline behavior: rejected remote legs use a shadow.
+
+    The 2026-10-08 fallback stays available to this network-free test only
+    when both environment switches are set explicitly.
+    """
     from src.broker.megabull_options import MegaBullOptionsBroker
     from src.paper_trader import PaperTrader
     from src.broker.paper import PaperBroker
+    monkeypatch.setenv("TRIO_ALLOW_LOCAL_OPTION_SHADOW", "1")
+    monkeypatch.setenv("TRIO_REMOTE_REQUIRED", "0")
     sig = TradeSignal(symbol="NIFTY", action="SELL", entry_price=25000.0,
                       confidence=80)
     pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0, adx=30.0)
@@ -387,6 +390,56 @@ def test_megabull_options_rejects_without_network(tmp_path):
              (tmp_path / "trade_log.jsonl").read_text().splitlines() if x]
     orders = [r for r in lines if r.get("event") == "order"]
     assert any(o.get("asset") == "options" for o in orders)
+
+
+def test_megabull_options_rejection_default_off_has_no_local_shadow(
+        tmp_path, monkeypatch):
+    """Config-off/default behavior must not create a local option order."""
+    from src.broker.megabull_options import MegaBullOptionsBroker
+    from src.paper_trader import PaperTrader
+    from src.broker.paper import PaperBroker
+    from src.utils import (load_config, local_option_shadow_allowed,
+                           remote_paper_required)
+
+    # No config section or environment opt-in: both policies stay off.
+    monkeypatch.delenv("TRIO_ALLOW_LOCAL_OPTION_SHADOW", raising=False)
+    monkeypatch.delenv("TRIO_REMOTE_REQUIRED", raising=False)
+    cfg = load_config()
+    assert not remote_paper_required(cfg)
+    assert not local_option_shadow_allowed(cfg)
+
+    mega = _MegaStub(fail_all=True)
+    opt_broker = MegaBullOptionsBroker(mega, lot_size=50)
+    plan = _bear_plan()
+    rejected = opt_broker.open_spread(
+        plan["candidates"][0]["option_legs"], lots=1)
+    assert rejected.status == "REJECTED"
+
+    trader = PaperTrader(symbols=["NIFTY"], test_mode=False)
+    trader.trade_log_path = tmp_path / "trade_log.jsonl"
+    trader.broker = PaperBroker(initial_capital=500000.0)
+    trader.broker_name = "paper"
+
+    placed = trader.execute_option_plan(plan, opt_broker=opt_broker)
+    assert placed == []
+    assert not getattr(trader, "_opt_shadows", [])
+    assert not mega.positions
+    lines = [json.loads(x) for x in
+             (tmp_path / "trade_log.jsonl").read_text().splitlines() if x]
+    assert not [r for r in lines
+                 if r.get("event") == "order" and r.get("asset") == "options"]
+
+
+def test_remote_required_defeats_explicit_shadow_opt_in(monkeypatch):
+    """Remote-only policy wins even when local shadow is explicitly enabled."""
+    from src.utils import local_option_shadow_allowed, remote_paper_required
+
+    monkeypatch.setenv("TRIO_ALLOW_LOCAL_OPTION_SHADOW", "1")
+    monkeypatch.setenv("TRIO_REMOTE_REQUIRED", "1")
+    cfg = {"execution": {"allow_local_option_shadow": True,
+                          "remote_paper_required": False}}
+    assert remote_paper_required(cfg)
+    assert not local_option_shadow_allowed(cfg)
 
 
 def test_megabull_options_failed_close_keeps_spread_open():

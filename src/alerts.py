@@ -27,6 +27,20 @@ def _redact_telegram_token(text: Any) -> str:
     return re.sub(r"/bot\d+:[A-Za-z0-9_-]+/", "/bot<redacted>/", s)
 
 
+def _clean_telegram_credential(value: Any) -> str:
+    """Normalize a credential copied into a local or CI environment.
+
+    GitHub Actions secrets can accidentally contain a trailing newline or
+    wrapping quotes when pasted from a ``.env`` file. Telegram treats either
+    as part of the bot token and responds with 404. Strip only surrounding
+    whitespace/quotes; never alter the token body.
+    """
+    s = "" if value is None else str(value).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in {"'", '"'}:
+        s = s[1:-1].strip()
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Markdown escaping (Telegram legacy Markdown)
 # ---------------------------------------------------------------------------
@@ -70,8 +84,10 @@ def _send_telegram_kind(message: str, kind: str,
         return False
 
     if config_override is not None:
-        token = get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
-        chat_id = get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+        token = _clean_telegram_credential(
+            get_env(tg_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN")))
+        chat_id = _clean_telegram_credential(
+            get_env(tg_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID")))
     else:
         token, chat_id, _ = _resolve_bot(kind)
 
@@ -102,6 +118,13 @@ def _send_telegram_kind(message: str, kind: str,
             ok_any = True
         except Exception as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (401, 404):
+                # Authentication / bot endpoint errors affect every recipient.
+                # Retrying other chats would only remove valid subscribers.
+                logger.error("Telegram bot API returned HTTP %s (kind=%s); "
+                             "verify the bot token with getMe. Subscribers kept.",
+                             status, kind)
+                break
             logger.error("Telegram send failed for %s: %s", cid,
                          _redact_telegram_token(exc))
             _record_delivery(cid, ok=False, blocked=(status == 403), kind=kind)
@@ -150,16 +173,20 @@ def _resolve_bot(kind: str) -> tuple[str, str, Path]:
         token_env = (opt.get("bot_token_env") or "TELEGRAM_OPTIONS_BOT_TOKEN")
         chat_env = (opt.get("chat_id_env") or "TELEGRAM_OPTIONS_CHAT_ID")
         sub_file = (opt.get("subscriber_file") or "output/subscribers_options.json")
-        token = get_env(token_env) or ""
-        chat_id = get_env(chat_env) or ""
+        token = _clean_telegram_credential(get_env(token_env))
+        chat_id = _clean_telegram_credential(get_env(chat_env))
         # Fallback to the old bot when the new one is not configured yet
         if not token:
-            token = get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
-            chat_id = get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+            token = _clean_telegram_credential(
+                get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN")))
+            chat_id = _clean_telegram_credential(
+                get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID")))
             sub_file = tg.get("subscriber_file", "output/subscribers.json")
     else:
-        token = get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
-        chat_id = get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+        token = _clean_telegram_credential(
+            get_env(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN")))
+        chat_id = _clean_telegram_credential(
+            get_env(tg.get("chat_id_env", "TELEGRAM_CHAT_ID")))
         sub_file = tg.get("subscriber_file", "output/subscribers.json")
     path = Path(sub_file)
     if not path.is_absolute():

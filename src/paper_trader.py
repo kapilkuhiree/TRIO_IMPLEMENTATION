@@ -1088,14 +1088,33 @@ class PaperTrader:
                 if pick.net_debit > 0 and risk_amt > 0:
                     lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
                 if required:
-                    from src.execution_lifecycle import reconcile_broker
+                    from src.execution_lifecycle import (
+                        reconcile_broker, validate_available_balance)
                     if reconcile_broker(self).get("uncertain"):
                         break
                     if get_risk_state().halt_active:
                         break
-                    balance = self.broker.get_balance(strict=True)
-                    if balance["available"] < pick.net_debit * lots * lot_sz:
-                        self._log_event("skip", {"asset": "options", "reason": "margin-exhausted"})
+                    # All broker adapters implement the BaseBroker
+                    # get_balance() signature without a ``strict`` keyword.
+                    try:
+                        balance = self.broker.get_balance()
+                        available, margin_reason = validate_available_balance(
+                            balance)
+                    except Exception:
+                        # An unavailable or malformed remote balance is not
+                        # permission to trade. Do not log the response body.
+                        self._log_event("skip", {
+                            "asset": "options",
+                            "reason": "margin-check-failed"})
+                        continue
+                    if margin_reason:
+                        self._log_event("skip", {
+                            "asset": "options", "reason": margin_reason})
+                        continue
+                    if available < pick.net_debit * lots * lot_sz:
+                        self._log_event("skip", {
+                            "asset": "options",
+                            "reason": "margin-exhausted"})
                         continue
                     # Persist the intent BEFORE sending legs. An interrupted
                     # submit must never be automatically retried as a new spread.
