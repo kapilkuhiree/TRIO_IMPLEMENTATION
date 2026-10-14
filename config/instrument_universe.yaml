@@ -1,0 +1,146 @@
+# TRIO — Experimental Multi-Instrument Configuration
+# Do NOT modify config/config.yaml. This file is for experimental options
+# strategy testing across multiple underlyings only.
+# ============================================================================
+
+# Master instrument universe — indices first, then stocks
+# Each entry represents an eligible underlying for options scanning.
+# Do not hardcode expiry dates, lot sizes or strike intervals here;
+# those are resolved from contract specifications at backtest time.
+instrument_universe:
+  # ========================================================================
+  # INDEX INSTRUMENTS
+  # ========================================================================
+  - symbol: "NIFTY"
+    name: "NIFTY 50"
+    exchange: "NSE"
+    type: "index"
+    
+  - symbol: "BANKNIFTY"
+    name: "NIFTY Bank Nifty"
+    exchange: "NSE"
+    type: "index"
+    
+  - symbol: "FINNIFTY"
+    name: "Nifty Financial Services"
+    exchange: "NSE"
+    type: "index"
+    
+  - symbol: "NIFTYNXT50"
+    name: "Nifty Next 50"
+    exchange: "NSE"
+    type: "index"
+    
+  # ========================================================================
+  # STOCK OPTIONS
+  # ========================================================================
+  - symbol: "RELIANCE"
+    name: "Reliance Industries"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "HDFCBANK"
+    name: "HDFC Bank"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "ICICIBANK"
+    name: "ICICI Bank"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "SBIN"
+    name: "State Bank of India"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "INFY"
+    name: "Infosys"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "TCS"
+    name: "Tata Consultancy Services"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "BHARTIARTL"
+    name: "Bharti Airtel"
+    exchange: "NSE"
+    type: "stock"
+    
+  - symbol: "LT"
+    name: "Larsen & Toubro"
+    exchange: "NSE"
+    type: "stock"
+
+# Minimum OI thresholds per underlying (configurable by liquidity class)
+min_oi_thresholds:
+  NIFTY: 1000
+  BANKNIFTY: 500
+  FINNIFTY: 500
+  RELIANCE: 2000
+  HDFCBANK: 1000
+  ICICIBANK: 1000
+  SBIN: 2000
+  INFY: 1000
+  TCS: 1000
+  BHARTIARTL: 500
+  LT: 2000
+  # NIFTYNXT50 is kept in the experimental universe, but its historical
+  # contract specification is not yet verified.  This conservative index
+  # liquidity-class value is configuration coverage only; the actual options
+  # backtest remains blocked until lot size and expiry history are validated.
+  NIFTYNXT50: 500
+
+# Maximum spreads per session per underlying
+max_spreads_per_session:
+  NIFTY: 4
+  BANKNIFTY: 4
+  FINNIFTY: 4
+  RELIANCE: 4
+  HDFCBANK: 4
+  ICICIBANK: 4
+  SBIN: 4
+  INFY: 4
+  TCS: 4
+  BHARTIARTL: 4
+  LT: 4
+
+# Risk per trade as % of equity per underlying
+risk_per_trade_pct:
+  NIFTY: 0.30
+  BANKNIFTY: 0.30
+  FINNIFTY: 0.30
+  RELIANCE: 0.30
+  HDFCBANK: 0.30
+  ICICIBANK: 0.30
+  SBIN: 0.30
+  INFY: 0.30
+  TCS: 0.30
+  BHARTIARTL: 0.30
+  LT: 0.30
+  # Coverage value only; see the contract-specification note above.
+  NIFTYNXT50: 0.30
+
+# Correlation groups — prevent simultaneous exposure to same move
+correlated_groups:
+  - [NIFTY, FINNIFTY]
+  - [BANKNIFTY, SBIN, ICICIBANK, HDFCBANK]
+  - [RELIANCE, TCS, INFY]
+
+# Trading session (from market.yaml — do not override unless needed)
+# - open: "09:15"
+# - entry_start: "09:20"
+# - entry_cutoff: "15:00"
+# - hard_flat: "15:10"
+# - close: "15:30"
+# - timezone: "Asia/Kolkata"
+
+# Risk controls (from experimental_risk.yaml — do not overwrite config.yaml)
+# - risk_per_trade_pct: 0.25%–0.5% of equity (set per underlying above)
+# - max_daily_loss_pct: 1.0% of starting daily equity (AGGREGATED across all instruments)
+# - max_open_positions: 5 (AGGREGATED — total across ALL underlyings per day)
+# - max_consecutive_losses: 2 (stop after 2 consecutive losses, ANY instrument)
+# - time_cutoff_ist: 14:30 (2:30 PM IST — no new entries after this time)
+# - max_total_open_risk_pct: 3.0% (cap total open risk across all positions)
