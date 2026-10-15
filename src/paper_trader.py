@@ -14,10 +14,19 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils import (get_logger, load_config, utc_now, remote_paper_required,
                        local_option_shadow_allowed)
+from src.options_intraday import (
+    COMBINED,
+    combined_mode_enabled,
+    options_intraday_enabled,
+    resolve_trading_mode,
+    strict_options_enabled,
+    validate_option_candidate,
+    validate_options_mode_environment,
+)
 from src.data_fetcher import fetch_market_data
 from src.indicators import compute_indicators
 from src.sentiment import analyze_sentiment
@@ -45,12 +54,17 @@ class PaperTrader:
         timeframe: Optional[str] = None,
         initial_capital: Optional[float] = None,
         test_mode: bool = False,
+        trading_mode: Optional[str] = None,
     ):
         cfg = load_config()
 
         self.symbols = symbols or cfg.get("symbols", [])
         self.timeframe = timeframe or cfg.get("timeframes", {}).get("default", "15m")
         self.test_mode = test_mode  # smoke/unit runs write a SEPARATE log file
+        self.trading_mode = resolve_trading_mode(cfg, trading_mode)
+        self.options_only = options_intraday_enabled(cfg, trading_mode)
+        self.combined_mode = combined_mode_enabled(cfg, trading_mode)
+        self.strict_options_mode = strict_options_enabled(cfg, trading_mode)
 
         rm_cfg = cfg.get("risk_management", {})
         capital = initial_capital or rm_cfg.get("capital", 100000)
@@ -107,6 +121,9 @@ class PaperTrader:
         self._eod_squared = False  # one EOD square-off per session
         self._last_plan_order_ids: List[str] = []
         self._last_option_order_ids: List[str] = []
+        self._options_risk_positions: Dict[str, Dict[str, Any]] = {}
+        self._options_unresolved_exits: Dict[str, str] = {}
+        self._options_runtime = None
 
         # Trade log: one JSON line per event (scan/screen/order/guard/close).
         # Path from config `logging.trade_log`; CSV mirror written at session end.
@@ -121,8 +138,8 @@ class PaperTrader:
         self._live_log_path = self.trade_log_path
 
         logger.info(
-            "PaperTrader initialized: %d symbols, timeframe=%s, capital=%.2f",
-            len(self.symbols), self.timeframe, capital,
+            "PaperTrader initialized: %d symbols, timeframe=%s, capital=%.2f, mode=%s",
+            len(self.symbols), self.timeframe, capital, self.trading_mode,
         )
 
     def _option_registry_path(self) -> Path:
@@ -168,6 +185,150 @@ class PaperTrader:
     @staticmethod
     def _option_registry_key(provider: str, sid_key: tuple) -> str:
         return "|".join([str(provider)] + [str(x) for x in sid_key[1:]])
+
+    def ensure_option_broker(self, cfg: Optional[Dict[str, Any]] = None) -> Any:
+        """Attach the configured options adapter exactly once.
+
+        Strict options modes are deliberately remote-paper-only.  The legacy
+        overlay may still construct a local options paper broker in ordinary
+        production mode, but never in ``options_intraday`` or ``combined``.
+        """
+        cfg = cfg or load_config()
+        existing = getattr(self, "opt_broker", None)
+        if existing is not None:
+            return existing
+        if self.strict_options_mode:
+            ok, reason = validate_options_mode_environment(cfg)
+            if not ok:
+                raise RuntimeError(reason)
+            from src.remote_paper import make_options_broker
+            self.opt_broker = make_options_broker(self, cfg)
+            if getattr(self.opt_broker, "provider_name", "") != "megabull_options":
+                raise RuntimeError("strict options mode requires MegaBullOptionsBroker")
+            return self.opt_broker
+        return None
+
+    def _get_options_runtime(self, cfg: Optional[Dict[str, Any]] = None) -> Any:
+        """Return the strict options-intraday lifecycle controller.
+
+        The legacy options overlay remains available for the normal production
+        mode.  The explicit options-intraday mode has a separate runtime so a
+        local shadow, multi-leg spread, or stock/equity execution path cannot
+        be reached accidentally.
+        """
+        if not getattr(self, "strict_options_mode",
+                       getattr(self, "options_only", False)):
+            raise RuntimeError("options-intraday runtime requested outside its mode")
+        runtime = getattr(self, "_options_runtime", None)
+        if runtime is None:
+            from src.options_intraday_runtime import OptionsIntradayRuntime
+            runtime = OptionsIntradayRuntime(
+                self, cfg or load_config(),
+                trading_mode=getattr(self, "trading_mode", "options_intraday"))
+            self._options_runtime = runtime
+        return runtime
+
+    def _strict_options_risk_positions(self) -> Dict[str, Dict[str, Any]]:
+        """Expose strict option risk to the shared portfolio reconciler."""
+        runtime = getattr(self, "_options_runtime", None)
+        if runtime is None or not self.strict_options_mode:
+            return dict(getattr(self, "_options_risk_positions", {}) or {})
+        exporter = getattr(runtime, "risk_positions", None)
+        return dict(exporter() or {}) if callable(exporter) else {}
+
+    def strict_options_risk_positions(self) -> Dict[str, Dict[str, Any]]:
+        return self._strict_options_risk_positions()
+
+    def _strict_options_closed_trades(self) -> List[Dict[str, Any]]:
+        runtime = getattr(self, "_options_runtime", None)
+        exporter = getattr(runtime, "strict_options_closed_trades", None)
+        return list(exporter() or []) if callable(exporter) else []
+
+    def _strict_options_blocked(self) -> bool:
+        """Whether unresolved strict options state must block new entries.
+
+        Existing equity positions may still be managed and flattened, but a
+        combined session must not open another equity trade while the shared
+        MegaBull account has an unresolved option entry/exit or an unknown
+        remote option holding.
+        """
+        if not getattr(self, "strict_options_mode", False):
+            return False
+        runtime = getattr(self, "_options_runtime", None)
+        if runtime is None:
+            return False
+        if bool(getattr(runtime, "_broker_blocked", False)):
+            return True
+        if bool(getattr(self, "_options_unresolved_exits", {})):
+            return True
+        state = getattr(runtime, "_state", {}) or {}
+        for intent in (state.get("intents", {}) or {}).values():
+            if isinstance(intent, dict) and intent.get("status") in {"pending", "uncertain"}:
+                return True
+        return False
+
+    def _options_risk_preflight(self, opt_broker: Any,
+                                candidate: Dict[str, Any],
+                                pick: Any, lots: int,
+                                cfg: Dict[str, Any]) -> Tuple[bool, str]:
+        """Apply production risk state before a remote options submission."""
+        from src.risk_manager import get_risk_state
+        state = get_risk_state()
+        if state.halt_active:
+            return False, "risk-halt"
+        rm_cfg = cfg.get("risk_management", {}) or {}
+        max_open = int(rm_cfg.get("max_open_positions", 5) or 5)
+        if len(getattr(opt_broker, "positions", {}) or {}) >= max_open:
+            return False, "max-open-options"
+        max_consecutive = int(rm_cfg.get("max_consecutive_losses", 0) or 0)
+        if max_consecutive > 0 and state.consecutive_losses >= max_consecutive:
+            return False, "consecutive-loss-limit"
+        capital = float(rm_cfg.get("capital", 0) or 0)
+        max_daily_pct = float(rm_cfg.get("max_daily_loss_pct", 0) or 0)
+        if capital > 0 and max_daily_pct > 0 and state.daily_pnl <= -capital * max_daily_pct / 100:
+            return False, "daily-loss-limit"
+        sid = getattr(pick, "expiry", "") + ":" + str(
+            getattr(pick, "legs", [{}])[0].strike if getattr(pick, "legs", None) else "")
+        if any(key.endswith(sid) for key in self._options_risk_positions):
+            return False, "duplicate-option-entry"
+        if getattr(pick, "maxLoss", 0.0) <= 0:
+            return False, "invalid-option-risk"
+        if lots <= 0:
+            return False, "invalid-lot-size"
+        return True, ""
+
+    def _option_brokers(self) -> List[Any]:
+        """Return the primary options book and any explicitly allowed shadows."""
+        brokers = []
+        primary = getattr(self, "opt_broker", None)
+        if primary is not None:
+            brokers.append(primary)
+        if not self.options_only:
+            brokers.extend(item[0] if isinstance(item, tuple) else item
+                           for item in (getattr(self, "_opt_shadows", []) or []))
+        return [broker for broker in brokers if broker is not None]
+
+    def options_have_positions(self) -> bool:
+        return any(bool(getattr(broker, "positions", {}))
+                   for broker in self._option_brokers())
+
+    def _register_option_fill(self, order: Any, pick: Any, lots: int) -> None:
+        """Register a confirmed option position in the production risk state."""
+        sid = str(getattr(order, "symbol", "") or "")
+        if not sid:
+            return
+        risk_amount = float(getattr(pick, "maxLoss", 0.0) or 0.0) * lots
+        info = {"size": lots, "entry": float(getattr(pick, "net_debit", 0.0) or 0.0),
+                "risk_amount": risk_amount, "asset": "options"}
+        self._options_risk_positions[sid] = info
+        try:
+            from src.risk_manager import add_position
+            add_position(sid, lots, info["entry"], risk_amount)
+        except Exception as exc:
+            logger.warning("Options risk registration failed for %s: %s", sid, exc)
+
+    def _forget_option_risk(self, symbol: str) -> None:
+        self._options_risk_positions.pop(str(symbol), None)
 
     def scan_once(self) -> List[TradeSignal]:
         """
@@ -351,7 +512,8 @@ class PaperTrader:
             if not clock.is_closed(now_ist):
                 return True
             # Market closed: only stop once the book is flat.
-            return bool(self.broker.positions)
+            return bool(self.broker.positions) or self.options_have_positions() \
+                or bool(getattr(self, "_options_unresolved_exits", {}))
         except Exception:
             # Fail-safe: an unreadable clock must not strand live positions.
             return True
@@ -977,19 +1139,54 @@ class PaperTrader:
         """
         if not plan:
             return []
+        strict_mode = getattr(self, "strict_options_mode",
+                              getattr(self, "options_only", False))
+        combined_mode = getattr(self, "combined_mode", False)
+        if strict_mode:
+            # Strict options modes are owned by the dedicated lifecycle
+            # lifecycle runtime.  Do not convert its one-leg candidates into
+            # the legacy OptionTradeCandidate overlay: that path permits
+            # spreads and has a local-shadow fallback in normal production.
+            if plan.get("executed"):
+                logger.info("execute_option_plan: options plan already marked executed; skipping")
+                return []
+            cfg = load_config()
+            broker = opt_broker or self.ensure_option_broker(cfg)
+            runtime = self._get_options_runtime(cfg)
+            strict_plan = (plan if str(plan.get("trading_mode", "")).lower()
+                           == "options_intraday" else
+                           (plan.get("options_intraday_plan")
+                            if combined_mode else plan))
+            if not isinstance(strict_plan, dict):
+                raise RuntimeError("combined plan has no strict options sub-plan")
+            placed = runtime.execute_plan(strict_plan, opt_broker=broker)
+            self.opt_broker = broker
+            self._last_option_order_ids = [
+                str(item.get("order_id")) for item in placed
+                if isinstance(item, dict) and item.get("order_id")
+            ]
+            return placed
         if plan.get("executed"):
             logger.info("execute_option_plan: plan already marked executed; skipping")
             return []
         cfg = load_config()
+        options_mode = bool(self.options_only)
+        if options_mode:
+            ok, reason = validate_options_mode_environment(cfg)
+            if not ok:
+                logger.error("execute_option_plan blocked: %s", reason)
+                return []
         required = remote_paper_required(cfg)
-        if required and not self._session_open():
+        if (required or options_mode) and not self._session_open():
             return []
         if opt_broker is None:
-            if required or getattr(self.broker, "provider_name", "") == "megabull":
+            if options_mode:
+                opt_broker = self.ensure_option_broker(cfg)
+            elif required or getattr(self.broker, "provider_name", "") == "megabull":
                 from src.remote_paper import make_options_broker
                 opt_broker = make_options_broker(self, cfg)
                 self.opt_broker = opt_broker
-        if required:
+        if required or options_mode:
             if getattr(opt_broker, "provider_name", "") != "megabull_options":
                 raise RuntimeError("Remote-only options require MegaBullOptionsBroker")
         if opt_broker is None:
@@ -1026,6 +1223,17 @@ class PaperTrader:
             if not opt or opt.get("strategy") in (None, "", "none"):
                 continue
             try:
+                if options_mode:
+                    valid, reason = validate_option_candidate(
+                        cand, plan=plan, cfg=cfg)
+                    if not valid:
+                        self._log_event("skip", {
+                            "symbol": cand.get("symbol"),
+                            "asset": "options",
+                            "reason": reason,
+                        })
+                        logger.warning("Options-only candidate rejected: %s", reason)
+                        continue
                 from src.options_selector import OptionTradeCandidate, OptionLeg
                 legs = [OptionLeg(**{k: l.get(k, v) for k, v in
                                       OptionLeg().__dict__.items()})
@@ -1033,6 +1241,8 @@ class PaperTrader:
                 pick = OptionTradeCandidate(
                     strategy=opt.get("strategy", ""),
                     underlying=opt.get("underlying", "NIFTY"),
+                    exchange=opt.get("exchange", "NSE"),
+                    lot_size=int(opt.get("lot_size") or 0),
                     spot=float(opt.get("spot") or 0.0),
                     expiry=str(opt.get("expiry") or ""),
                     legs=legs, net_debit=float(opt.get("net_debit") or 0.0),
@@ -1085,19 +1295,38 @@ class PaperTrader:
                 lot_sz = int(load_config().get("options", {}).get(
                     "lot_size", 50))
                 lots = 1
-                if pick.net_debit > 0 and risk_amt > 0:
-                    lots = max(1, int(risk_amt // (pick.net_debit * lot_sz)))
-                if required:
+                risk_unit = float(pick.maxLoss or pick.net_debit * lot_sz or 0.0)
+                if risk_amt > 0 and risk_unit > 0:
+                    lots = int(risk_amt // risk_unit)
+                if options_mode and lots < 1:
+                    self._log_event("skip", {
+                        "symbol": cand.get("symbol"),
+                        "asset": "options",
+                        "reason": "risk-budget-below-one-lot",
+                    })
+                    continue
+                if required or options_mode:
                     from src.execution_lifecycle import (
                         reconcile_broker, validate_available_balance)
                     if reconcile_broker(self).get("uncertain"):
                         break
-                    if get_risk_state().halt_active:
+                    risk_ok, risk_reason = self._options_risk_preflight(
+                        opt_broker, cand, pick, lots, cfg)
+                    if not risk_ok:
+                        self._log_event("skip", {
+                            "symbol": cand.get("symbol"),
+                            "asset": "options",
+                            "reason": risk_reason,
+                        })
                         break
                     # All broker adapters implement the BaseBroker
                     # get_balance() signature without a ``strict`` keyword.
                     try:
+                        if bool(getattr(self.broker, "_auth_failed", False)):
+                            raise RuntimeError("broker balance authentication failed")
                         balance = self.broker.get_balance()
+                        if getattr(self.broker, "_balance_valid", True) is False:
+                            raise RuntimeError("broker balance response not authoritative")
                         available, margin_reason = validate_available_balance(
                             balance)
                     except Exception:
@@ -1123,6 +1352,8 @@ class PaperTrader:
                 order = opt_broker.open_spread(pick, lots=lots,
                                                reason="options-plan")
                 if order.status == "FILLED":
+                    if options_mode:
+                        self._register_option_fill(order, pick, lots)
                     self._opt_spreads_placed.add(sid_key)
                     self._opt_registry_keys.add(registry_key)
                     self._last_option_order_ids.append(str(order.order_id))
@@ -1146,8 +1377,9 @@ class PaperTrader:
                     # the LOCAL paper sim as the shadow book so the
                     # overlay's P&L/marking stays testable and the equity
                     # session is never blocked.
-                    if local_option_shadow_allowed(cfg) and "megabull" in str(
-                            getattr(opt_broker, "provider_name", "")).lower():
+                    if (not options_mode and local_option_shadow_allowed(cfg)
+                            and "megabull" in str(
+                            getattr(opt_broker, "provider_name", "")).lower()):
                         try:
                             from src.broker.options_paper import (
                                 OptionsPaperBroker)
@@ -1230,6 +1462,25 @@ class PaperTrader:
         if not plan:
             logger.warning("execute_plan: no plan supplied.")
             return []
+        if self.options_only:
+            # Options-only mode may manage an existing equity book, but it
+            # must never submit a cash-market order from a stock signal.
+            for cand in plan.get("candidates", []) or []:
+                self._log_event("skip", {
+                    "symbol": cand.get("symbol"),
+                    "asset": "equity",
+                    "reason": "options-only-mode",
+                })
+            logger.info("execute_plan: options-only mode — equity entries blocked.")
+            return []
+        if self._strict_options_blocked():
+            logger.critical("execute_plan: strict options state unresolved — "
+                            "blocking new equity entries while managing exits.")
+            self._log_event("skip", {
+                "asset": "equity",
+                "reason": "strict-options-state-unresolved",
+            })
+            return []
         if plan.get("executed"):
             logger.info("execute_plan: plan already marked executed; skipping")
             return []
@@ -1297,11 +1548,14 @@ class PaperTrader:
             cfg = load_config()
             universe = cfg.get("universe", {}).get("premarket", "nifty100")
             top_n = cfg.get("screener", {}).get("max_positions_to_open", 3)
-            fresh = build_plan(universe, "1d", top_n)
+            fresh = build_plan(universe, "1d", top_n,
+                               trading_mode=self.trading_mode)
             cands = fresh.get("candidates", []) or []
-            option_cands = fresh.get("option_candidates")
-            if option_cands is None:
-                option_cands = cands
+            strict_plan = (fresh.get("options_intraday_plan")
+                           if self.combined_mode else
+                           (fresh if self.options_only else None))
+            option_source = strict_plan if isinstance(strict_plan, dict) else fresh
+            option_cands = option_source.get("option_candidates", []) or []
             try:
                 from src.plan import save_plan as _save_plan
                 from src.plan import today_ist_str
@@ -1340,12 +1594,19 @@ class PaperTrader:
                 except Exception:
                     pass
             return []
-        # Trade the fresh candidates (equity + options) right now.
-        placed_eq = self.execute_plan({"candidates": cands})
+        # Trade the fresh candidates through their asset-specific lifecycle.
+        placed_eq = [] if self.options_only else self.execute_plan(
+            {"candidates": cands})
         placed_opt: List[Dict[str, Any]] = []
         try:
             opt_broker = getattr(self, "opt_broker", None)
-            if opt_broker is not None:
+            if self.strict_options_mode and opt_broker is None:
+                opt_broker = self.ensure_option_broker(cfg)
+            if self.strict_options_mode and opt_broker is not None:
+                options_plan = strict_plan
+                placed_opt = self.execute_option_plan(
+                    options_plan, opt_broker=opt_broker)
+            elif opt_broker is not None:
                 placed_opt = self.execute_option_plan(
                     {"candidates": cands,
                      "option_candidates": option_cands},
@@ -1357,8 +1618,8 @@ class PaperTrader:
             from src.alerts import send_telegram as _send_eq
             from src.alerts import send_options_telegram as _send_opt
             # Equity verdict
-            eq_lines = [f"🔍 *Live Market Scan — Equity ({slot} IST) — found "
-                        f"{len(cands)} setup(s), traded now:*"]
+            eq_lines = [f"🔍 *Live Market Scan — Equity ({slot} IST) — "
+                        f"{'blocked by options-only mode' if self.options_only else f'found {len(cands)} setup(s), traded now'}:*"]
             for c in cands[:5]:
                 eq_lines.append(
                     f"• {c.get('symbol')} {c.get('action')} "
@@ -1367,13 +1628,16 @@ class PaperTrader:
             eq_lines.append(f"Equity orders: {len(placed_eq)}")
             _send_eq("\n".join(eq_lines))
             # Options verdict (separate channel)
-            has_opt = any((c.get("option_legs") or {}).get("strategy") not in (None, "", "none")
-                          for c in option_cands)
+            has_opt = bool(option_cands)
             if has_opt:
                 opt_lines = [f"🔍 *Live Market Scan — Options (8877508167, {slot} IST) — "
                              f"found {len(option_cands)} opportunity(s), traded now:*"]
                 for c in option_cands[:5]:
                     opt = c.get("option_legs") or {}
+                    if not opt and c.get("option_legs") is None:
+                        # Strict planner candidates already contain the
+                        # one-leg structure under option_legs.
+                        opt = {}
                     if opt.get("strategy") and opt.get("strategy") != "none":
                         legs = " + ".join(
                             f"{l.get('side')} {l.get('strike')}{l.get('kind')}"
@@ -1408,7 +1672,30 @@ class PaperTrader:
         guard tick — used by scripts/session.py to mark option spreads to
         the live chain mid. Never raises out of this loop.
         """
-        if not self._session_open():
+        options_runtime = None
+        equity_enabled = not self.options_only
+        if self.strict_options_mode:
+            try:
+                options_runtime = self._get_options_runtime(load_config())
+                self.ensure_option_broker(load_config())
+            except Exception as exc:
+                logger.critical("options_intraday runtime setup failed: %s", exc)
+                return
+        if self.combined_mode and isinstance(plan, dict):
+            nested = plan.get("options_intraday_plan")
+            from datetime import datetime, timedelta, timezone
+            today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+            if (isinstance(nested, dict) and
+                    (nested.get("execution_ready") is False or
+                     str(nested.get("date", "")) != today)):
+                try:
+                    from src.options_intraday_plan import build_intraday_plan
+                    refreshed = build_intraday_plan(load_config())
+                    refreshed["date"] = today
+                    plan["options_intraday_plan"] = refreshed
+                except Exception as exc:
+                    logger.critical("combined options plan refresh failed: %s", exc)
+        if equity_enabled and not self._session_open():
             logger.info("Session is CLOSED — plan execution delayed "
                         "until the next open (managing only).")
             # Still rebuild stop/target for any positions held, so the guard
@@ -1416,7 +1703,8 @@ class PaperTrader:
             self.rehydrate_orders(plan or {})
 
         start = time.time()
-        plan_done = plan is None  # no plan -> nothing to execute
+        equity_plan_done = plan is None or not equity_enabled
+        options_plan_done = plan is None or not self.strict_options_mode
         market_open_alerted = False
         live_scan_times = ["09:40", "10:15", "11:00", "12:00", "13:00", "14:00"]
 
@@ -1426,13 +1714,31 @@ class PaperTrader:
                 ist_now = datetime.now(_tz(_td(hours=5, minutes=30)))
                 now_str = ist_now.strftime("%H:%M")
 
-                from src.execution_lifecycle import reconcile_broker
-                ready = not reconcile_broker(self).get("uncertain")
-                if not plan_done and self._session_open() and ready:
+                if equity_enabled:
+                    from src.execution_lifecycle import reconcile_broker
+                    ready = (not reconcile_broker(self).get("uncertain") and
+                             not self._strict_options_blocked())
+                else:
+                    ready = True
+                if (not equity_plan_done and equity_enabled and
+                        self._session_open() and ready):
                     self.execute_plan(plan)
-                    if getattr(self, "opt_broker", None) is not None:
-                        self.execute_option_plan(plan, opt_broker=self.opt_broker)
-                    plan_done = True
+                    equity_plan_done = True
+                if (not options_plan_done and self.strict_options_mode and
+                        self._session_open()):
+                    try:
+                        self.execute_option_plan(
+                            plan, opt_broker=getattr(self, "opt_broker", None))
+                    except Exception as option_exc:
+                        logger.critical(
+                            "strict options plan execution unresolved: %s",
+                            option_exc)
+                    # The runtime persists intents before remote submission;
+                    # never resubmit the same opening plan on every tick.
+                    options_plan_done = True
+                if ((equity_plan_done or not equity_enabled) and
+                        (options_plan_done or not self.strict_options_mode) and
+                        not market_open_alerted):
                     if not market_open_alerted:
                         _open_msg = "🔔 *Market Open (09:15 IST)*\n\nNSE session has started! TRIO is now active, orders dispatched, and position tracking is live."
                         for _sender in (
@@ -1455,25 +1761,41 @@ class PaperTrader:
                         new_cands = self._live_rescan(slot)
                         break
 
-                # Manage existing positions (stops/targets/partials).
-                self._guard_open_positions()
-                self._manage_open_positions()
-                # EOD: square off once the window closes.
-                self._maybe_eod_square_off()
-                self._log_event("scan", {
-                    "session_open": self._session_open(),
-                    "positions": len(self.broker.positions)})
-                try:
-                    from src.alerts import handle_all_joins
-                    handle_all_joins()
-                except Exception:
-                    pass
-                if tick_hook is not None:
+                # Manage existing positions (stops/targets/partials).  The
+                # options tick hook runs before hard-flat so a remote paper
+                # exit is attempted at the authoritative 15:10 boundary.
+                if equity_enabled:
+                    self._guard_open_positions()
+                    self._manage_open_positions()
+                if self.strict_options_mode:
+                    try:
+                        options_runtime.tick(now=ist_now)
+                    except Exception as runtime_exc:
+                        logger.critical(
+                            "options_intraday tick unresolved: %s", runtime_exc)
+                else:
+                    self._guard_open_positions()
+                    self._manage_open_positions()
+                if tick_hook is not None and not self.strict_options_mode:
                     try:
                         tick_hook()
                     except Exception as hook_exc:
                         logger.warning("run_session tick_hook failed: %s",
                                        hook_exc)
+                # EOD: square off once the window closes.
+                if equity_enabled:
+                    self._maybe_eod_square_off()
+                option_count = (len((options_runtime._state.get("positions", {})
+                                     if options_runtime is not None else {}))
+                                if self.strict_options_mode else 0)
+                self._log_event("scan", {
+                    "session_open": self._session_open(),
+                    "positions": len(self.broker.positions) + option_count})
+                try:
+                    from src.alerts import handle_all_joins
+                    handle_all_joins()
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.error("run_session tick failed: %s", exc)
             # Stop only when the MARKET is closed, not when entries stop.
@@ -1481,10 +1803,27 @@ class PaperTrader:
             # 15:10 — breaking there skipped the forced square-off.)
             if not self._market_still_running():
                 logger.info("Market closed — final square-off.")
-                self._maybe_eod_square_off()
+                if self.strict_options_mode and options_runtime is not None:
+                    try:
+                        options_runtime.finalize(now=ist_now)
+                    except Exception as runtime_exc:
+                        logger.critical(
+                            "options_intraday finalization unresolved: %s",
+                            runtime_exc)
+                if equity_enabled:
+                    self._maybe_eod_square_off()
                 break
             if max_seconds and (time.time() - start) >= max_seconds:
                 logger.info("run_session: max_seconds reached.")
+                if self.strict_options_mode and options_runtime is not None:
+                    try:
+                        options_runtime.finalize(now=ist_now)
+                    except Exception as runtime_exc:
+                        logger.critical(
+                            "options_intraday max-time finalization unresolved: %s",
+                            runtime_exc)
+                if equity_enabled:
+                    self._maybe_eod_square_off(now_ist=ist_now)
                 break
             time.sleep(max(5, interval_seconds))
         self._write_trade_log_csv()

@@ -29,6 +29,7 @@ jobs:
       TRIO_BROKER_PROVIDER: megabull
       TRIO_REMOTE_REQUIRED: "1"
       TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
+      TRIO_TRADING_MODE: combined
       TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +77,8 @@ jobs:
               print("Update the rejected GitHub Actions secret(s) with the raw token from @BotFather.")
               sys.exit(1)
 
-      - name: Build premarket plan
-        run: python scripts/premarket.py
+      - name: Build combined equity and options preview
+        run: python scripts/premarket.py --trading-mode combined
 
       - name: Persist plan to repo
         run: |

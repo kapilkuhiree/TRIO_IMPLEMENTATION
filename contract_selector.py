@@ -49,6 +49,7 @@ def is_contract_eligible(
     max_spread_pct: float = 5.0,
     min_price: float = 0.1,
     max_price: float = 10000.0,
+    live_quote_only: bool = False,
 ) -> Tuple[bool, str]:
     """Check if an option contract meets basic eligibility criteria.
 
@@ -63,6 +64,45 @@ def is_contract_eligible(
     Returns:
         (is_eligible, reason) tuple
     """
+    # A live NSE chain is a quote snapshot, not an OHLC candle.  Keep this
+    # path separate from historical candle eligibility so callers never have
+    # to manufacture open/high/low/close values from spot or LTP.
+    if live_quote_only:
+        required_fields = [
+            "strike", "expiry", "option_type", "volume", "bid", "ask",
+            "open_interest", "quote_timestamp",
+        ]
+        for field in required_fields:
+            if contract.get(field) is None or contract.get(field) == "":
+                return False, f"Missing required live quote field: {field}"
+        if contract.get("option_type", "") not in ("CE", "PE"):
+            return False, f"Invalid option_type: {contract.get('option_type')}"
+        if not contract.get("expiry"):
+            return False, "Missing expiry"
+        try:
+            strike = float(contract.get("strike"))
+            bid = float(contract.get("bid"))
+            ask = float(contract.get("ask"))
+            volume = float(contract.get("volume"))
+            oi = float(contract.get("open_interest"))
+        except (TypeError, ValueError):
+            return False, "Non-numeric live quote field"
+        if strike <= 0:
+            return False, f"Invalid strike: {contract.get('strike')}"
+        if bid <= 0 or ask <= 0:
+            return False, "Non-positive bid/ask"
+        if bid >= ask:
+            return False, "Bid >= Ask (invalid spread)"
+        mid_price = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid_price * 100 if mid_price else 100.0
+        if spread_pct > max_spread_pct:
+            return False, f"Spread too wide: {spread_pct:.1f}% > {max_spread_pct:.1f}%"
+        if volume <= 0:
+            return False, "Non-positive volume"
+        if oi < min_oi:
+            return False, f"Open interest {oi} below minimum {min_oi}"
+        return True, "Eligible live quote"
+
     # Check required fields exist
     required_fields = ["strike", "expiry", "option_type", "open", "high", "low",
                        "close", "volume", "bid", "ask"]
@@ -151,15 +191,17 @@ def validate_expiry_against_underlying(
         # Monthly expiries are last Thursday of month
         return True, "Monthly expiry accepted"
 
-    # Check if expiry is a valid date string
-    try:
-        from datetime import datetime
-        dt = datetime.strptime(expiry, "%Y-%m-%d")
-        # For NIFTY, weekly expiries are typically Thursdays
-        # For now, accept any date format as valid (validated at backtest time)
-        return True, "Date format expiry accepted"
-    except ValueError:
-        return False, f"Invalid expiry date format: {expiry}"
+    # Accept both the canonical NSE chain format and the historical ISO form.
+    for expiry_format in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y"):
+        try:
+            datetime.strptime(expiry, expiry_format)
+            # For NIFTY, weekly expiries are typically Thursdays.  The
+            # exchange listing itself remains the authoritative availability
+            # check for the live-chain path.
+            return True, "Date format expiry accepted"
+        except ValueError:
+            continue
+    return False, f"Invalid expiry date format: {expiry}"
 
 
 def get_valid_expiries(underlying_symbol: str, contract_specs: Dict[str, Any]) -> List[str]:
@@ -269,6 +311,7 @@ def select_option_contract(
     moneyness_target: str = "ATM",
     expected_exchange: Optional[str] = None,
     expected_expiry: Optional[str] = None,
+    live_quote_only: bool = False,
 ) -> Dict[str, Any]:
     """Select the best option contract for a given signal.
 
@@ -328,7 +371,8 @@ def select_option_contract(
             continue
 
         eligible, reason = is_contract_eligible(
-            contract, min_oi=min_oi, max_spread_pct=max_spread_pct
+            contract, min_oi=min_oi, max_spread_pct=max_spread_pct,
+            live_quote_only=live_quote_only,
         )
         if eligible:
             eligible_contracts.append(contract)

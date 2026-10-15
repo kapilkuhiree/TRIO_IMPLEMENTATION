@@ -233,8 +233,18 @@ def cmd_paper(args: argparse.Namespace) -> None:
     print(f"  Interval: {interval}s")
     print(f"  Press Ctrl+C to stop\n")
 
-    trader = PaperTrader(symbols=symbols, timeframe=args.timeframe)
-    trader.run(interval_seconds=interval, max_iterations=args.max_iterations)
+    trader = PaperTrader(symbols=symbols, timeframe=args.timeframe,
+                         trading_mode=getattr(args, "trading_mode", None))
+    if getattr(trader, "strict_options_mode", False):
+        from src.plan import load_plan, today_ist_str
+        plan = load_plan(today_ist_str())
+        trader.ensure_option_broker(load_config())
+        max_seconds = (interval * args.max_iterations
+                       if args.max_iterations else None)
+        trader.run_session(plan=plan, interval_seconds=interval,
+                           max_seconds=max_seconds)
+    else:
+        trader.run(interval_seconds=interval, max_iterations=args.max_iterations)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +334,11 @@ def main() -> None:
     p_paper.add_argument("--timeframe", "-t", default="15m", help="Timeframe")
     p_paper.add_argument("--interval", type=int, default=300, help="Scan interval in seconds")
     p_paper.add_argument("--max-iterations", type=int, help="Stop after N scans")
+    p_paper.add_argument(
+        "--trading-mode", default=None,
+        choices=("production", "combined", "options_intraday"),
+        help="production (default), combined, or options_intraday",
+    )
 
     args = parser.parse_args()
 

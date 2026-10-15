@@ -48,6 +48,7 @@ class OptionLeg:
     """One leg: strike/expiry/side/premium/delta/token."""
     strike: float = 0.0
     expiry: str = ""
+    exchange: str = "NSE"
     kind: str = "CE"          # CE | PE
     side: str = "BUY"         # BUY (long) | SELL (short)
     premium: float = 0.0      # fill price used
@@ -70,6 +71,8 @@ class OptionTradeCandidate:
     strategy: str = ""        # bull-call-spread | bear-put-spread |
                               # iron-condor | long-straddle | none
     underlying: str = "NIFTY"
+    exchange: str = "NSE"
+    lot_size: int = 0
     spot: float = 0.0
     expiry: str = ""
     legs: List[OptionLeg] = field(default_factory=list)
@@ -395,7 +398,7 @@ def select(signal: Any, chain: Dict[str, Any],
         rank = round(conf * iv_pen * liq, 1)
         return OptionTradeCandidate(
             strategy=strat, underlying=underlying, spot=spot,
-            expiry=expiry or "", legs=legs, net_debit=premium,
+            expiry=expiry or "", lot_size=lot_size, legs=legs, net_debit=premium,
             maxLoss=max_loss, maxGain=0.0,
             breakeven=round(row["strike"] + premium
                             if kind == "CE"

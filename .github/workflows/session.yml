@@ -31,6 +31,7 @@ jobs:
       TRIO_BROKER_PROVIDER: megabull
       TRIO_REMOTE_REQUIRED: "1"
       TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
+      TRIO_TRADING_MODE: combined
       TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
@@ -78,8 +79,8 @@ jobs:
               print("Update the rejected GitHub Actions secret(s) with the raw token from @BotFather.")
               sys.exit(1)
 
-      - name: Run session (place plan + manage to EOD)
-        run: python scripts/session.py --interval 60 --max-seconds 21300
+      - name: Run combined equity and options session
+        run: python scripts/session.py --trading-mode combined --interval 60 --max-seconds 21300
 
       - name: Send daily digest
         if: always()

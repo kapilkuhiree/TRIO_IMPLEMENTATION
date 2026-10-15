@@ -24,10 +24,12 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import csv
 import logging
+import re
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -48,6 +50,194 @@ STATUS_PENDING = "PENDING"
 STATUS_FILLED = "FILLED"
 STATUS_REJECTED = "REJECTED"
 STATUS_UNKNOWN = "UNKNOWN"
+
+# Asset classification is deliberately tri-state.  A remote position which
+# cannot be proven to be an equity must not be folded into the equity risk
+# book: the options runtime may own it, or the account may require a manual
+# reconciliation before another entry is safe.
+ASSET_EQUITY = "equity"
+ASSET_OPTIONS = "options"
+ASSET_UNKNOWN = "unknown"
+
+_OPTION_SYMBOL_SUFFIX = re.compile(r"(?:CE|PE)$", re.IGNORECASE)
+_OPTION_TYPE_KEYS = ("optionType", "option_type", "optiontype", "kind", "right")
+_OPTION_CONTRACT_KEYS = (
+    "expiry", "expiryDate", "expiry_date", "strike", "strikePrice",
+    "strike_price", "optionType", "option_type", "optiontype", "kind",
+    "right",
+)
+_EQUITY_TYPES = {
+    "EQ", "EQUITY", "STK", "STOCK", "CASH", "NSEEQ", "NSECM", "BSEEQ",
+    "BSECM",
+}
+
+
+def _mapping(value: Any) -> Dict[str, Any]:
+    """Return a shallow mapping view for metadata-like values."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(vars(value))
+        except Exception:
+            return {}
+    return {}
+
+
+def _metadata_value(metadata: Mapping[str, Any], *keys: str) -> Any:
+    """Read metadata without depending on a vendor's column casing."""
+    for wanted in keys:
+        if wanted in metadata and metadata[wanted] not in (None, ""):
+            return metadata[wanted]
+        wanted_lower = wanted.lower()
+        for actual, value in metadata.items():
+            if str(actual).lower() == wanted_lower and value not in (None, ""):
+                return value
+    return None
+
+
+def classify_instrument(symbol: Any, metadata: Any = None) -> str:
+    """Classify one instrument using only supplied metadata.
+
+    ``ASSET_UNKNOWN`` is intentional.  The helper never calls a broker or
+    refreshes an instrument list, so it is safe to use while reconciling a
+    remote account.  Explicit option instrument types (``OPT``, ``OPTIDX``,
+    ``OPTION`` and vendor variants) win.  A ``CE``/``PE`` suffix is accepted
+    only when contract metadata (expiry, strike, option type, or an option
+    segment) corroborates it; a bare equity symbol ending in those letters is
+    therefore not misclassified.
+    """
+    data = _mapping(metadata)
+    explicit_asset = str(_metadata_value(data, "asset") or "").strip().lower()
+    if explicit_asset in {ASSET_OPTIONS, "option"}:
+        return ASSET_OPTIONS
+    if explicit_asset in {ASSET_EQUITY, "stock"}:
+        return ASSET_EQUITY
+
+    raw_type = _metadata_value(
+        data, "instrumentType", "instrument_type", "instrumenttype", "segment",
+        "securityType", "security_type")
+    type_text = str(raw_type or "").strip().upper()
+    type_compact = re.sub(r"[^A-Z0-9]", "", type_text)
+    if (type_compact == "OPT" or type_compact.startswith("OPT") or
+            "OPTION" in type_compact):
+        return ASSET_OPTIONS
+    if type_compact in _EQUITY_TYPES:
+        return ASSET_EQUITY
+
+    trading_symbol = str(
+        symbol or _metadata_value(data, "tradingSymbol", "trading_symbol", "symbol")
+        or "").strip().upper()
+    suffix_symbol = trading_symbol.removesuffix(".NS").removesuffix(".BO")
+    suffix_option = bool(_OPTION_SYMBOL_SUFFIX.search(suffix_symbol))
+    option_type = str(_metadata_value(data, *_OPTION_TYPE_KEYS) or "").strip().upper()
+    contract_fields = any(
+        _metadata_value(data, key) not in (None, "")
+        for key in _OPTION_CONTRACT_KEYS
+    )
+    exchange = str(_metadata_value(data, "exchange", "exchangeSegment",
+                                   "exchange_segment") or "").strip().upper()
+    option_segment = "OPT" in re.sub(r"[^A-Z0-9]", "", exchange)
+    if suffix_option and (contract_fields or option_segment or option_type in {"CE", "PE", "CALL", "PUT"}):
+        return ASSET_OPTIONS
+
+    # A known non-option type must remain equity even when its symbol happens
+    # to end in CE/PE.  All other incomplete metadata stays conservative.
+    if type_compact in _EQUITY_TYPES:
+        return ASSET_EQUITY
+    return ASSET_UNKNOWN
+
+
+def classify_position(symbol: Any, position: Any = None,
+                      metadata: Any = None) -> str:
+    """Classify a position from position fields plus instrument metadata."""
+    position_data = _mapping(position)
+    combined = dict(position_data)
+    combined.update(_mapping(metadata))
+    return classify_instrument(symbol, combined)
+
+
+def _iter_positions(positions: Any) -> Iterable[Tuple[Any, Any]]:
+    if isinstance(positions, Mapping):
+        return positions.items()
+    if positions is None:
+        return ()
+    return ((getattr(value, "symbol", "") or str(index), value)
+            for index, value in enumerate(positions))
+
+
+def partition_positions(positions: Any, metadata_by_symbol: Any = None,
+                        instrument_cache: Optional[Path] = None) -> Dict[str, Dict[Any, Any]]:
+    """Partition positions into equity, options, and unknown buckets.
+
+    This function is cache-only.  ``instrument_cache`` is read if supplied;
+    no token lookup, download, or other network operation is performed.
+    Values are retained by their original position key so callers can pass
+    the equity bucket directly to the existing risk ledger rebuild.
+    """
+    supplied = _mapping(metadata_by_symbol)
+    cached: Dict[str, Dict[str, Any]] = {}
+    if instrument_cache is not None:
+        try:
+            with open(Path(instrument_cache), encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    tsym = str(row.get("tradingSymbol") or "").strip().upper()
+                    if tsym:
+                        cached[tsym] = dict(row)
+        except (OSError, UnicodeDecodeError):
+            cached = {}
+
+    result: Dict[str, Dict[Any, Any]] = {
+        ASSET_EQUITY: {}, ASSET_OPTIONS: {}, ASSET_UNKNOWN: {},
+    }
+    for key, position in _iter_positions(positions):
+        symbol = str(_mapping(position).get("symbol") or key or "").strip()
+        lookup = symbol.replace(".NS", "").replace(".BO", "").upper()
+        metadata = dict(cached.get(lookup) or cached.get(symbol.upper()) or {})
+        supplied_row = _mapping(supplied.get(symbol) or supplied.get(lookup))
+        metadata.update({key: value for key, value in supplied_row.items()
+                         if value not in (None, "")})
+        asset = classify_position(symbol, position, metadata)
+        result[asset][key] = position
+    return result
+
+
+def partition_closed_trades(closed_trades: Any,
+                            metadata_by_symbol: Any = None,
+                            instrument_cache: Optional[Path] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Partition close records with the same conservative cache-only rules."""
+    result: Dict[str, List[Dict[str, Any]]] = {
+        ASSET_EQUITY: [], ASSET_OPTIONS: [], ASSET_UNKNOWN: [],
+    }
+    supplied = _mapping(metadata_by_symbol)
+    cached: Dict[str, Dict[str, Any]] = {}
+    if instrument_cache is not None:
+        try:
+            with open(Path(instrument_cache), encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    tsym = str(row.get("tradingSymbol") or "").strip().upper()
+                    if tsym:
+                        cached[tsym] = dict(row)
+        except (OSError, UnicodeDecodeError):
+            cached = {}
+    for record in closed_trades or []:
+        if not isinstance(record, Mapping):
+            continue
+        symbol = (record.get("trading_symbol") or record.get("tradingSymbol") or
+                  record.get("symbol") or "")
+        lookup = str(symbol).replace(".NS", "").replace(".BO", "").upper()
+        metadata = dict(cached.get(lookup) or cached.get(str(symbol).upper()) or {})
+        supplied_row = _mapping(supplied.get(symbol) or supplied.get(lookup))
+        metadata.update({key: value for key, value in supplied_row.items()
+                         if value not in (None, "")})
+        record_data = dict(record)
+        metadata.update({key: value for key, value in record_data.items()
+                         if value not in (None, "")})
+        asset = classify_instrument(symbol, metadata)
+        if asset == ASSET_UNKNOWN and str(record.get("asset", "")).lower() in {"option", "options"}:
+            asset = ASSET_OPTIONS
+        result[asset].append(dict(record))
+    return result
 
 
 class MegaBullBroker(BaseBroker):
@@ -84,6 +274,7 @@ class MegaBullBroker(BaseBroker):
         self._pending_orders: Set[str] = set()  # remote LIMIT accepted, not yet confirmed
         self._tokens: Dict[str, str] = {}  # TRADINGSYMBOL -> instrumentToken
         self._name_map_cache: Optional[Dict[str, str]] = None  # instName -> sym
+        self._position_metadata: Dict[str, Dict[str, Any]] = {}
         self._session = session or _QuietSession()
         default_cache = Path("output") / "instruments_cache.csv"
         self.instrument_cache = instrument_cache or default_cache
@@ -199,6 +390,92 @@ class MegaBullBroker(BaseBroker):
         if tsym not in self._tokens:
             raise KeyError(f"No MegaBull instrument for {symbol} ({tsym})")
         return self._tokens[tsym]
+
+    def instrument_metadata(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Read one instrument row from the local cache without refreshing it.
+
+        Classification and account reconciliation must not turn an unknown
+        position into an instrument-download request.  ``instrument_for``
+        remains the explicit, order-time lookup that may use the existing
+        instrument API; this method is intentionally cache-only.
+        """
+        tsym = self.to_trading_symbol(symbol)
+        if not self.instrument_cache.exists():
+            return None
+        try:
+            with open(self.instrument_cache, encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    if (row.get("tradingSymbol") or "").strip().upper() == tsym:
+                        return dict(row)
+        except (OSError, UnicodeDecodeError):
+            return None
+        return None
+
+    def instrument_for(self, symbol: str) -> Dict[str, Any]:
+        """Return the complete cached instrument row for ``symbol``.
+
+        Options-intraday uses this as the final contract-identity boundary:
+        token-only resolution is not enough to prove exchange, expiry, strike,
+        option type, and lot size.  ``token_for`` is allowed to refresh the
+        broker's instrument CSV when the local cache is missing; this method
+        then reads the exact row back and fails closed if it is unavailable.
+        """
+        tsym = self.to_trading_symbol(symbol)
+
+        row = self.instrument_metadata(tsym)
+        if row is None:
+            self.token_for(tsym)
+            row = self.instrument_metadata(tsym)
+        if row is None:
+            raise KeyError(f"No complete MegaBull instrument row for {symbol}")
+        return row
+
+    def classify_instrument(self, symbol: Any, metadata: Any = None) -> str:
+        """Cache-aware classification which never performs network I/O."""
+        row = metadata if metadata is not None else self.instrument_metadata(str(symbol))
+        return classify_instrument(symbol, row)
+
+    def classify_position(self, symbol: Any, position: Any = None,
+                          metadata: Any = None) -> str:
+        """Classify a mirrored position using its remote/cache metadata."""
+        cached = self._position_metadata.get(str(symbol))
+        if cached is None:
+            cached = self._position_metadata.get(self.to_trading_symbol(str(symbol)))
+        row = metadata if metadata is not None else cached
+        if row is None:
+            row = self.instrument_metadata(str(symbol))
+        return classify_position(symbol, position, row)
+
+    def partition_positions(self, positions: Any = None) -> Dict[str, Dict[Any, Any]]:
+        """Return the cache-only equity/option/unknown position partition."""
+        source = self.positions if positions is None else positions
+        metadata: Dict[str, Dict[str, Any]] = dict(self._position_metadata)
+        return partition_positions(source, metadata, self.instrument_cache)
+
+    def partition_closed_trades(self, closed_trades: Any = None) -> Dict[str, List[Dict[str, Any]]]:
+        """Partition close records without fetching instrument metadata."""
+        source = self.closed_trades if closed_trades is None else closed_trades
+        out = partition_closed_trades(source, self._position_metadata,
+                                      self.instrument_cache)
+        # A broker record can have only the symbol while the position mirror
+        # retained the exact metadata.  Fill that gap without changing the
+        # conservative treatment of unknown records.
+        if self._position_metadata:
+            rebuilt: Dict[str, List[Dict[str, Any]]] = {
+                ASSET_EQUITY: [], ASSET_OPTIONS: [], ASSET_UNKNOWN: [],
+            }
+            for record in source or []:
+                if not isinstance(record, Mapping):
+                    continue
+                symbol = (record.get("trading_symbol") or
+                          record.get("tradingSymbol") or record.get("symbol") or "")
+                asset = classify_instrument(
+                    symbol, {**_mapping(record),
+                             **(self._position_metadata.get(str(symbol), {}) or {}),
+                             **(self.instrument_metadata(str(symbol)) or {})})
+                rebuilt[asset].append(dict(record))
+            out = rebuilt
+        return out
 
     # ------------------------------------------------------------------
     # BaseBroker interface
@@ -509,6 +786,7 @@ class MegaBullBroker(BaseBroker):
             logger.warning("Position refresh: unrecognized response shape — stale, not flat")
             return False
         fresh: Dict[str, Position] = {}
+        fresh_metadata: Dict[str, Dict[str, Any]] = {}
         token_to_symbol = {v: k for k, v in self._tokens.items()}
         for it in items or []:
             try:
@@ -527,6 +805,13 @@ class MegaBullBroker(BaseBroker):
             tsym = self._resolve_symbol(it, token_to_symbol)
             symbol = (f"{tsym}.NS" if tsym and not tsym.endswith((".NS", " 50", " BANK"))
                       else tsym)
+            metadata = dict(it)
+            cached = self.instrument_metadata(tsym) if tsym else None
+            if cached:
+                cached.update(metadata)
+                metadata = cached
+            if symbol:
+                fresh_metadata[symbol] = metadata
             try:
                 avg = float(it.get("priceAvg") or it.get("avgBuyPrice") or 0.0)
             except (TypeError, ValueError):
@@ -542,6 +827,7 @@ class MegaBullBroker(BaseBroker):
                 pnl_pct=(pnl / (avg * abs(qty)) * 100) if avg and qty else 0.0,
             )
         self.positions = fresh
+        self._position_metadata = fresh_metadata
         return True
 
     def close_position(self, symbol: str, price: float,
@@ -612,6 +898,7 @@ class MegaBullBroker(BaseBroker):
 
     def get_balance(self) -> Dict[str, float]:
         if getattr(self, "_auth_failed", False):
+            self._balance_valid = False
             return {"total": self.capital, "available": self.capital,
                     "used_margin": 0.0}
         try:
@@ -632,9 +919,11 @@ class MegaBullBroker(BaseBroker):
                     * abs(int(it.get("qty", 0) or 0))
                     for it in items)
             available = float(left) if left is not None else (total - blocked)
+            self._balance_valid = True
             return {"total": total, "available": available,
                     "used_margin": blocked}
         except Exception as exc:  # noqa: BLE001 - dashboard must not die
+            self._balance_valid = False
             logger.warning("Balance fetch failed, using local mirror: %s", exc)
             return {"total": self.capital, "available": self.capital,
                     "used_margin": 0.0}

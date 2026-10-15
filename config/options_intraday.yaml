@@ -1,0 +1,30 @@
+# Dedicated overlay for the explicit options-only runtime.
+# It is loaded by src/options_intraday.py only when that runtime is selected;
+# production config/config.yaml is intentionally not modified by this file.
+options_intraday:
+  execution_class: remote_paper
+  entry_cutoff: "14:30"
+  hard_flat: "15:10"
+  strategies: [orb, pullback, momentum]
+  stop_premium_fraction: 0.20
+  target_premium_fraction: 0.30
+  max_open_positions: 3
+  max_daily_entries: 5
+  max_daily_loss_pct: 1.0
+  max_unrealized_loss_pct: 1.0
+  max_consecutive_losses: 2
+  max_portfolio_risk_pct: 1.0
+  max_correlated_positions: 1
+  correlated_groups:
+    - [NIFTY, FINNIFTY]
+  # Planning-time contract identity.  The broker instrument list is still
+  # revalidated immediately before every remote submission.
+  contract_specs:
+    NIFTY:
+      lot_size: 65
+      provenance: "NIFTY NSE/MegaBull contract specification effective 2026"
+      valid_from: "2026-01-01"
+      valid_until: "2026-12-31"
+  plan_max_age_minutes: 15
+  signal_max_age_minutes: 60
+  chain_max_age_minutes: 15

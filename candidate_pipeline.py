@@ -220,6 +220,129 @@ class CandidatePipeline:
     # ------------------------------------------------------------------
     # Step 1: Strategy Signal Evaluation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _trade_direction(trade: Dict[str, Any]) -> str:
+        """Normalize the three strategy wrappers to bullish/bearish."""
+        signal_type = str(trade.get("signal_type") or "").lower()
+        option_type = str(trade.get("option_type") or "").upper()
+        if signal_type in {"bearish", "breakdown", "short"} or option_type == "PE":
+            return "bearish"
+        return "bullish"
+
+    @classmethod
+    def evaluate_strategy_signals_pure(
+        cls,
+        candles: List[Dict[str, Any]],
+        strategy_name: str,
+        underlying_symbol: str = "NIFTY",
+        contract_specs: Optional[Dict[str, Any]] = None,
+        index: Optional[int] = None,
+    ) -> List[OptionsCandidate]:
+        """Evaluate a strategy without constructing a stateful pipeline.
+
+        The historical ``evaluate_strategy_signals`` method intentionally
+        remains unchanged for the research/backtest workflow.  Production
+        intraday planning must not construct :class:`CandidatePipeline`,
+        because its constructor resets the experimental risk singleton and
+        the old method delegates to backtest wrappers.  This pure entry point
+        calls the strategy classes' signal boundary directly and only builds
+        the existing ``OptionsCandidate`` value objects.
+
+        ``index`` defaults to the last validated, completed bar.  Callers may
+        provide an explicit index when testing a particular completed bar.
+        No risk state, P&L, or trade lifecycle is touched here.
+        """
+        from strategies.orb_strategy import OrbStrategy
+        from strategies.trend_pullback_strategy import TrendPullbackStrategy
+        from strategies.momentum_continuation_strategy import (
+            MomentumContinuationStrategy,
+        )
+
+        key = str(strategy_name or "").strip().lower()
+        strategy_types = {
+            "orb": OrbStrategy,
+            "pullback": TrendPullbackStrategy,
+            "momentum": MomentumContinuationStrategy,
+        }
+        strategy_type = strategy_types.get(key)
+        if strategy_type is None or not candles:
+            return []
+
+        specs = dict(contract_specs or {})
+        index = len(candles) - 1 if index is None else int(index)
+        if index < 0 or index >= len(candles):
+            return []
+
+        strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
+        signal = strategy.evaluate_signal(
+            candles,
+            index,
+            specs,
+            underlying_symbol=underlying_symbol,
+        )
+
+        if isinstance(signal, dict):
+            signal_dict = signal
+        else:
+            signal_dict = dict(getattr(signal, "__dict__", {}) or {})
+        if not bool(signal_dict.get("allowed")):
+            return []
+
+        option_type = str(signal_dict.get("option_type") or "").upper()
+        if option_type not in {"CE", "PE"}:
+            return []
+        candle = candles[index] or {}
+        timestamp = signal_dict.get("trigger_time") or signal_dict.get("timestamp")
+        timestamp = timestamp or candle.get("timestamp", "")
+        entry_price = signal_dict.get("entry_price")
+        stop_loss = signal_dict.get("stop_loss")
+        target = signal_dict.get("target")
+        try:
+            underlying_price = float(entry_price)
+        except (TypeError, ValueError):
+            underlying_price = 0.0
+
+        candidate = OptionsCandidate(
+            candidate_id=(
+                f"{key.upper()}_{timestamp or 'unknown'}_{index}"
+            ),
+            signal_timestamp=str(timestamp or ""),
+            underlying_symbol=underlying_symbol,
+            strategy_name={
+                "orb": "ORB",
+                "pullback": "Pullback",
+                "momentum": "Momentum",
+            }[key],
+            direction=cls._trade_direction(signal_dict),
+            option_type=option_type,
+            entry_price=entry_price or 0.0,
+            stop_loss=stop_loss or 0.0,
+            target=target or 0.0,
+            signal_reason=(
+                signal_dict.get("reasoning")
+                or signal_dict.get("signal_reason")
+                or f"{key} signal"
+            ),
+            underlying_price_at_signal=underlying_price,
+            exchange=str(candle.get("exchange") or "NSE").upper(),
+        )
+        return [candidate]
+
+    @staticmethod
+    def rank_candidates_pure(
+        candidates: List[OptionsCandidate],
+    ) -> List[OptionsCandidate]:
+        """Deterministically rank candidates without touching pipeline state."""
+        return sorted(
+            list(candidates or []),
+            key=lambda candidate: (
+                0 if candidate.contract_eligibility and
+                candidate.contract_eligibility[0] else 1,
+                -float(candidate.contract_rank_score or 0.0),
+                candidate.candidate_id,
+            ),
+        )
     
     def evaluate_strategy_signals(
         self,
@@ -260,7 +383,7 @@ class CandidatePipeline:
                     signal_timestamp=trade.get("timestamp", ""),
                     underlying_symbol=underlying_symbol,
                     strategy_name="ORB",
-                    direction="bullish" if trade.get("signal_type", "") == "bullish" else "bearish",
+                    direction=self._trade_direction(trade),
                     option_type=trade.get("option_type", "CE"),
                     entry_price=trade.get("entry_price", 0),
                     stop_loss=trade.get("stop_loss", 0),
@@ -287,7 +410,7 @@ class CandidatePipeline:
                     signal_timestamp=trade.get("timestamp", ""),
                     underlying_symbol=underlying_symbol,
                     strategy_name="Pullback",
-                    direction="bullish" if trade.get("signal_type", "") == "bullish" else "bearish",
+                    direction=self._trade_direction(trade),
                     option_type=trade.get("option_type", "CE"),
                     entry_price=trade.get("entry_price", 0),
                     stop_loss=trade.get("stop_loss", 0),
@@ -314,7 +437,7 @@ class CandidatePipeline:
                     signal_timestamp=trade.get("timestamp", ""),
                     underlying_symbol=underlying_symbol,
                     strategy_name="Momentum",
-                    direction="bullish" if trade.get("signal_type", "") == "bullish" else "bearish",
+                    direction=self._trade_direction(trade),
                     option_type=trade.get("option_type", "CE"),
                     entry_price=trade.get("entry_price", 0),
                     stop_loss=trade.get("stop_loss", 0),

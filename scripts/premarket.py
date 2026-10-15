@@ -13,6 +13,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 """
 
 import argparse
+from copy import deepcopy
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -23,13 +24,21 @@ sys.path.insert(0, str(ROOT))
 from src.utils import load_env, load_config, utc_now, get_logger  # noqa: E402
 from src.screener import screen, resolve_basket  # noqa: E402
 from src.plan import (save_plan, today_ist_str, next_trading_day_ist_str)  # noqa: E402
+from src.options_intraday import (  # noqa: E402
+    COMBINED,
+    combined_mode_enabled,
+    options_intraday_enabled,
+    resolve_trading_mode,
+)
+from src.options_intraday_plan import build_intraday_plan  # noqa: E402
 
 load_env()
 logger = get_logger("premarket")
 
 
 def build_plan(universe: str, timeframe: str, top_n: int,
-               with_options: bool = True) -> Dict[str, Any]:
+               with_options: bool = True,
+               trading_mode: str = None) -> Dict[str, Any]:
     """Run the daily screen and return the plan payload.
 
     When config `options.enabled` is true, each candidate also carries
@@ -38,6 +47,10 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     untouched so the equity path never depends on options.
     """
     cfg = load_config()
+    mode = resolve_trading_mode(cfg, trading_mode)
+    if options_intraday_enabled(cfg, mode):
+        return build_intraday_plan(cfg)
+    combined = combined_mode_enabled(cfg, mode)
     sc_cfg = cfg.get("screener", {})
     symbols = resolve_basket(universe)
 
@@ -50,7 +63,12 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         pass
 
     opt_cfg = cfg.get("options", {}) or {}
-    options_on = with_options and bool(opt_cfg.get("enabled", True))
+    # Combined mode deliberately uses the existing equity screen without the
+    # legacy option overlay.  Its strict options plan is kept in a separate
+    # nested payload below, so PaperTrader/session cannot route these legs via
+    # the old overlay path.
+    options_on = (with_options and bool(opt_cfg.get("enabled", True))
+                  and not combined)
     options_top_n = int(sc_cfg.get("options_max_candidates", 6) or 6)
     options_min_rank = float(sc_cfg.get(
         "options_min_rank", sc_cfg.get("min_rank", 60.0)))
@@ -206,7 +224,7 @@ def build_plan(universe: str, timeframe: str, top_n: int,
     # here so Telegram/dashboard and the JSON file all agree. `scanned` is
     # what actually fetched, `actionable` is what cleared confidence+rank,
     # and `failed` is genuine fetch/screen errors only.
-    return {
+    plan = {
         "date": today_ist_str(),
         "generated_at": utc_now(),
         "universe": universe,
@@ -226,9 +244,93 @@ def build_plan(universe: str, timeframe: str, top_n: int,
         "option_chain_diagnostic": chain_diagnostic,
         "options_pnl_readiness": "NOT_READY_FOR_OPTIONS_PNL",
         "research_only": True,
+        "trading_mode": mode,
         "executed": False,
         "asset": "equity+options",
     }
+
+    if combined:
+        try:
+            options_plan = deepcopy(build_intraday_plan(cfg))
+            if not isinstance(options_plan, dict):
+                raise TypeError("options plan builder returned a non-mapping")
+        except Exception as exc:
+            # A strict options data failure must never discard the equity
+            # screen.  Keep a complete, auditable nested plan for the session
+            # owner to rebuild at the open.
+            options_plan = {
+                "date": today_ist_str(),
+                "generated_at": utc_now(),
+                "trading_mode": "options_intraday",
+                "asset": "options",
+                "candidates": [],
+                "option_candidates": [],
+                "option_chain": None,
+                "intraday_data_diagnostic": {
+                    "valid": False,
+                    "failure_reason": "options_plan_build_exception",
+                },
+                "option_chain_diagnostic": {
+                    "valid": False,
+                    "failure_reason": f"options_plan_build_exception: {exc}",
+                },
+                "executed": False,
+            }
+
+        # build_intraday_plan is also used by a same-session owner.  The
+        # premarket artifact itself is a preview unless a caller explicitly
+        # proves that the nested plan is execution-ready.
+        options_plan["trading_mode"] = "options_intraday"
+        options_plan.setdefault("asset", "options")
+        options_plan.setdefault("candidates", [])
+        options_plan.setdefault("option_candidates", [])
+        options_plan.setdefault("option_chain", None)
+        if not isinstance(options_plan.get("option_chain_diagnostic"), dict):
+            options_plan["option_chain_diagnostic"] = {}
+        if not isinstance(options_plan.get("intraday_data_diagnostic"), dict):
+            options_plan["intraday_data_diagnostic"] = {}
+        options_plan.setdefault("generated_at", utc_now())
+        chain = options_plan.get("option_chain") or {}
+        option_candidates = options_plan.get("option_candidates") or []
+        if not isinstance(options_plan.get("timestamps"), dict):
+            options_plan["timestamps"] = {}
+        timestamps = options_plan["timestamps"]
+        timestamps.setdefault("generated_at", options_plan.get("generated_at"))
+        timestamps.setdefault(
+            "option_chain_quote",
+            chain.get("quote_timestamp") if isinstance(chain, dict) else None,
+        )
+        timestamps.setdefault(
+            "latest_signal",
+            next((candidate.get("signal_timestamp")
+                  for candidate in option_candidates
+                  if isinstance(candidate, dict)
+                  and candidate.get("signal_timestamp")), None),
+        )
+        diagnostic_text = " ".join(
+            str(value).lower()
+            for value in (
+                (options_plan.get("option_chain_diagnostic") or {}).get(
+                    "failure_reason", ""),
+                (options_plan.get("intraday_data_diagnostic") or {}).get(
+                    "failure_reason", ""),
+            )
+        )
+        preview_or_stale = any(
+            options_plan.get(key) is True
+            for key in ("preview", "is_preview", "stale", "is_stale")
+        ) or "preview" in diagnostic_text or "stale" in diagnostic_text
+        if options_plan.get("execution_ready") is not True or preview_or_stale:
+            options_plan["execution_ready"] = False
+            options_plan.setdefault(
+                "execution_blocked_reason",
+                "combined premarket options plan is a preview; rebuild at session open",
+            )
+
+        plan["options_intraday_plan"] = options_plan
+        plan["legacy_options_overlay"] = False
+
+    return plan
 
 
 def format_summary(plan: Dict[str, Any], kind: str = "all") -> str:
@@ -240,8 +342,10 @@ def format_summary(plan: Dict[str, Any], kind: str = "all") -> str:
     lines = [f"*TRIO premarket plan — {plan['date']}{tag}*",
              f"Universe: {plan['universe']} ({plan['scanned']} scanned, {_fail} failed, {plan.get('requested', _req)} requested) "
              f"on {plan['timeframe']}"]
-    cands = (plan.get("option_candidates", []) or []) if kind == "options" \
-        else (plan.get("candidates", []) or [])
+    option_plan = plan.get("options_intraday_plan", {}) or {}
+    option_source = option_plan if plan.get("trading_mode") == COMBINED else plan
+    cands = ((option_source.get("option_candidates", []) or [])
+             if kind == "options" else (plan.get("candidates", []) or []))
     if kind == "options":
         opts = [c for c in cands if (c.get("option_legs") or {}).get("strategy") not in (None, "", "none")]
         if not opts:
@@ -289,6 +393,30 @@ def format_options_summary(plan: Dict[str, Any]) -> str:
     return format_summary(plan, kind="options")
 
 
+def prepare_plan_for_premarket(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark the post-close artifact as a preview for the next session.
+
+    Strict options candidates use same-session completed bars and exchange
+    quotes, so they must be rebuilt after the next session opens.  The
+    artifact is retained for diagnostics, but the session runner will not
+    treat it as executable.
+    """
+    prepared = dict(plan or {})
+    prepared["date"] = next_trading_day_ist_str()
+    if prepared.get("trading_mode") == "options_intraday":
+        prepared["execution_ready"] = False
+        prepared["execution_blocked_reason"] = (
+            "options_intraday plans are rebuilt during the live session")
+    elif prepared.get("trading_mode") == COMBINED:
+        nested = deepcopy(prepared.get("options_intraday_plan") or {})
+        nested["trading_mode"] = "options_intraday"
+        nested["execution_ready"] = False
+        nested["execution_blocked_reason"] = (
+            "combined premarket options plan is rebuilt during the live session")
+        prepared["options_intraday_plan"] = nested
+    return prepared
+
+
 def main() -> None:
     # Check for /start on BOTH bots so broadcasts stay separate.
     try:
@@ -304,6 +432,9 @@ def main() -> None:
     parser.add_argument("--timeframe", default="1d")
     parser.add_argument("--top-n", type=int, default=None)
     parser.add_argument("--no-alert", action="store_true")
+    parser.add_argument("--trading-mode", default=None,
+                        choices=("production", "combined", "options_intraday"),
+                        help="production (default), combined, or options_intraday")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -314,9 +445,11 @@ def main() -> None:
 
     logger.info("Premarket scan: universe=%s timeframe=%s top_n=%d",
                 universe, args.timeframe, top_n)
-    plan = build_plan(universe, args.timeframe, top_n)
+    trading_mode = resolve_trading_mode(cfg, args.trading_mode)
+    plan = build_plan(universe, args.timeframe, top_n,
+                      trading_mode=trading_mode)
     # The post-close premarket run belongs to the next valid NSE session.
-    plan["date"] = next_trading_day_ist_str()
+    plan = prepare_plan_for_premarket(plan)
     path = save_plan(plan, date=plan["date"])
     print(f"Plan written: {path}")
     print(format_summary(plan))

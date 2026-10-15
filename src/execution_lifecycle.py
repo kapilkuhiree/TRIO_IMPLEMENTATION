@@ -92,6 +92,161 @@ def _make_close_key(record: Dict[str, Any]) -> str:
 # reconcile
 # ---------------------------------------------------------------------------
 
+def _equity_position_partition(broker: Any,
+                               positions: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Return only positions proven to belong to the equity book.
+
+    MegaBull exposes one account for equity and strict options.  Its
+    cache-only partition helper is the boundary that prevents an option leg
+    from being rebuilt as a stock position.  Brokers without that optional
+    helper retain the existing equity-only behavior.  Unknown MegaBull
+    entries are excluded and reported as unresolved rather than guessed into
+    the equity ledger.
+    """
+    provider = str(getattr(broker, "provider_name", "")).strip().lower()
+    partition = getattr(broker, "partition_positions", None)
+    if provider == "megabull_options" and not callable(partition):
+        return {}, list((positions or {}).keys())
+    if not callable(partition):
+        classifier = getattr(broker, "classify_position", None)
+        if callable(classifier):
+            equity: Dict[str, Any] = {}
+            unknown: List[str] = []
+            for key, value in (positions or {}).items():
+                try:
+                    asset = str(classifier(key, value)).lower()
+                except Exception:
+                    asset = "unknown"
+                if asset == "equity":
+                    equity[key] = value
+                elif asset == "unknown":
+                    unknown.append(str(key))
+            return equity, unknown
+        return dict(positions or {}), []
+    try:
+        buckets = partition(positions)
+    except Exception as exc:
+        logger.warning("reconcile: instrument partition failed: %s", exc)
+        return {}, list((positions or {}).keys())
+    if not isinstance(buckets, Mapping):
+        return {}, list((positions or {}).keys())
+    equity = buckets.get("equity", {})
+    unknown = buckets.get("unknown", {})
+    return (dict(equity) if isinstance(equity, Mapping) else {},
+            list(unknown.keys()) if isinstance(unknown, Mapping) else [])
+
+
+def _equity_closed_trades(broker: Any,
+                          closed_trades: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Filter option/unknown close records from the equity rebuild."""
+    partition = getattr(broker, "partition_closed_trades", None)
+    if not callable(partition):
+        if str(getattr(broker, "provider_name", "")).lower() == "megabull_options":
+            return [], [str(item.get("symbol", "")) for item in closed_trades]
+        classifier = getattr(broker, "classify_instrument", None)
+        if callable(classifier):
+            equity: List[Dict[str, Any]] = []
+            unknown: List[str] = []
+            for item in closed_trades:
+                if not isinstance(item, Mapping):
+                    continue
+                symbol = (item.get("trading_symbol") or item.get("tradingSymbol") or
+                          item.get("symbol") or "")
+                try:
+                    asset = str(classifier(symbol, item)).lower()
+                except Exception:
+                    asset = "unknown"
+                if asset == "equity":
+                    equity.append(dict(item))
+                elif asset == "unknown":
+                    unknown.append(str(symbol))
+            return equity, unknown
+        return list(closed_trades or []), []
+    try:
+        buckets = partition(closed_trades)
+    except Exception as exc:
+        logger.warning("reconcile: close partition failed: %s", exc)
+        return [], [str(item.get("symbol", "")) for item in closed_trades]
+    if not isinstance(buckets, Mapping):
+        return [], [str(item.get("symbol", "")) for item in closed_trades]
+    equity = buckets.get("equity", [])
+    unknown = buckets.get("unknown", [])
+    return (list(equity) if isinstance(equity, (list, tuple)) else [],
+            [str(item.get("symbol", "")) for item in unknown if isinstance(item, Mapping)])
+
+
+def _strict_options_risk_positions(trader: Any) -> Dict[str, Dict[str, Any]]:
+    """Read the strict runtime's open option positions, if attached.
+
+    The parent integration owns policy and attachment.  This lifecycle only
+    consumes a callable export when present, with the legacy mapping retained
+    as a compatibility fallback for existing option-only callers.
+    """
+    owners = [trader, getattr(trader, "_options_runtime", None)]
+    found: Any = None
+    for owner in owners:
+        if owner is None:
+            continue
+        names = ("_strict_options_risk_positions", "strict_options_risk_positions")
+        if owner is getattr(trader, "_options_runtime", None):
+            names = names + ("risk_positions",)
+        for name in names:
+            export = getattr(owner, name, None)
+            if callable(export):
+                try:
+                    found = export()
+                except Exception as exc:
+                    logger.warning("reconcile: strict option risk export failed: %s", exc)
+                    found = None
+                break
+        if found is not None:
+            break
+    if found is None:
+        found = getattr(trader, "_options_risk_positions", {}) or {}
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(found, Mapping):
+        items = found.items()
+    elif isinstance(found, (list, tuple, set)):
+        items = []
+        for value in found:
+            if isinstance(value, Mapping):
+                key = value.get("position_id") or value.get("symbol") or value.get("trading_symbol")
+                if key:
+                    items.append((key, value))
+    else:
+        items = []
+    for key, value in items:
+        if not isinstance(value, Mapping):
+            continue
+        info = dict(value)
+        # The callable is the strict-options boundary; asset qualification is
+        # repeated here so a stale legacy export cannot become an equity row.
+        info["asset"] = "options"
+        info.setdefault("position_id", str(key))
+        info.setdefault("symbol", str(key))
+        normalized[str(key)] = info
+    return normalized
+
+
+def _strict_options_closed_trades(trader: Any) -> List[Dict[str, Any]]:
+    """Read private strict-runtime close records for shared P&L rebuilds."""
+    owners = [trader, getattr(trader, "_options_runtime", None)]
+    for owner in owners:
+        if owner is None:
+            continue
+        for name in ("_strict_options_closed_trades", "strict_options_closed_trades"):
+            export = getattr(owner, name, None)
+            if callable(export):
+                try:
+                    value = export()
+                except Exception as exc:
+                    logger.warning("reconcile: strict option close export failed: %s", exc)
+                    return []
+                return [dict(item) for item in value
+                        if isinstance(item, Mapping)] if isinstance(value, (list, tuple)) else []
+    return []
+
 def reconcile_broker(trader) -> Dict[str, Any]:
     """Refresh the mirror, scan for PENDING/UNKNOWN rows, rebuild risk.
 
@@ -177,17 +332,45 @@ def reconcile_broker(trader) -> Dict[str, Any]:
                                       clear_broker_uncertain, rebuild_from_ledger,
                                       get_risk_state)
 
-        # Rebuild from the now-refreshed mirror + ledger.
+        # Rebuild only the equity book.  Strict option risk is merged back
+        # immediately below from the runtime's callable export.
+        equity_positions, unknown_positions = _equity_position_partition(
+            broker, positions_dict)
+        equity_closed, unknown_closes = _equity_closed_trades(
+            broker, list(getattr(broker, "closed_trades", []) or []))
+        strict_closed = _strict_options_closed_trades(trader)
+        rebuild_closed = equity_closed + strict_closed
         try:
             from datetime import datetime, timezone, timedelta as _td
             IST = timezone(_td(hours=5, minutes=30))
             today = datetime.now(IST).strftime("%Y-%m-%d")
         except Exception:
             today = None
-        rebuild_from_ledger(positions_dict,
-                            getattr(broker, "closed_trades", []) or [],
+        rebuild_from_ledger(equity_positions,
+                            rebuild_closed,
                             today=today)
         rs = get_risk_state()
+        for opt_symbol, opt_info in _strict_options_risk_positions(trader).items():
+            rs.positions[opt_symbol] = dict(opt_info)
+        rs.open_positions = len(rs.positions)
+        if unknown_positions or unknown_closes:
+            try:
+                set_broker_uncertain("unclassified remote instrument(s)")
+            except Exception:
+                pass
+            out["uncertain"] = True
+        # Runtime close records are now part of this rebuild.  Mark them as
+        # already read back so a runtime reconstruction cannot apply P&L a
+        # second time in the same process.
+        closed_ids = getattr(rs, "_options_intraday_closed_ids", set())
+        if not isinstance(closed_ids, set):
+            closed_ids = set(closed_ids or [])
+        for record in strict_closed:
+            close_id = str(record.get("position_id") or record.get("symbol") or "")
+            closed_at = str(record.get("closed_at") or "")
+            if close_id and closed_at:
+                closed_ids.add(close_id + "|" + closed_at)
+        setattr(rs, "_options_intraday_closed_ids", closed_ids)
         try:
             trader._proposed = dict(getattr(rs, "positions", {}) or {})
         except Exception:
@@ -196,11 +379,15 @@ def reconcile_broker(trader) -> Dict[str, Any]:
         # Rebuild resets the in-memory RiskState. Apply the broker uncertainty
         # decision *after* rebuilding so a pending/ambiguous remote book cannot
         # accidentally lose its safety halt.
-        if pending or state["consecutive_successes"] < required_consecutive:
-            reason = (f"{len(pending)} pending/unknown position(s)"
-                      if pending else
-                      f"warming up refresh confidence "
-                      f"({state['consecutive_successes']}/{required_consecutive})")
+        if (pending or unknown_positions or unknown_closes or
+                state["consecutive_successes"] < required_consecutive):
+            if unknown_positions or unknown_closes:
+                reason = "unclassified remote instrument(s)"
+            elif pending:
+                reason = f"{len(pending)} pending/unknown position(s)"
+            else:
+                reason = (f"warming up refresh confidence "
+                          f"({state['consecutive_successes']}/{required_consecutive})")
             set_broker_uncertain(reason)
             out["uncertain"] = True
         else:
@@ -244,6 +431,8 @@ def preflight(trader, candidate: Dict[str, Any],
     """
     from src.risk_manager import get_risk_state, would_breach_sector
     cfg = cfg if cfg is not None else load_config()
+    if bool(getattr(trader, "options_only", False)):
+        return False, "options-only-mode"
     allow_shorts = bool(cfg.get("trading", {}).get("allow_shorts", False))
     max_open = int(cfg.get("risk_management", {}).get("max_open_positions", 5) or 5)
 
@@ -444,6 +633,22 @@ def record_confirmed_close(trader, symbol: str,
     """
     if not record:
         return {}
+    # The strict runtime books option closes itself before returning them to a
+    # caller.  Its marker survives lifecycle rebuilds, so a parent callback
+    # forwarding that same record must not apply the realized P&L again.
+    if str(record.get("asset", "")).strip().lower() in {"option", "options"}:
+        try:
+            from src.risk_manager import get_risk_state as _risk
+            seen = getattr(_risk(), "_options_intraday_closed_ids", set())
+            if not isinstance(seen, set):
+                seen = set(seen or [])
+            marker = str(record.get("close_id") or "")
+            fallback_marker = str(record.get("position_id") or symbol) + "|" + str(
+                record.get("closed_at") or "")
+            if marker in seen or fallback_marker in seen:
+                return record
+        except Exception:
+            pass
     tid = _get_trader_id(trader)
     ckey = _make_close_key(record)
     now = time.time()
@@ -460,8 +665,20 @@ def record_confirmed_close(trader, symbol: str,
     _processed_closes[cache_key] = now
 
     try:
-        from src.risk_manager import close_position as _rm_close, update_pnl as _rm_pnl
+        from src.risk_manager import (close_position as _rm_close,
+                                      get_risk_state as _risk,
+                                      update_pnl as _rm_pnl)
         _rm_pnl(float(record.get("pnl") or 0.0))
+        if str(record.get("asset", "")).strip().lower() in {"option", "options"}:
+            risk_state = _risk()
+            seen = getattr(risk_state, "_options_intraday_closed_ids", set())
+            if not isinstance(seen, set):
+                seen = set(seen or [])
+            marker = str(record.get("close_id") or "")
+            seen.add(marker)
+            seen.add(str(record.get("position_id") or symbol) + "|" + str(
+                record.get("closed_at") or ""))
+            setattr(risk_state, "_options_intraday_closed_ids", seen)
         # partial exits keep the runner visible — only full closes pop the key
         try:
             broker = getattr(trader, "broker", None)

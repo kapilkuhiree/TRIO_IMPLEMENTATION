@@ -165,16 +165,38 @@ def _num(x: Any) -> float:
         return 0.0
 
 
+def _exchange_timestamp(value: Any) -> Any:
+    """Return an exchange-supplied timestamp without replacing it locally."""
+    if value in (None, ""):
+        return None
+    return value
+
+
 def _parse_strike_row(expiry: str, strike: Any,
-                      row: Dict[str, Any]) -> Dict[str, Any]:
+                      row: Dict[str, Any],
+                      record_timestamp: Any = None) -> Dict[str, Any]:
     """Normalize one NSE strike row to {strike, CE:{...}, PE:{...}}.
 
     v3 legs use buyPrice1/sellPrice1 for bid/ask (legacy used
     bidprice/askPrice) — accept both.
     """
-    out: Dict[str, Any] = {"strike": float(strike), "expiry": expiry}
+    row_timestamp = _exchange_timestamp(
+        row.get("row_timestamp") or row.get("timestamp")
+        or row.get("quote_timestamp") or record_timestamp
+    )
+    out: Dict[str, Any] = {
+        "strike": float(strike),
+        "expiry": expiry,
+        # These are exchange-record timestamps.  They intentionally do not
+        # fall back to the local HTTP retrieval time.
+        "row_timestamp": row_timestamp,
+    }
     for side in ("CE", "PE"):
         leg = row.get(side) or {}
+        quote_timestamp = _exchange_timestamp(
+            leg.get("quote_timestamp") or leg.get("timestamp")
+            or leg.get("row_timestamp") or row_timestamp
+        )
         out[side] = {
             "lastPrice": _num(leg.get("lastPrice")),
             "bidPrice": _num(leg.get("bidPrice", leg.get("buyPrice1"))),
@@ -183,7 +205,11 @@ def _parse_strike_row(expiry: str, strike: Any,
             "changeOI": int(leg.get("changeinOpenInterest") or 0),
             "iv": _num(leg.get("impliedVolatility")),
             "volume": int(leg.get("totalTradedVolume") or 0),
+            "quote_timestamp": quote_timestamp,
+            "row_timestamp": row_timestamp,
         }
+        if quote_timestamp is not None:
+            out["quote_timestamp"] = quote_timestamp
     return out
 
 
@@ -311,6 +337,10 @@ def fetch_chain(symbol: str = "NIFTY",
                 raw_rows = (rec.get("data")
                             or (data.get("filtered", {}) or {}).get("data")
                             or data.get("data") or [])
+                record_timestamp = (
+                    rec.get("timestamp") or rec.get("quote_timestamp")
+                    or data.get("timestamp") or data.get("quote_timestamp")
+                )
                 response_diag = next(
                     (item for item in reversed(response_diagnostics)
                      if item.get("requested_expiry") == (requested_expiry or None)
@@ -328,12 +358,14 @@ def fetch_chain(symbol: str = "NIFTY",
                     exp = explicit_expiry
                     if not exp:
                         eds = row.get("expiryDates") or ""
-                        if isinstance(eds, str) and eds in all_expiries:
+                        if isinstance(eds, str) and eds:
                             exp = eds
                         elif requested_expiry:
-                            # Per-expiry responses may omit both singular and
-                            # usable plural expiry keys.  The request itself
-                            # is the authoritative grouping key.
+                            # A response made with an explicit expiry is
+                            # authoritative when NSE omits the row field.  An
+                            # aggregate response is not allowed to guess an
+                            # expiry from the global list: doing so silently
+                            # puts a strike under the wrong expiry key.
                             exp = requested_expiry
                     strike = row.get("strikePrice")
                     if not exp or strike is None:
@@ -342,7 +374,10 @@ def fetch_chain(symbol: str = "NIFTY",
                                 "missing_expiry_or_strike")
                         continue
                     try:
-                        normalized = _parse_strike_row(exp, strike, row)
+                        normalized = _parse_strike_row(
+                            exp, strike, row,
+                            record_timestamp=record_timestamp,
+                        )
                         if normalized["strike"] <= 0:
                             raise ValueError("non-positive strike")
                     except (TypeError, ValueError) as exc:
@@ -372,9 +407,20 @@ def fetch_chain(symbol: str = "NIFTY",
                 "expiry_status": {},
                 "freshness": {"ttl_minutes": ttl, "fresh": True},
             }
+            exchange_timestamps = []
+            for rows in by_expiry.values():
+                for row in rows:
+                    if row.get("quote_timestamp") not in (None, ""):
+                        exchange_timestamps.append(row["quote_timestamp"])
+            quote_timestamp = (
+                exchange_timestamps[0] if exchange_timestamps and
+                all(item == exchange_timestamps[0] for item in exchange_timestamps)
+                else None
+            )
             chain = {"underlying": underlying, "symbol": symbol,
                      "expiries": expiries, "by_expiry": by_expiry,
                      "source": "nse", "retrieved_at": retrieved_at,
+                     "quote_timestamp": quote_timestamp,
                      "diagnostics": diagnostic}
             diagnostic["expiry_status"] = {
                 exp: expiry_status(chain, exp) for exp in expiries[:4]

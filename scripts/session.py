@@ -19,7 +19,7 @@ import argparse
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -27,11 +27,50 @@ sys.path.insert(0, str(ROOT))
 from src.utils import load_env, load_config, get_logger  # noqa: E402
 from src.paper_trader import PaperTrader  # noqa: E402
 from src.plan import load_plan, today_ist_str, mark_executed  # noqa: E402
+from src.options_intraday import (  # noqa: E402
+    COMBINED,
+    combined_mode_enabled,
+    options_intraday_enabled,
+    resolve_trading_mode,
+    strict_options_enabled,
+)
 
 load_env()
 logger = get_logger("session")
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _refresh_strict_options_subplan(plan: Optional[Dict[str, Any]],
+                                    cfg: Dict[str, Any],
+                                    session_date: str,
+                                    *, combined: bool) -> Optional[Dict[str, Any]]:
+    """Rebuild only the strict options leg from current completed bars/quotes.
+
+    Combined mode retains its already-generated equity candidates.  The
+    nested options plan is always rebuilt when it is a premarket preview or
+    belongs to another session, so a stale option quote cannot be routed.
+    """
+    if plan is None:
+        return plan
+    if combined:
+        nested = plan.get("options_intraday_plan")
+        needs_refresh = (not isinstance(nested, dict) or
+                         nested.get("execution_ready") is False or
+                         str(nested.get("date", "")) != str(session_date))
+        if needs_refresh:
+            from src.options_intraday_plan import build_intraday_plan
+            refreshed = build_intraday_plan(cfg)
+            refreshed["date"] = session_date
+            plan["options_intraday_plan"] = refreshed
+        return plan
+    if str(plan.get("trading_mode", "")).strip().lower() == "options_intraday":
+        if plan.get("execution_ready") is False or str(plan.get("date", "")) != str(session_date):
+            from src.options_intraday_plan import build_intraday_plan
+            refreshed = build_intraday_plan(cfg)
+            refreshed["date"] = session_date
+            return refreshed
+    return plan
 
 
 def main() -> None:
@@ -44,12 +83,28 @@ def main() -> None:
                         help="Skip reading a plan (management only)")
     parser.add_argument("--allow-stale-plan", action="store_true",
                         help="Allow stale-plan fallback (default: management-only)")
+    parser.add_argument("--trading-mode", default=None,
+                        help="production (default), combined, or options_intraday")
     args = parser.parse_args()
 
     date = args.date or today_ist_str()
     cfg = load_config()
+    trading_mode = resolve_trading_mode(cfg, args.trading_mode)
+    options_only = options_intraday_enabled(cfg, trading_mode)
+    combined = combined_mode_enabled(cfg, trading_mode)
+    strict_options = strict_options_enabled(cfg, trading_mode)
 
     plan = None if args.no_plan else load_plan(date)
+    if combined and plan is not None and plan.get("trading_mode") != COMBINED:
+        logger.info("Ignoring non-combined plan for %s; rebuilding equity + "
+                    "strict-options plan.", date)
+        plan = None
+    if options_only and plan is not None and (
+            plan.get("execution_ready") is False or
+            plan.get("trading_mode") != "options_intraday"):
+        logger.info("Ignoring non-executable options preview for %s; "
+                    "building a same-session intraday plan.", date)
+        plan = None
     if plan is not None:
         # Use today's plan as-is (validated on its own screen).
         pass
@@ -94,7 +149,8 @@ def main() -> None:
                     from src.plan import save_plan as _save_plan
                     cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
                     fresh = build_plan(cfg_universe, "1d",
-                                       cfg.get("screener", {}).get("max_positions_to_open", 3))
+                                       cfg.get("screener", {}).get("max_positions_to_open", 3),
+                                       trading_mode=trading_mode)
                     fresh["date"] = date
                     _save_plan(fresh, date=date)
                     logger.info("Fresh plan also built: %d candidate(s) for %s.",
@@ -123,7 +179,8 @@ def main() -> None:
                 from src.plan import save_plan as _save_plan
                 cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
                 plan = build_plan(cfg_universe, "1d",
-                                   cfg.get("screener", {}).get("max_positions_to_open", 3))
+                                   cfg.get("screener", {}).get("max_positions_to_open", 3),
+                                   trading_mode=trading_mode)
                 plan["date"] = date
                 _save_plan(plan, date=date)
                 logger.info("Live fallback plan built: %d candidate(s) for %s.",
@@ -142,7 +199,8 @@ def main() -> None:
             from src.plan import save_plan as _save_plan
             cfg_universe = cfg.get("universe", {}).get("premarket", "nifty100")
             plan = build_plan(cfg_universe, "1d",
-                               cfg.get("screener", {}).get("max_positions_to_open", 3))
+                               cfg.get("screener", {}).get("max_positions_to_open", 3),
+                               trading_mode=trading_mode)
             plan["date"] = date
             _save_plan(plan, date=date)
             logger.info("Fresh plan built: %d candidate(s) for %s.",
@@ -150,6 +208,15 @@ def main() -> None:
         except Exception as exc:
             logger.error("Fresh plan build failed: %s — manage-only.", exc)
             plan = None
+
+    if strict_options and plan is not None and not args.no_plan:
+        try:
+            plan = _refresh_strict_options_subplan(
+                plan, cfg, date, combined=combined)
+        except Exception as exc:
+            logger.error("Strict options plan refresh failed: %s", exc)
+            if options_only:
+                plan = None
 
     # Session uses the plan's symbols so position data can be fetched.
     symbols = list(plan.get("symbols", [])) if plan else []
@@ -163,6 +230,7 @@ def main() -> None:
         symbols=symbols or None,
         timeframe="15m",
         initial_capital=(cfg.get("risk_management", {}) or {}).get("capital"),
+        trading_mode=trading_mode,
     )
     logger.info("Session job: plan=%s candidates=%d",
                 date, len((plan or {}).get("candidates", [])))
@@ -247,13 +315,16 @@ def main() -> None:
         eq_prov = (cfg.get("broker", {}) or {}).get("provider", "megabull").upper()
         opt_prov = (cfg.get("options", {}) or {}).get("broker", "megabull").upper()
 
+        _option_route = ("remote paper only; local shadow disabled"
+                         if strict_options else
+                         "with instant local-sim shadow fallback")
         _msg = [
             "☀️ *Good morning, Mr Kapil Kuhire Sir!*",
             "TRIO session started at 09:10 IST — *Waiting for market open (09:15 IST)*.",
             "",
             f"📍 *Platforms targeted today:*",
             f"• *Equity Intraday:* `{eq_prov}` (MIS paper fills)",
-            f"• *Index Options:* `{opt_prov}` (with instant local-sim shadow fallback)",
+            f"• *Index Options:* `{opt_prov}` ({_option_route})",
             "",
             f"📋 *Today's Plan ({date}):* {len((plan or {}).get('candidates', []))} candidate(s)"
         ]
@@ -282,24 +353,21 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Startup good-morning alert failed: %s", exc)
 
-    # Options overlay (shadow until proven): place spreads for candidates
-    # carrying option_legs. Broker comes from config `options.broker`:
-    # "paper" (default) keeps the local options_paper sim; "megabull"
-    # routes both legs to the MegaBull remote paper account so the user
-    # can SEE the NIFTY spread in the MegaBull app. Equity flow below is
-    # untouched either way. Until MegaBull accepts option orders (their
-    # buysell rejected every lots/units variant on 2026-10-08) the
-    # MegaBull leg failures skip SILENTLY — the local paper sim still
-    # books the P&L, so the overlay never blocks the equity session.
-    # Spreads are marked to the live chain mid on every guard tick and
-    # squared off at EOD alongside equities.
+    # The ordinary production path retains its existing optional options
+    # overlay.  The explicit options_intraday path only attaches the strict
+    # remote broker here; PaperTrader.run_session owns its lifecycle runtime
+    # and never invokes the local shadow overlay.
     opt_broker = None
     try:
         opt_cfg = cfg.get("options", {}) or {}
         option_candidates = (plan or {}).get("option_candidates")
         if option_candidates is None:
             option_candidates = (plan or {}).get("candidates", []) or []
-        if opt_cfg.get("enabled", True) and plan is not None and any(
+        if strict_options:
+            # Strict modes attach the remote options broker even when the
+            # opening plan is empty so a later live rescan can execute.
+            opt_broker = trader.ensure_option_broker(cfg)
+        elif opt_cfg.get("enabled", True) and plan is not None and any(
                 (c.get("option_legs") or {}).get("strategy") not in
                 (None, "", "none") for c in option_candidates):
             which = str(opt_cfg.get("broker", "paper")).strip().lower()
@@ -331,7 +399,7 @@ def main() -> None:
                     logger.info("Options broker: local paper sim "
                                 "(MegaBull legs rejected — shadow only).")
             placed_opt = trader.execute_option_plan(plan,
-                                                      opt_broker=opt_broker)
+                                                    opt_broker=opt_broker)
             # expose to the guard loop below
             trader.opt_broker = opt_broker
             # Loud routing verdict for Telegram: the user asked whether
@@ -367,6 +435,14 @@ def main() -> None:
                             + "\n".join(_opt_status))
             except Exception as _tg_exc:
                 logger.warning("Options routing alert failed: %s", _tg_exc)
+        if options_only:
+            trader.opt_broker = opt_broker
+            logger.info("options_intraday: remote paper options only; "
+                        "equity entry route disabled; runtime owns execution.")
+        elif combined:
+            trader.opt_broker = opt_broker
+            logger.info("combined: MegaBull equity intraday plus strict "
+                        "remote-paper options; legacy overlay disabled.")
     except Exception as exc:
         logger.warning("Options overlay failed: %s", exc)
 
@@ -377,17 +453,33 @@ def main() -> None:
     try:
         trader.run_session(plan=plan, interval_seconds=args.interval,
                            max_seconds=args.max_seconds,
-                           tick_hook=(lambda: _manage_options(
-                               trader, opt_broker, cfg)))
+                           tick_hook=(None if strict_options else
+                                      (lambda: _manage_options(
+                                          trader, opt_broker, cfg))))
     finally:
-        try:
-            _squareoff_options(opt_broker, "eod-squareoff", trader=trader)
-        except Exception as exc:
-            logger.warning("Options EOD square-off failed: %s", exc)
-        if plan is not None and not plan.get("executed"):
+        if strict_options:
+            try:
+                runtime = trader._get_options_runtime(cfg)
+                runtime.finalize()
+            except Exception as exc:
+                logger.critical("Options intraday finalization unresolved: %s", exc)
+                trader._options_unresolved_exits = {
+                    "strict_options": str(exc),
+                }
+        else:
+            try:
+                _squareoff_options(opt_broker, "eod-squareoff", trader=trader)
+            except Exception as exc:
+                logger.warning("Options EOD square-off failed: %s", exc)
+        if (plan is not None and not plan.get("executed") and
+                not getattr(trader, "_options_unresolved_exits", {})):
             order_ids = list(getattr(trader, "_last_plan_order_ids", []) or [])
             order_ids.extend(getattr(trader, "_last_option_order_ids", []) or [])
             mark_executed(plan, order_ids, date=date)
+            nested = plan.get("options_intraday_plan") if isinstance(plan, dict) else None
+            if isinstance(nested, dict):
+                nested["executed"] = True
+                nested["order_ids"] = list(order_ids)
         logger.info("Session job finished at %s",
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
 
@@ -443,6 +535,16 @@ def _manage_options(trader, opt_broker, cfg) -> None:
     shadow spreads track the same mid and square off at EOD with the
     rest — one mark loop, both books.
     """
+    if opt_broker is None and not getattr(trader, "_opt_shadows", None):
+        return
+    try:
+        from src.market_clock import market_clock_from_config
+        now = datetime.now(IST)
+        if market_clock_from_config(cfg).is_hard_flat(now):
+            _squareoff_options(opt_broker, "eod-squareoff", trader=trader)
+            return
+    except Exception as exc:
+        logger.warning("Options hard-flat clock check failed: %s", exc)
     brokers = [b for b in [opt_broker] +
                list(getattr(trader, "_opt_shadows", []) or [])
                if b is not None]
@@ -476,7 +578,8 @@ def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
     P&L shows in the evening digest alongside equities. Without this the
     options broker's private ``closed_trades`` list dies with the runner.
     """
-    if opt_broker is None:
+    if opt_broker is None and not (trader is not None and
+                                   getattr(trader, "_opt_shadows", None)):
         return 0
     n = 0
     try:
@@ -497,6 +600,7 @@ def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
                 sids_all.append((br, sid))
         except Exception:
             continue
+    unresolved = []
     for br, sid in sids_all:
         try:
             detail = (getattr(br, "spreads", {}) or {}).get(sid) or {}
@@ -511,11 +615,35 @@ def _squareoff_options(opt_broker, reason: str = "eod-squareoff",
                 n += 1
                 if trader is not None:
                     try:
-                        trader._log_event("close", rec)
-                    except Exception:
-                        pass
-        except Exception:
+                        from src.execution_lifecycle import record_confirmed_close
+                        record_confirmed_close(trader, sid, rec)
+                        trader._forget_option_risk(sid)
+                    except Exception as exc:
+                        logger.warning("Options risk close accounting failed for %s: %s",
+                                       sid, exc)
+            else:
+                unresolved.append(f"{getattr(br, 'provider_name', '?')}:{sid}")
+                logger.critical("Options exit not confirmed for %s; retaining position.",
+                                sid)
+        except Exception as exc:
+            unresolved.append(f"{getattr(br, 'provider_name', '?')}:{sid}")
+            logger.critical("Unresolved options EOD exit for %s: %s", sid, exc)
             continue
+    if unresolved and trader is not None:
+        trader._options_unresolved_exits = {
+            key: reason for key, reason in
+            ((item, "exit-unconfirmed") for item in unresolved)
+        }
+        logger.critical("Options remain unresolved at EOD: %s",
+                        ", ".join(unresolved))
+        try:
+            from src.alerts import send_options_telegram
+            send_options_telegram("CRITICAL: unresolved options exit(s): "
+                                  + ", ".join(unresolved))
+        except Exception:
+            pass
+    elif trader is not None:
+        trader._options_unresolved_exits = {}
     if trader is not None and n:
         try:
             trader._write_trade_log_csv()

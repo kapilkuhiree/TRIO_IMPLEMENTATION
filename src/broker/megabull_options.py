@@ -185,6 +185,14 @@ class MegaBullOptionsBroker(BaseBroker):
         long_k = float(longs[0].get("strike") or 0)
         short_k = float(shorts[0].get("strike") or 0) if shorts else 0.0
         net = float(d.get("net_debit") or 0.0)
+        contract_lot_size = d.get("lot_size")
+        if contract_lot_size not in (None, 0):
+            if (isinstance(contract_lot_size, bool) or
+                    not isinstance(contract_lot_size, int) or contract_lot_size <= 0):
+                return self._reject(strat, lots, net, "invalid contract lot size")
+            if contract_lot_size != self.lot_size:
+                return self._reject(strat, lots, net,
+                                    "contract lot size does not match broker")
         lots = max(1, int(lots or 1))
         sid = self._spread_id(strat, expiry, long_k, short_k)
         if sid in self.positions:
@@ -371,8 +379,9 @@ class MegaBullOptionsBroker(BaseBroker):
         try:
             return self.mega.get_balance()
         except Exception:
-            return {"total": self.capital, "available": self.capital,
-                    "used_margin": 0.0}
+            # A mirror is not evidence of available remote funds.  The
+            # validated execution gate deliberately rejects this schema.
+            return {}
 
     def get_order_status(self, order_id: str) -> BrokerOrder:
         if order_id in self.orders:
