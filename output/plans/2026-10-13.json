@@ -531,6 +531,10 @@
       "adx": 36.82463245955796
     }
   ],
-  "executed": false,
-  "asset": "equity+options"
+  "executed": true,
+  "asset": "equity+options",
+  "executed_at": "2026-10-13T10:00:01.940051+00:00",
+  "order_ids": [
+    "megabull_783821"
+  ]
 }
