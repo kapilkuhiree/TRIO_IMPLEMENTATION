@@ -137,14 +137,17 @@ class MegaBullOptionsBroker(BaseBroker):
                            mega_symbol, exc)
             return False
 
-    def _unwind(self, opened: List[Dict[str, Any]], reason: str) -> None:
-        """Close any confirmed legs after a failed spread (no orphans)."""
+    def _unwind(self, opened: List[Dict[str, Any]], reason: str) -> bool:
+        """Close confirmed legs and report whether every leg flattened."""
+        all_closed = True
         for leg in opened:
             if leg.get("confirmed"):
                 ok = self._close_remote(
                     leg["mega_symbol"], leg["side"], leg["lots"],
                     leg.get("price", 0.0), reason)
                 leg["confirmed"] = ok
+                all_closed = all_closed and ok
+        return all_closed
 
     def open_spread(self, candidate: Any, lots: int = 1,
                     reason: str = "options-plan") -> BrokerOrder:
@@ -201,6 +204,7 @@ class MegaBullOptionsBroker(BaseBroker):
 
         units = max(1, int(lots) * max(1, int(self.lot_size)))
         opened: List[Dict[str, Any]] = []
+        pending_statuses = {"PENDING", "SUBMITTED", "ACCEPTED", "OPEN", "UNKNOWN"}
         for leg in legs:
             mega_symbol = option_symbol(underlying, expiry,
                                         float(leg.get("strike") or 0),
@@ -217,7 +221,33 @@ class MegaBullOptionsBroker(BaseBroker):
                 order_type="MKT",
                 price=float(leg.get("premium") or net or 0.0) or None,
                 reason=reason)
-            if order.status != "FILLED":
+            status = str(getattr(order, "status", "UNKNOWN") or "UNKNOWN").upper()
+            # A remote paper API can accept a request without confirming the
+            # fill.  Preserve the real child order id/status so the strict
+            # runtime records an unresolved intent instead of treating a
+            # delayed/partial leg as a terminal rejection and retrying it.
+            if status != "FILLED":
+                order_id = str(getattr(order, "order_id", "") or "")
+                if order_id:
+                    self.orders[order_id] = order
+                if status in pending_statuses:
+                    if opened:
+                        # A multi-leg caller must not leave confirmed sister
+                        # legs unmanaged.  If unwinding is not confirmed, the
+                        # returned UNKNOWN state keeps the parent blocked.
+                        unwound = self._unwind(opened, "option-leg-unwind")
+                        pending_status = "PENDING" if unwound else "UNKNOWN"
+                    else:
+                        pending_status = "PENDING"
+                    return BrokerOrder(
+                        order_id=order_id or f"mbopt_pending_{uuid.uuid4().hex[:8]}",
+                        symbol=sid, side="BUY", quantity=lots,
+                        order_type="MKT", price=net,
+                        status=pending_status,
+                        broker="megabull_options", placed_at=utc_now(),
+                        error=(f"leg pending ({mega_symbol}): "
+                               f"{getattr(order, 'error', '')}"),
+                    )
                 self._unwind(opened, "option-leg-unwind")
                 return self._reject(
                     sid, lots, net,

@@ -53,6 +53,12 @@ from src.data_fetcher import fetch_market_data
 from src.indicators import compute_indicators
 from src.signal_engine import generate_signal, TradeSignal
 from src.risk_manager import apply_risk_management
+from src.demand_supply import (
+    candles_from_frame,
+    confirm_demand_supply,
+    demand_supply_enabled,
+    filter_completed_frame,
+)
 
 logger = get_logger("screener")
 
@@ -295,6 +301,40 @@ def _fallback_ranked_candidates(scored: List[RankedCandidate],
     return scored_sorted[:max(1, min(top_n, len(scored_sorted)))]
 
 
+def _prepare_market_frame(md: Any, timeframe: str):
+    """Use only completed intraday rows before indicators or signals."""
+    frame, diagnostic = filter_completed_frame(md.ohlcv, timeframe)
+    if diagnostic.get("filtered") and not diagnostic.get("valid"):
+        raise ValueError(
+            f"no completed {timeframe} candles ({diagnostic.get('dropped', {})})")
+    latest = float(frame["Close"].iloc[-1]) if len(frame) else None
+    if latest is None:
+        raise ValueError(f"empty completed {timeframe} candle frame")
+    return frame, latest
+
+
+def _demand_supply_passes(frame: Any, signal: TradeSignal,
+                          timeframe: str, cfg: Dict[str, Any]) -> bool:
+    if not demand_supply_enabled(cfg, context="equity", timeframe=timeframe):
+        return True
+    direction = "bullish" if signal.action == "BUY" else "bearish"
+    confirmation = confirm_demand_supply(
+        candles_from_frame(frame, symbol=signal.symbol),
+        direction,
+        cfg=cfg,
+        context="equity",
+    )
+    signal.reasoning.append(
+        f"Demand/supply: {confirmation.reason}"
+        + (f" ({confirmation.zone_type} {confirmation.zone_low}-"
+           f"{confirmation.zone_high})" if confirmation.confirmed else "")
+    )
+    if not confirmation.confirmed:
+        logger.info("Demand/supply blocked %s %s: %s",
+                    signal.symbol, signal.action, confirmation.reason)
+    return confirmation.confirmed
+
+
 def screen(symbols: Optional[List[str]] = None,
            timeframe: Optional[str] = None,
            top_n: Optional[int] = None,
@@ -356,15 +396,18 @@ def screen(symbols: Optional[List[str]] = None,
             iv_shadow = bool(ind_cfg.get("shadow_log", True))
             for sym, md in (md_map or {}).items():
                 try:
-                    readings = compute_indicators(md.ohlcv, sym, timeframe)
+                    frame, latest_price = _prepare_market_frame(md, timeframe)
+                    readings = compute_indicators(frame, sym, timeframe)
                     sig = generate_signal(symbol=sym,
-                                          latest_price=md.latest_price,
+                                          latest_price=latest_price,
                                           technical_readings=readings)
                 except Exception as exc:
                     failed += 1
                     logger.warning("Screen skipped %s: %s", sym, exc)
                     continue
                 if sig.action not in ("BUY", "SELL") or sig.confidence < min_confidence:
+                    continue
+                if not _demand_supply_passes(frame, sig, timeframe, cfg):
                     continue
                 # IV-rank gate: cheap vol preferred for debit spreads.
                 iv_read = readings.indicators.get("iv_rank")
@@ -427,9 +470,10 @@ def screen(symbols: Optional[List[str]] = None,
     for symbol in symbols:
         try:
             md = fetch_market_data(symbol, timeframe)
-            readings = compute_indicators(md.ohlcv, symbol, timeframe)
+            frame, latest_price = _prepare_market_frame(md, timeframe)
+            readings = compute_indicators(frame, symbol, timeframe)
             sig = generate_signal(symbol=symbol,
-                                  latest_price=md.latest_price,
+                                  latest_price=latest_price,
                                   technical_readings=readings)
             scanned += 1
         except Exception as exc:
@@ -440,6 +484,8 @@ def screen(symbols: Optional[List[str]] = None,
         if sig.action not in ("BUY", "SELL"):
             continue
         if sig.confidence < min_confidence:
+            continue
+        if not _demand_supply_passes(frame, sig, timeframe, cfg):
             continue
 
         # IV-rank gate (per-symbol fallback path, mirrors batch path)

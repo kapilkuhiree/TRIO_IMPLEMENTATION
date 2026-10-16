@@ -26,7 +26,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.utils import load_env, load_config, get_logger  # noqa: E402
 from src.paper_trader import PaperTrader  # noqa: E402
-from src.plan import load_plan, today_ist_str, mark_executed  # noqa: E402
+from src.plan import (load_plan, today_ist_str, mark_executed,
+                      validate_plan_identity)  # noqa: E402
 from src.options_intraday import (  # noqa: E402
     COMBINED,
     combined_mode_enabled,
@@ -93,8 +94,35 @@ def main() -> None:
     options_only = options_intraday_enabled(cfg, trading_mode)
     combined = combined_mode_enabled(cfg, trading_mode)
     strict_options = strict_options_enabled(cfg, trading_mode)
+    current_session_date = today_ist_str()
+
+    # An explicit historical date is useful for research, but it must never
+    # become a production entry session.  Management/finalization can still
+    # run with no plan so an existing remote position is not abandoned.
+    if strict_options and date != current_session_date:
+        logger.error(
+            "Strict options session date %s is not current IST session %s; "
+            "running management-only.", date, current_session_date)
+        args.no_plan = True
+
+    # The stale-plan flag is intentionally incompatible with strict options.
+    # A previous day's candidates, strikes, expiries, or quotes must never be
+    # used as today's options instructions, even when the operator supplied an
+    # explicit fallback flag.
+    if strict_options and args.allow_stale_plan:
+        logger.warning(
+            "Ignoring --allow-stale-plan in strict options mode; "
+            "options require a fresh current-session plan.")
+        args.allow_stale_plan = False
 
     plan = None if args.no_plan else load_plan(date)
+    if plan is not None:
+        identity_reason = validate_plan_identity(
+            plan, expected_date=date, current_date=current_session_date,
+            require_current=strict_options)
+        if identity_reason:
+            logger.error("Executable plan rejected: %s", identity_reason)
+            plan = None
     if combined and plan is not None and plan.get("trading_mode") != COMBINED:
         logger.info("Ignoring non-combined plan for %s; rebuilding equity + "
                     "strict-options plan.", date)
@@ -133,7 +161,9 @@ def main() -> None:
                     r = None
                     try:
                         from src.plan import validate_stale
-                        r = validate_stale(_c, date, live_price=lp)
+                        r = validate_stale(
+                            _c, date, live_price=lp,
+                            source_date=str(latest.get("date") or ""))
                     except Exception:
                         r = None
                     if r is None:
@@ -234,6 +264,7 @@ def main() -> None:
     )
     logger.info("Session job: plan=%s candidates=%d",
                 date, len((plan or {}).get("candidates", [])))
+    unresolved_failure = None
 
     # Check for /start subscribers on BOTH bots so intraday + options
     # broadcasts are always reachable — stale per-bot offset is isolated.
@@ -466,6 +497,7 @@ def main() -> None:
                 trader._options_unresolved_exits = {
                     "strict_options": str(exc),
                 }
+                unresolved_failure = str(exc)
         else:
             try:
                 _squareoff_options(opt_broker, "eod-squareoff", trader=trader)
@@ -482,6 +514,9 @@ def main() -> None:
                 nested["order_ids"] = list(order_ids)
         logger.info("Session job finished at %s",
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
+        if unresolved_failure:
+            raise RuntimeError(
+                "strict options session failed: remote position was not confirmed flat")
 
 
 def _chain_mid_for(spread_id: str, legs: list, expiry: str,

@@ -12,6 +12,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+import os
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -19,6 +20,34 @@ import pandas as pd
 from src.utils import get_logger, load_config, retry_with_backoff, utc_now
 
 logger = get_logger("data_fetcher")
+
+
+def _fetch_zerodha(symbol: str, timeframe: str, period: str) -> pd.DataFrame:
+    """Fetch read-only candles from Zerodha and normalize to TRIO OHLCV."""
+    from src.zerodha_market_data import ZerodhaMarketData
+
+    adapter = ZerodhaMarketData.from_env()
+    rows = adapter.historical_symbol(symbol, timeframe, period)
+    if not rows:
+        raise ValueError(f"No Zerodha candles returned for {symbol}")
+    frame = pd.DataFrame(rows)
+    timestamp_column = "date" if "date" in frame.columns else "timestamp"
+    if timestamp_column not in frame.columns:
+        raise ValueError("Zerodha candles have no timestamp field")
+    frame[timestamp_column] = pd.to_datetime(frame[timestamp_column], utc=True)
+    frame.set_index(timestamp_column, inplace=True)
+    rename = {
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    }
+    frame.rename(columns=rename, inplace=True)
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for column in required:
+        if column not in frame.columns:
+            frame[column] = 0.0 if column == "Volume" else pd.NA
+    frame = frame[required].copy()
+    frame.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    return frame
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -163,10 +192,13 @@ def fetch_market_data(
         else:
             period = df_cfg.get("history_period")
 
-    source = df_cfg.get("source", "yfinance")
+    source = (os.environ.get("TRIO_MARKET_DATA_PROVIDER", "").strip().lower()
+              or df_cfg.get("source", "yfinance"))
 
     if source == "yfinance":
         df = _fetch_yfinance(symbol, timeframe, period)
+    elif source == "zerodha":
+        df = _fetch_zerodha(symbol, timeframe, period)
     else:
         raise ValueError(f"Unsupported data source: {source}")
 
@@ -223,6 +255,13 @@ def fetch_multiple(
     # identically regardless of runner cache layout.
     cfg = load_config()
     df_cfg = cfg.get("data_fetcher", {})
+    source = (os.environ.get("TRIO_MARKET_DATA_PROVIDER", "").strip().lower()
+              or df_cfg.get("source", "yfinance"))
+    if source == "zerodha":
+        # Kite's instrument and historical endpoints are per-instrument; do
+        # not accidentally route a Zerodha-selected scan through yfinance's
+        # batch downloader.
+        return _per_symbol()
     use_batch = df_cfg.get("use_batch_fetch", True) is not False
     if not use_batch or len(symbols) <= 5:
         return _per_symbol()

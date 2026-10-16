@@ -21,6 +21,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import yaml
 
+from src.demand_supply import demand_supply_enabled
+
 
 OPTIONS_INTRADAY = "options_intraday"
 COMBINED = "combined"
@@ -421,6 +423,11 @@ def validate_option_candidate(
         return False, "signal direction/action mismatch"
     if kind != ("CE" if action == "BUY" else "PE"):
         return False, "signal action/option type mismatch"
+    if demand_supply_enabled(cfg, context="options", timeframe="5m"):
+        confirmation = (candidate.get("option_diagnostic", {}) or {}).get(
+            "demand_supply")
+        if not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True:
+            return False, "missing demand/supply confirmation"
     expiry_date = None
     for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
         try:

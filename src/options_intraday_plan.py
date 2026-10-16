@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from candidate_pipeline import CandidatePipeline, OptionsCandidate
 from contract_selector import select_option_contract
+from src.demand_supply import confirm_demand_supply, demand_supply_enabled
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -195,6 +196,10 @@ def _normalise_candles(
     normalized: List[Dict[str, Any]] = []
     errors: List[str] = []
     seen = set()
+    ignored = {
+        "outside_session": 0,
+        "future_or_incomplete": 0,
+    }
 
     for row_number, source in enumerate(source_rows, start=1):
         if not isinstance(source, dict):
@@ -211,11 +216,14 @@ def _normalise_candles(
             continue
         seen.add(key)
         if parsed > now:
-            errors.append(f"row_{row_number}:future_bar")
+            ignored["future_or_incomplete"] += 1
             continue
         completion = parsed + BAR_SIZE
         if completion > now:
-            errors.append(f"row_{row_number}:incomplete_bar")
+            # Providers commonly include the currently-forming candle.  It
+            # must not poison an otherwise valid current-session dataset; it
+            # is simply excluded until the next completed-bar pass.
+            ignored["future_or_incomplete"] += 1
             continue
 
         open_price = _finite(_row_value(source, "open", "Open"))
@@ -253,7 +261,10 @@ def _normalise_candles(
             errors.append(f"row_{row_number}:not_nse_index")
             continue
         if parsed.time() < NSE_OPEN or parsed.time() > NSE_LAST_BAR_START:
-            errors.append(f"row_{row_number}:outside_nse_session")
+            # Historical yfinance intraday responses can contain pre/post
+            # market rows.  They are irrelevant to the NSE signal and must
+            # not make the current session fail closed.
+            ignored["outside_session"] += 1
             continue
         if parsed.minute % 5 or parsed.second or parsed.microsecond:
             errors.append(f"row_{row_number}:not_a_5min_bar_start")
@@ -296,6 +307,11 @@ def _normalise_candles(
             }
             if not expected_or.issubset(present_or):
                 errors.append("missing_orb_opening_range_bar")
+            if not any(
+                _parse_timestamp(item["timestamp"]).time() >= time(9, 30)
+                for item in current_rows
+            ):
+                errors.append("no_completed_signal_bar_after_opening_range")
 
         latest_ts = _parse_timestamp(current_rows[-1]["timestamp"])
         age_minutes = (now - (latest_ts + BAR_SIZE)).total_seconds() / 60.0
@@ -316,6 +332,7 @@ def _normalise_candles(
             if current_rows else None
         ),
         "errors": errors,
+        "ignored_rows": ignored,
         "timestamp_timezone": "Asia/Kolkata",
     }
     return normalized, diagnostic
@@ -615,6 +632,10 @@ def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
             "quote_age_seconds": round(quote_age, 3),
             "lot_size_source": "verified",
             "rejection_reasons": [],
+            "demand_supply": getattr(candidate, "demand_supply_confirmation", {
+                "confirmed": True,
+                "reason": "demand/supply disabled",
+            }),
         },
         "signal_reason": candidate.signal_reason,
         "historical_options_pnl": "NOT_READY",
@@ -652,6 +673,11 @@ def build_intraday_plan(
 
     selected_strategies = _strategies(cfg)
     plan["strategies"] = selected_strategies
+    plan["demand_supply"] = {
+        "enabled": demand_supply_enabled(
+            cfg, context="options", timeframe="5m"),
+        "context": "NIFTY 5m",
+    }
     raw_candles, candle_source = _load_candles(cfg, now_ist, candles)
     max_candle_age = _cfg_float(
         mode_cfg,
@@ -843,6 +869,21 @@ def build_intraday_plan(
         values = [candidate.entry_price, candidate.stop_loss, candidate.target]
         if any(_finite(value) is None or float(value) <= 0 for value in values):
             rejected.append({"strategy": candidate.strategy_name, "reason": "invalid underlying levels"})
+            continue
+        confirmation = confirm_demand_supply(
+            normalized_candles,
+            direction,
+            index=latest_index,
+            cfg=cfg,
+            context="options",
+        )
+        candidate.demand_supply_confirmation = confirmation.to_dict()
+        if not confirmation.confirmed:
+            rejected.append({
+                "strategy": candidate.strategy_name,
+                "reason": "demand_supply_confirmation_failed",
+                "details": [confirmation.reason],
+            })
             continue
         result = select_option_contract(
             underlying_symbol="NIFTY",

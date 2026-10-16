@@ -31,7 +31,9 @@ jobs:
       TRIO_BROKER_PROVIDER: megabull
       TRIO_REMOTE_REQUIRED: "1"
       TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
-      TRIO_TRADING_MODE: combined
+      TRIO_DEMAND_SUPPLY: "1"
+      TRIO_TRADING_MODE: options_intraday
+      TRIO_OPTIONS_INTRADAY_STATE_PATH: output/runtime/options_intraday_state.json
       TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
@@ -79,8 +81,8 @@ jobs:
               print("Update the rejected GitHub Actions secret(s) with the raw token from @BotFather.")
               sys.exit(1)
 
-      - name: Run combined equity and options session
-        run: python scripts/session.py --trading-mode combined --interval 60 --max-seconds 21300
+      - name: Run options-only remote paper session
+        run: python scripts/session.py --trading-mode options_intraday --interval 60 --max-seconds 21300
 
       - name: Send daily digest
         if: always()
@@ -95,13 +97,16 @@ jobs:
           git config user.name "trio-bot"
           git config user.email "trio-bot@users.noreply.github.com"
           git add -A output/dashboard_state.json output/plans output/subscribers.json output/subscribers_options.json output/equity_snapshot.json output/runtime output/chain_diagnostics
+          # Commit the runner's generated state before fetching origin.  A
+          # merge refuses to start when the worktree contains changes that
+          # overlap a newer remote state commit (the previous failure mode).
+          if ! git diff --cached --quiet; then
+            git commit -m "session state $(date -u +%F)"
+          fi
           git fetch origin main
           if ! git merge -X ours --no-edit origin/main; then
             git checkout --ours -- output/
             git add -A output/
             git -c core.editor=true merge --continue
-          fi
-          if ! git diff --cached --quiet; then
-            git commit -m "session state $(date -u +%F)"
           fi
           git push origin HEAD:main

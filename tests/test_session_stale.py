@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.plan import find_latest_plan, validate_stale, next_trading_day_ist_str
+from src.plan import (find_latest_plan, load_plan, validate_plan_identity,
+                       validate_stale, next_trading_day_ist_str)
 
 
 def test_find_latest_rejects_future_file(tmp_path):
@@ -23,6 +24,30 @@ def test_find_latest_rejects_future_file(tmp_path):
     got = find_latest_plan(plan_dir=tmp_path)
     assert got is not None
     assert got["date"] == today
+
+
+def test_load_plan_rejects_filename_payload_date_mismatch(tmp_path):
+    (tmp_path / "2026-10-14.json").write_text(
+        json.dumps({"date": "2026-10-15", "candidates": []}))
+    assert load_plan("2026-10-14", plan_dir=tmp_path) is None
+
+
+def test_validate_plan_identity_rejects_previous_session_for_production():
+    reason = validate_plan_identity(
+        {"date": "2026-10-14"}, expected_date="2026-10-14",
+        current_date="2026-10-15", require_current=True)
+    assert reason is not None
+    assert "current session" in reason
+
+
+def test_find_latest_skips_mismatched_payload_and_uses_valid_file(tmp_path):
+    (tmp_path / "2026-10-14.json").write_text(
+        json.dumps({"date": "2026-10-13"}))
+    (tmp_path / "2026-10-13.json").write_text(
+        json.dumps({"date": "2026-10-13", "candidates": []}))
+    got = find_latest_plan(plan_dir=tmp_path)
+    assert got is not None
+    assert got["date"] == "2026-10-13"
 
 
 def test_validate_stale_age_exceeded():
@@ -43,6 +68,15 @@ def test_validate_stale_ok():
     cand = {"symbol": "X", "entry_price": 100.0, "stop_loss": 90.0,
             "target": 115.0, "position_size": 10, "date": "2026-10-10"}
     assert validate_stale(cand, "2026-10-10", live_price=100.2) is None
+
+
+def test_validate_stale_missing_candidate_date_uses_source_plan_date():
+    cand = {"symbol": "X", "entry_price": 100.0, "stop_loss": 90.0,
+            "target": 115.0, "position_size": 10}
+    reason = validate_stale(
+        cand, "2026-10-15", source_date="2026-10-13")
+    assert reason is not None
+    assert "stale" in reason.lower()
 
 
 def test_next_trading_day_skips_weekend_and_configured_holiday():

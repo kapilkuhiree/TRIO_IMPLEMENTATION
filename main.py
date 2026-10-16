@@ -216,6 +216,20 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         logger.error("Backtest error: %s", exc)
 
 
+def _current_strict_options_plan(cfg, plan, *, session_date=None):
+    """Return only a fresh current-session strict-options plan."""
+    from src.options_intraday_plan import build_intraday_plan
+    from src.plan import today_ist_str
+
+    session_date = session_date or today_ist_str()
+    if (isinstance(plan, dict) and plan.get("execution_ready") is not False and
+            str(plan.get("date", "")) == session_date):
+        return plan
+    fresh = build_intraday_plan(cfg)
+    fresh["date"] = session_date
+    return fresh
+
+
 def cmd_paper(args: argparse.Namespace) -> None:
     """Run paper trading loop."""
     from src.paper_trader import PaperTrader
@@ -237,7 +251,19 @@ def cmd_paper(args: argparse.Namespace) -> None:
                          trading_mode=getattr(args, "trading_mode", None))
     if getattr(trader, "strict_options_mode", False):
         from src.plan import load_plan, today_ist_str
-        plan = load_plan(today_ist_str())
+        cfg = load_config()
+        session_date = today_ist_str()
+        plan = load_plan(session_date)
+        # A premarket options artifact is a diagnostic preview only.  The
+        # direct CLI path must use the same current-session rebuild as the
+        # scheduled runner; it may never execute a cached strike, quote, or
+        # signal from an earlier session.
+        try:
+            plan = _current_strict_options_plan(
+                cfg, plan, session_date=session_date)
+        except Exception as exc:
+            logger.error("Fresh strict-options plan build failed: %s", exc)
+            plan = None
         trader.ensure_option_broker(load_config())
         max_seconds = (interval * args.max_iterations
                        if args.max_iterations else None)

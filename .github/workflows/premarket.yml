@@ -29,7 +29,8 @@ jobs:
       TRIO_BROKER_PROVIDER: megabull
       TRIO_REMOTE_REQUIRED: "1"
       TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
-      TRIO_TRADING_MODE: combined
+      TRIO_DEMAND_SUPPLY: "1"
+      TRIO_TRADING_MODE: options_intraday
       TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +78,8 @@ jobs:
               print("Update the rejected GitHub Actions secret(s) with the raw token from @BotFather.")
               sys.exit(1)
 
-      - name: Build combined equity and options preview
-        run: python scripts/premarket.py --trading-mode combined
+      - name: Build options-only preview
+        run: python scripts/premarket.py --trading-mode options_intraday
 
       - name: Persist plan to repo
         run: |
@@ -96,13 +97,15 @@ jobs:
             output/equity_snapshot.json \
             output/runtime/.gitkeep \
             output/chain_diagnostics
+          # Commit generated state before fetching origin so git merge never
+          # aborts on an overlapping dirty output/plan file.
+          if ! git diff --cached --quiet; then
+            git commit -m "premarket plan $(date -u +%F)"
+          fi
           git fetch origin main
           if ! git merge -X ours --no-edit origin/main; then
             git checkout --ours -- output/
             git add -A output/
             git -c core.editor=true merge --continue
-          fi
-          if ! git diff --cached --quiet; then
-            git commit -m "premarket plan $(date -u +%F)"
           fi
           git push origin HEAD:main

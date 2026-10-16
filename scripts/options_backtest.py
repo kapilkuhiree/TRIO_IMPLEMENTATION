@@ -51,7 +51,7 @@ logger = get_logger("options_backtest")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 NIFTY = "^NSEI"
-LOT = 75  # NSE NIFTY lot (2025+)
+LOT = 65  # NIFTY lot size configured for the 2026 contract regime
 
 STOP_PCT = -0.50   # exit spread/long at -50% of debit
 TARGET_PCT = 0.35  # exit at +35% of debit

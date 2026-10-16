@@ -122,3 +122,23 @@ def test_options_premarket_artifact_is_next_session_preview(monkeypatch):
     assert prepared["date"] == "2026-10-16"
     assert prepared["execution_ready"] is False
     assert "rebuilt" in prepared["execution_blocked_reason"]
+
+
+def test_direct_strict_cli_rebuilds_preview_instead_of_using_cached_plan(monkeypatch):
+    import main
+
+    fresh = {"date": "2026-10-15", "trading_mode": "options_intraday",
+             "execution_ready": True, "option_candidates": []}
+    calls = []
+
+    def rebuild(cfg):
+        calls.append(cfg)
+        return dict(fresh)
+
+    monkeypatch.setattr("src.options_intraday_plan.build_intraday_plan", rebuild)
+    preview = {"date": "2026-10-16", "execution_ready": False,
+               "option_candidates": [{"stale": True}]}
+    result = main._current_strict_options_plan(
+        {"options_intraday": {}}, preview, session_date="2026-10-15")
+    assert result == fresh
+    assert calls == [{"options_intraday": {}}]

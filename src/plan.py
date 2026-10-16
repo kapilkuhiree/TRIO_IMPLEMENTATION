@@ -85,10 +85,44 @@ def load_plan(date: Optional[str] = None,
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        reason = validate_plan_identity(payload, expected_date=path.stem)
+        if reason:
+            logger.warning("Plan rejected (%s): %s", path, reason)
+            return None
+        return payload
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Plan unreadable (%s): %s", path, exc)
         return None
+
+
+def validate_plan_identity(payload: Any, *, expected_date: Optional[str] = None,
+                            current_date: Optional[str] = None,
+                            require_current: bool = False) -> Optional[str]:
+    """Return a reason when a plan cannot be used for the requested session.
+
+    Research may inspect historical plans, so this helper does not reject an
+    old date by default.  Production callers opt into ``require_current`` and
+    must also provide the date represented by the filename/request.  Keeping
+    the filename/payload check here prevents a renamed or mismatched artifact
+    from becoming an executable plan.
+    """
+    if not isinstance(payload, dict):
+        return "plan is not an object"
+    payload_date = str(payload.get("date") or "").strip()
+    if not payload_date:
+        return "plan date is missing"
+    try:
+        datetime.strptime(payload_date, "%Y-%m-%d")
+    except ValueError:
+        return "plan date is invalid"
+    if expected_date is not None and payload_date != str(expected_date):
+        return f"plan date {payload_date} does not match requested {expected_date}"
+    if require_current:
+        wanted = str(current_date or today_ist_str())
+        if payload_date != wanted:
+            return f"plan date {payload_date} is not current session {wanted}"
+    return None
 
 
 def find_latest_plan(plan_dir: Optional[Path] = None,
@@ -117,21 +151,29 @@ def find_latest_plan(plan_dir: Optional[Path] = None,
             pass
     if not json_files:
         return None
-    latest_file = json_files[-1]
-    try:
-        return json.loads(latest_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    for latest_file in reversed(json_files):
+        try:
+            payload = json.loads(latest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if validate_plan_identity(payload, expected_date=latest_file.stem):
+            continue
+        return payload
+    return None
 
 
 def validate_stale(cand: Dict[str, Any], date: str,
                    live_price: Optional[float] = None,
                    max_age_days: int = 1,
-                   max_deviation_pct: float = 1.0) -> Optional[str]:
+                   max_deviation_pct: float = 1.0,
+                   source_date: Optional[str] = None) -> Optional[str]:
     """Return None if *cand* is safe to trade when stale, else a reason."""
     try:
         from datetime import datetime as _dt1
-        cand_date = str(cand.get("date") or date)
+        # A candidate commonly has no own date.  In that case use the source
+        # plan date, never the requested current date, so stale fallback cannot
+        # turn yesterday's candidate into a same-day candidate.
+        cand_date = str(cand.get("date") or source_date or date)
         days = (_dt1.strptime(date, "%Y-%m-%d") -
                 _dt1.strptime(cand_date, "%Y-%m-%d")).days
         if days > max_age_days:

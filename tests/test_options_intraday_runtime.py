@@ -243,6 +243,27 @@ def test_policy_rechecks_chain_quote_and_ignores_false_archived_diagnostic(tmp_p
     assert options.open_calls == []
 
 
+def test_previous_session_plan_is_rejected_before_any_option_order(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    stale = _plan()
+    stale["date"] = "2026-10-13"
+    with pytest.raises(OptionsIntradayPolicyError, match="today's valid session"):
+        runtime.execute_plan(stale, options, now=NOW)
+    assert options.open_calls == []
+
+
+def test_previous_session_signal_is_rejected_before_any_option_order(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    stale = _plan()
+    stale["option_candidates"][0]["signal_timestamp"] = (
+        "2026-10-13T04:20:00+00:00")
+    with pytest.raises(OptionsIntradayPolicyError, match="missing, future-dated, or stale"):
+        runtime.execute_plan(stale, options, now=NOW)
+    assert options.open_calls == []
+
+
 def test_complete_lot_affordability_does_not_force_one_lot(tmp_path):
     options = _OptionsDouble()
     runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))

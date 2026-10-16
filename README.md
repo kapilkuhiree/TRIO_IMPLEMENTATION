@@ -141,7 +141,8 @@ hard_flat 15:10 | close 15:30 | tz Asia/Kolkata | holidays: []
 | `MEGABULL_API_KEY` | Remote paper broker (`broker.provider: megabull`) | For remote |
 | `TRIO_BROKER_PROVIDER` | `paper` (tests) or `megabull` | Overrides config |
 | `TRIO_TEST_MODE` / `TRIO_LIVE` | Test sidecar / live confirm | As needed |
-| `ZERODHA_API_KEY/_SECRET/_ACCESS_TOKEN` | Zerodha adapter (stub — not wired) | Not active |
+| `ZERODHA_API_KEY/_SECRET/_ACCESS_TOKEN` | Read-only Zerodha market data/archive | Required for archive |
+| `TRIO_OPTIONS_ARCHIVE_PATH` | Optional SQLite options archive path | Optional |
 
 ## Project Structure
 
@@ -192,7 +193,10 @@ TRIO_IMPLEMENTATION/
 
 ## Known Limitations
 
-* Zerodha adapter is a stub — not enabled as a `broker.provider`.
+* Zerodha is read-only for market-data research. It is not enabled as a
+  `broker.provider` and the archive cannot discover expired option tokens that
+  were not captured while active. Run `python scripts/zerodha_options_archive.py`
+  with the daily access token to build the local incremental archive.
 * T2/T3 ladder legs are shadow-logged (`ladder.enabled_phase2: false`) — EOD hard-flat
   still settles everything at `15:10`.
 * Sector map covers NIFTY 50; unknown symbols are `Unknown`.

@@ -210,5 +210,6 @@ def test_cli_and_workflows_declare_all_modes(monkeypatch, capsys):
     session_workflow = (root / ".github" / "workflows" /
                         "session.yml").read_text(encoding="utf-8")
     for workflow in (premarket_workflow, session_workflow):
-        assert "TRIO_TRADING_MODE: combined" in workflow
-        assert "--trading-mode combined" in workflow
+        assert "TRIO_TRADING_MODE: options_intraday" in workflow
+        assert "--trading-mode options_intraday" in workflow
+        assert "--trading-mode combined" not in workflow

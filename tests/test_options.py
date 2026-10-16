@@ -354,6 +354,40 @@ def test_megabull_options_single_long(tmp_path):
     assert rec["result"] == "PASS" and rec["asset"] == "options"
 
 
+def test_megabull_options_pending_child_is_not_terminal_rejection(monkeypatch):
+    """A delayed remote child must remain unresolved, not become retryable."""
+    from unittest.mock import patch
+    from src.broker.base import BrokerOrder
+    from src.broker.megabull_options import MegaBullOptionsBroker
+
+    sig = TradeSignal(symbol="NIFTY", action="BUY", entry_price=25000.0,
+                      confidence=80)
+    with patch("src.options_selector._opt_cfg",
+               return_value={"enabled": True, "underlying": "NIFTY",
+                             "lot_size": 50, "min_oi": 1000,
+                             "delta_atm": 0.50, "delta_otm": 0.30,
+                             "delta_long": 0.65, "style": "long",
+                             "max_iv_rank": 80}):
+        pick = select(sig, _chain(), expiry="30-Oct-2026", iv_rank=40.0,
+                      adx=30.0)
+
+    class PendingMega(_MegaStub):
+        def place_order(self, symbol, side, quantity, **kwargs):
+            order = BrokerOrder(order_id="pending-child", symbol=symbol,
+                                side=side, quantity=quantity, status="PENDING",
+                                broker="megabull", error="accepted remotely")
+            self.orders[order.order_id] = order
+            return order
+
+    mega = PendingMega()
+    broker = MegaBullOptionsBroker(mega, lot_size=50)
+    order = broker.open_spread(pick, lots=1)
+    assert order.status == "PENDING"
+    assert order.order_id == "pending-child"
+    assert broker.get_order_status("pending-child").status == "PENDING"
+    assert not broker.positions
+
+
 def test_megabull_options_rejects_without_network(tmp_path, monkeypatch):
     """Explicit opt-in offline behavior: rejected remote legs use a shadow.
 

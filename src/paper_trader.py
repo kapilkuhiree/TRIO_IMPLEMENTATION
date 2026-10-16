@@ -33,6 +33,13 @@ from src.sentiment import analyze_sentiment
 from src.signal_engine import generate_signal, TradeSignal
 from src.risk_manager import apply_risk_management, get_risk_state
 from src.broker.paper import PaperBroker
+from src.demand_supply import (
+    candles_from_frame,
+    confirm_demand_supply,
+    demand_supply_config,
+    demand_supply_enabled,
+    filter_completed_frame,
+)
 
 logger = get_logger("paper_trader")
 
@@ -266,6 +273,72 @@ class PaperTrader:
             if isinstance(intent, dict) and intent.get("status") in {"pending", "uncertain"}:
                 return True
         return False
+
+    def _filter_equity_plan_by_demand_supply(
+            self, plan: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply an intraday demand/supply confirmation before equity entry.
+
+        The combined premarket plan is intentionally still built from the
+        existing daily equity screener.  When the feature is enabled, this
+        boundary adds the missing live intraday confirmation immediately before
+        submission, without changing the existing daily ranking or stop/target
+        calculations.
+        """
+        settings = demand_supply_config(cfg, context="equity")
+        timeframe = str(settings.get("equity_timeframe", "15m"))
+        if not demand_supply_enabled(cfg, context="equity", timeframe=timeframe):
+            return plan
+        candidates = list(plan.get("candidates", []) or [])
+        accepted = []
+        for candidate in candidates:
+            symbol = str(candidate.get("symbol", "")).strip()
+            try:
+                market_data = fetch_market_data(symbol, timeframe)
+                frame, diagnostic = filter_completed_frame(
+                    market_data.ohlcv, timeframe)
+                if not diagnostic.get("valid"):
+                    raise ValueError(
+                        f"no completed {timeframe} candles")
+                direction = ("bullish" if str(candidate.get("action", ""))
+                             .upper() == "BUY" else "bearish")
+                confirmation = confirm_demand_supply(
+                    candles_from_frame(frame, symbol=symbol),
+                    direction,
+                    cfg=cfg,
+                    context="equity",
+                )
+                candidate["demand_supply"] = confirmation.to_dict()
+                if confirmation.confirmed:
+                    accepted.append(candidate)
+                else:
+                    self._log_event("skip", {
+                        "symbol": symbol,
+                        "asset": "equity",
+                        "reason": "demand_supply_confirmation_failed",
+                        "details": confirmation.to_dict(),
+                    })
+                    logger.info("Demand/supply blocked equity %s: %s",
+                                symbol, confirmation.reason)
+            except Exception as exc:
+                candidate["demand_supply"] = {
+                    "confirmed": False,
+                    "reason": f"demand/supply data unavailable: {exc}",
+                }
+                self._log_event("skip", {
+                    "symbol": symbol,
+                    "asset": "equity",
+                    "reason": "demand_supply_data_unavailable",
+                })
+                logger.warning("Demand/supply data blocked equity %s: %s",
+                               symbol, exc)
+        plan["candidates"] = accepted
+        plan["demand_supply"] = {
+            "enabled": True,
+            "timeframe": timeframe,
+            "accepted": len(accepted),
+            "rejected": len(candidates) - len(accepted),
+        }
+        return plan
 
     def _options_risk_preflight(self, opt_broker: Any,
                                 candidate: Dict[str, Any],
@@ -1486,6 +1559,10 @@ class PaperTrader:
             return []
         self._last_plan_order_ids = []
         cfg = load_config()
+        plan = self._filter_equity_plan_by_demand_supply(plan, cfg)
+        if not plan.get("candidates"):
+            logger.info("execute_plan: no equity candidates after demand/supply filter")
+            return []
         from src.execution_lifecycle import reconcile_broker, submit_candidate
         recon = reconcile_broker(self)
         if recon.get("uncertain"):
@@ -1810,6 +1887,9 @@ class PaperTrader:
                         logger.critical(
                             "options_intraday finalization unresolved: %s",
                             runtime_exc)
+                        self._options_unresolved_exits = {
+                            "strict_options": str(runtime_exc),
+                        }
                 if equity_enabled:
                     self._maybe_eod_square_off()
                 break
@@ -1822,6 +1902,9 @@ class PaperTrader:
                         logger.critical(
                             "options_intraday max-time finalization unresolved: %s",
                             runtime_exc)
+                        self._options_unresolved_exits = {
+                            "strict_options": str(runtime_exc),
+                        }
                 if equity_enabled:
                     self._maybe_eod_square_off(now_ist=ist_now)
                 break
