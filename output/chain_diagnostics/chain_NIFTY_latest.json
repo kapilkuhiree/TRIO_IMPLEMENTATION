@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "retrieved_at": "2026-10-16T06:57:20.494948+00:00",
+  "symbol": "NIFTY",
+  "underlying": 23111.15,
+  "requested_expiries": [
+    "19-Oct-2026",
+    "27-Oct-2026",
+    "03-Nov-2026",
+    "09-Nov-2026"
+  ],
+  "responses": [
+    {
+      "requested_expiry": "19-Oct-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "validation_failures": [],
+      "raw_expiry_dates": [
+        "19-Oct-2026",
+        "27-Oct-2026",
+        "03-Nov-2026",
+        "09-Nov-2026",
+        "17-Nov-2026",
+        "23-Nov-2026",
+        "29-Dec-2026",
+        "30-Mar-2027",
+        "29-Jun-2027",
+        "28-Sep-2027",
+        "28-Dec-2027",
+        "27-Jun-2028",
+        "26-Dec-2028",
+        "26-Jun-2029",
+        "24-Dec-2029",
+        "25-Jun-2030",
+        "31-Dec-2030",
+        "24-Jun-2031"
+      ]
+    },
+    {
+      "requested_expiry": "27-Oct-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": true,
+      "strike_rows": 144,
+      "ce_records": 144,
+      "pe_records": 144,
+      "validation_failures": [],
+      "raw_expiry_dates": [
+        "19-Oct-2026",
+        "27-Oct-2026",
+        "03-Nov-2026",
+        "09-Nov-2026",
+        "17-Nov-2026",
+        "23-Nov-2026",
+        "29-Dec-2026",
+        "30-Mar-2027",
+        "29-Jun-2027",
+        "28-Sep-2027",
+        "28-Dec-2027",
+        "27-Jun-2028",
+        "26-Dec-2028",
+        "26-Jun-2029",
+        "24-Dec-2029",
+        "25-Jun-2030",
+        "31-Dec-2030",
+        "24-Jun-2031"
+      ]
+    },
+    {
+      "requested_expiry": "03-Nov-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "validation_failures": [],
+      "raw_expiry_dates": [
+        "19-Oct-2026",
+        "27-Oct-2026",
+        "03-Nov-2026",
+        "09-Nov-2026",
+        "17-Nov-2026",
+        "23-Nov-2026",
+        "29-Dec-2026",
+        "30-Mar-2027",
+        "29-Jun-2027",
+        "28-Sep-2027",
+        "28-Dec-2027",
+        "27-Jun-2028",
+        "26-Dec-2028",
+        "26-Jun-2029",
+        "24-Dec-2029",
+        "25-Jun-2030",
+        "31-Dec-2030",
+        "24-Jun-2031"
+      ]
+    },
+    {
+      "requested_expiry": "09-Nov-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "validation_failures": [],
+      "raw_expiry_dates": [
+        "19-Oct-2026",
+        "27-Oct-2026",
+        "03-Nov-2026",
+        "09-Nov-2026",
+        "17-Nov-2026",
+        "23-Nov-2026",
+        "29-Dec-2026",
+        "30-Mar-2027",
+        "29-Jun-2027",
+        "28-Sep-2027",
+        "28-Dec-2027",
+        "27-Jun-2028",
+        "26-Dec-2028",
+        "26-Jun-2029",
+        "24-Dec-2029",
+        "25-Jun-2030",
+        "31-Dec-2030",
+        "24-Jun-2031"
+      ]
+    },
+    {
+      "requested_expiry": null,
+      "path": "/api/option-chain-indices",
+      "http_status": 404,
+      "success": false,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "validation_failures": [],
+      "failure_reason": "endpoint_not_found"
+    }
+  ],
+  "expiry_status": {
+    "19-Oct-2026": {
+      "expiry": "19-Oct-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "usable": true,
+      "reason": "usable_strikes"
+    },
+    "27-Oct-2026": {
+      "expiry": "27-Oct-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 144,
+      "ce_records": 144,
+      "pe_records": 144,
+      "usable": true,
+      "reason": "usable_strikes"
+    },
+    "03-Nov-2026": {
+      "expiry": "03-Nov-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "usable": true,
+      "reason": "usable_strikes"
+    },
+    "09-Nov-2026": {
+      "expiry": "09-Nov-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 104,
+      "ce_records": 104,
+      "pe_records": 104,
+      "usable": true,
+      "reason": "usable_strikes"
+    }
+  },
+  "freshness": {
+    "ttl_minutes": 15,
+    "fresh": true
+  }
+}
