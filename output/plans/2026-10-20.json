@@ -1,6 +1,6 @@
 {
   "date": "2026-10-20",
-  "generated_at": "2026-10-19T16:42:37.568386+00:00",
+  "generated_at": "2026-10-20T09:44:48.038671+00:00",
   "trading_mode": "options_intraday",
   "asset": "options",
   "candidates": [],
@@ -18,7 +18,7 @@
   "requested": 1,
   "failed": 1,
   "actionable": 0,
-  "executed": false,
+  "executed": true,
   "option_underlying": "NIFTY",
   "strategies": [
     "orb",
@@ -32,12 +32,12 @@
   "intraday_data_diagnostic": {
     "valid": false,
     "rows": 4246,
-    "current_date_rows": 72,
+    "current_date_rows": 0,
     "max_age_minutes": 15.0,
-    "latest_timestamp": "2026-10-19T15:10:00+05:30",
-    "latest_completion_timestamp": "2026-10-19T15:15:00+05:30",
+    "latest_timestamp": null,
+    "latest_completion_timestamp": null,
     "errors": [
-      "stale_latest_bar:417.6m"
+      "no_completed_bar_for_current_ist_date"
     ],
     "ignored_rows": {
       "outside_session": 175,
@@ -47,9 +47,9 @@
     "source": {
       "source": "yfinance",
       "symbol": "^NSEI",
-      "fetched_at": "2026-10-19T16:42:38.215487+00:00"
+      "fetched_at": "2026-10-20T09:44:49.179431+00:00"
     }
   },
-  "execution_ready": false,
-  "execution_blocked_reason": "options_intraday plans are rebuilt during the live session"
+  "executed_at": "2026-10-20T10:00:14.288595+00:00",
+  "order_ids": []
 }
