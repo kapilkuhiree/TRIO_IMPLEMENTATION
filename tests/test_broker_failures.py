@@ -110,6 +110,7 @@ def test_megabull_order_pending_lifecycle():
     b = MegaBullBroker(api_key="fake")
     # Mock _post to return an order ID but no fill confirmation
     with patch.object(b, "token_for", return_value="123"), \
+         patch.object(b, "refresh_positions", return_value=True), \
          patch.object(b, "_post", return_value={"id": "12345"}), \
          patch.object(b, "_fill_confirmed", return_value=False), \
          patch.object(b, "_order_row", return_value={"status": "ACCEPTED"}):
@@ -125,6 +126,7 @@ def test_megabull_order_unknown_on_missing_row():
     b = MegaBullBroker(api_key="fake")
     # Mock _post, but _order_row returns None (not visible)
     with patch.object(b, "token_for", return_value="123"), \
+         patch.object(b, "refresh_positions", return_value=True), \
          patch.object(b, "_post", return_value={"id": "67890"}), \
          patch.object(b, "_fill_confirmed", return_value=False), \
          patch.object(b, "_order_row", return_value=None):
@@ -140,6 +142,7 @@ def test_megabull_poll_pending_transitions_to_filled():
     b = MegaBullBroker(api_key="fake")
     # Initial PENDING
     with patch.object(b, "token_for", return_value="123"), \
+         patch.object(b, "refresh_positions", return_value=True), \
          patch.object(b, "_post", return_value={"id": "12345"}), \
          patch.object(b, "_fill_confirmed", return_value=False), \
          patch.object(b, "_order_row", return_value={"status": "ACCEPTED"}):

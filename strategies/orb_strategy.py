@@ -88,9 +88,10 @@ class OrbStrategy:
         and realistic execution assumptions.
 
         Args:
-            candles_5min: List of 5-minute candle dicts for THIS underlying.
+            candles_5min: List of completed 5-minute candle dicts for THIS underlying.
                 Must include 'exchange', 'underlying_symbol', 'instrument_type'
-                fields with correct values for this underlying.
+                fields for the same NSE index or stock. The caller excludes
+                forming candles before selecting the bar index.
             index: Index of the bar to evaluate signal for
             contract_specs: Contract specifications (lot_size, strike_interval, etc.)
             underlying_symbol: Symbol name (e.g., "NIFTY", "BANKNIFTY", "RELIANCE")
@@ -111,6 +112,19 @@ class OrbStrategy:
             if index < 3 or index >= len(candles_5min):
                 return result
 
+            # Both the range and signal must belong to this NSE underlying.
+            # Stock candles generate option signals, just like index candles;
+            # option/futures prices must never be used as the underlying.
+            current_candle = candles_5min[index]
+            instrument_type = current_candle.get("instrument_type")
+            if (
+                not underlying_symbol
+                or current_candle.get("underlying_symbol") != underlying_symbol
+                or current_candle.get("exchange") != "NSE"
+                or instrument_type not in {"index", "stock"}
+            ):
+                return result
+
             # ------------------------------------------------------------------
             # Step 1: Determine the Opening Range (bars from 9:15 to 9:30 AM)
             # ------------------------------------------------------------------
@@ -120,7 +134,7 @@ class OrbStrategy:
             or_low = float("inf")
             or_bar_count = 0
 
-            current_time = candles_5min[index].get("timestamp", "")
+            current_time = current_candle.get("timestamp", "")
             try:
                 current_ts = datetime.fromisoformat(current_time.replace("Z", "+00:00"))
                 if current_ts.tzinfo is None:
@@ -142,8 +156,11 @@ class OrbStrategy:
                     # Skip candles from other underlyings
                     continue
 
-                # Validate instrument type
-                if candle.get("instrument_type", "index") != "index":
+                # The opening range cannot mix exchanges or instrument types.
+                if (
+                    candle.get("exchange") != "NSE"
+                    or candle.get("instrument_type") != instrument_type
+                ):
                     continue
 
                 # Check timestamp is within OR window (9:15 to 9:30 AM IST)
@@ -181,7 +198,6 @@ class OrbStrategy:
             if index >= len(candles_5min):
                 return result
 
-            current_candle = candles_5min[index]
             current_close = current_candle.get("close", 0)
             current_high = current_candle.get("high", 0)
             current_low = current_candle.get("low", 0)

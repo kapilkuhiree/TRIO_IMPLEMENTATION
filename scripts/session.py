@@ -74,6 +74,44 @@ def _refresh_strict_options_subplan(plan: Optional[Dict[str, Any]],
     return plan
 
 
+def _run_options_only_session(cfg: Dict[str, Any], trading_mode: str,
+                              *, interval_seconds: int,
+                              max_seconds: Optional[int],
+                              management_only: bool) -> None:
+    """Start the strict live runtime without reading or creating any plan."""
+    trader = PaperTrader(
+        timeframe="15m",
+        initial_capital=(cfg.get("risk_management", {}) or {}).get("capital"),
+        trading_mode=trading_mode,
+    )
+    try:
+        from src.alerts import handle_all_joins, send_options_telegram
+        handle_all_joins()
+        status = ("Management only; entry scans disabled." if management_only else
+                  "Fresh live scans start at the first entry-eligible tick.")
+        send_options_telegram("TRIO options_intraday session started. " + status)
+    except Exception as exc:
+        logger.warning("Options session startup alert failed: %s", exc)
+
+    try:
+        trader.ensure_option_broker(cfg)
+        trader.run_session(
+            plan=None, interval_seconds=interval_seconds,
+            max_seconds=max_seconds, management_only=management_only)
+    finally:
+        try:
+            trader._get_options_runtime(cfg).finalize()
+        except Exception as exc:
+            logger.critical("Options intraday finalization unresolved: %s", exc)
+            trader._options_unresolved_exits = {"strict_options": str(exc)}
+            raise RuntimeError(
+                "strict options session failed: remote position was not confirmed flat"
+            ) from exc
+        finally:
+            logger.info("Options session finished at %s",
+                        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TRIO session runner")
     parser.add_argument("--date", default=None, help="Plan date (IST)")
@@ -112,8 +150,14 @@ def main() -> None:
     if strict_options and args.allow_stale_plan:
         logger.warning(
             "Ignoring --allow-stale-plan in strict options mode; "
-            "options require a fresh current-session plan.")
+            "options require fresh current-session data.")
         args.allow_stale_plan = False
+
+    if options_only:
+        _run_options_only_session(
+            cfg, trading_mode, interval_seconds=args.interval,
+            max_seconds=args.max_seconds, management_only=args.no_plan)
+        return
 
     plan = None if args.no_plan else load_plan(date)
     if plan is not None:

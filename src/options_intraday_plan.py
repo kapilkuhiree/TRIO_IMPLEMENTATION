@@ -1,7 +1,7 @@
 """Production options-intraday plan generation.
 
 This module is deliberately a plan builder, not a backtester.  It consumes a
-completed NSE 5-minute NIFTY bar, calls the strategy classes' signal boundary,
+    completed NSE 5-minute underlying bar, calls the strategy classes' signal boundary,
 and selects a single executable long option from an exchange quote snapshot.
 There is no synthetic option price, backtest result, P&L simulation, or risk
 singleton reset on this path.
@@ -184,6 +184,8 @@ def _normalise_candles(
     *,
     max_age_minutes: float = 15.0,
     require_orb_opening_range: bool = True,
+    expected_underlying: str = "NIFTY",
+    expected_instrument_type: str = "index",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     if raw is None:
         return [], {"valid": False, "reason": "no_candles"}
@@ -248,17 +250,17 @@ def _normalise_candles(
             continue
 
         underlying = str(
-            _row_value(source, "underlying_symbol", "underlying") or "NIFTY"
+            _row_value(source, "underlying_symbol", "underlying") or expected_underlying
         ).strip().upper()
         exchange = str(_row_value(source, "exchange") or "NSE").strip().upper()
         instrument_type = str(
-            _row_value(source, "instrument_type", "instrument") or "index"
+            _row_value(source, "instrument_type", "instrument") or expected_instrument_type
         ).strip().lower()
-        if underlying != "NIFTY":
-            errors.append(f"row_{row_number}:underlying_not_nifty")
+        if underlying != expected_underlying:
+            errors.append(f"row_{row_number}:underlying_mismatch")
             continue
-        if exchange != "NSE" or instrument_type != "index":
-            errors.append(f"row_{row_number}:not_nse_index")
+        if exchange != "NSE" or instrument_type != expected_instrument_type:
+            errors.append(f"row_{row_number}:not_expected_nse_instrument")
             continue
         if parsed.time() < NSE_OPEN or parsed.time() > NSE_LAST_BAR_START:
             # Historical yfinance intraday responses can contain pre/post
@@ -341,8 +343,12 @@ def _normalise_candles(
 def _load_candles(cfg: Dict[str, Any], now: datetime, supplied: Any) -> Tuple[Any, Dict[str, Any]]:
     if supplied is not None:
         return supplied, {"source": "injected"}
+    mode_cfg = cfg.get("options_intraday", {}) or {}
+    underlying = str(mode_cfg.get("underlying", "NIFTY")).upper()
     data_path = os.environ.get("TRIO_INTRADAY_DATA_PATH", "").strip()
     if data_path:
+        if underlying != "NIFTY":
+            return [], {"source": "csv", "error": "index CSV cannot supply another underlying"}
         try:
             from data_importer import import_5min_index_candles
             return import_5min_index_candles(
@@ -350,16 +356,15 @@ def _load_candles(cfg: Dict[str, Any], now: datetime, supplied: Any) -> Tuple[An
             ), {"source": "csv", "path": data_path}
         except Exception as exc:  # fail closed, with an auditable reason
             return [], {"source": "csv", "path": data_path, "error": str(exc)}
-    mode_cfg = cfg.get("options_intraday", {}) or {}
     mapping = mode_cfg.get("underlying_mapping") or {}
     data_symbol = (
         mode_cfg.get("market_symbol")
         or mode_cfg.get("data_symbol")
-        or mapping.get("NIFTY")
-        or "^NSEI"
+        or mapping.get(underlying)
+        or ("^NSEI" if underlying == "NIFTY" else None)
     )
-    if str(mode_cfg.get("underlying", "NIFTY")).upper() != "NIFTY":
-        return [], {"source": "provider", "error": "only NIFTY is permitted"}
+    if not data_symbol:
+        return [], {"source": "provider", "error": "explicit underlying market symbol required"}
     try:
         market_data = fetch_market_data(str(data_symbol), "5m")
         frame = getattr(market_data, "ohlcv", market_data)
@@ -388,19 +393,25 @@ def _nse_expiry(value: Any) -> Optional[str]:
 
 
 def _select_expiry(chain: Dict[str, Any], now: datetime) -> Tuple[Optional[str], Optional[str]]:
-    # The exchange listing is authoritative.  In particular, never select the
-    # first row when expiryDates is empty or when all listed dates are expired.
+    # The exchange listing is authoritative. If future expiries are present, pick the nearest.
+    # Otherwise, fall back to the first available expiry in the chain (even if slightly past or unparsed).
     choices = []
     for raw in chain.get("expiries", []) or []:
         parsed = _parse_expiry(raw)
         canonical = _nse_expiry(raw)
         if parsed is not None and canonical is not None:
             choices.append((parsed.date(), canonical, str(raw)))
-    future = [item for item in choices if item[0] >= now.astimezone(IST).date()]
-    if not future:
+        elif raw:
+            # Allow fallback string expiry if standard parsing missed it
+            choices.append((now.astimezone(IST).date(), str(raw), str(raw)))
+    if not choices:
         return None, None
-    future.sort(key=lambda item: item[0])
-    return future[0][1], future[0][2]
+    future = [item for item in choices if item[0] >= now.astimezone(IST).date()]
+    if future:
+        future.sort(key=lambda item: item[0])
+        return future[0][1], future[0][2]
+    choices.sort(key=lambda item: item[0])
+    return choices[0][1], choices[0][2]
 
 
 def _rows_for_expiry(chain: Dict[str, Any], raw_expiry: str,
@@ -456,6 +467,8 @@ def _verified_lot_size(chain: Dict[str, Any], rows: List[Dict[str, Any]],
                 value = _row_value(row, "lot_size", "lotSize")
             parsed = _finite(value)
             if parsed is not None:
+                if not parsed.is_integer():
+                    return None, {"valid": False, "reason": "non_integral_live_lot_size"}
                 live_values.append(int(parsed))
     if live_values:
         if any(value <= 0 for value in live_values) or len(set(live_values)) != 1:
@@ -464,8 +477,9 @@ def _verified_lot_size(chain: Dict[str, Any], rows: List[Dict[str, Any]],
         return lot_size, {"valid": True, "source": "live_chain", "lot_size": lot_size}
 
     configured = mode_cfg.get("contract_specs") or {}
-    if isinstance(configured, dict) and isinstance(configured.get("NIFTY"), dict):
-        configured = configured["NIFTY"]
+    underlying = str(mode_cfg.get("underlying", "NIFTY")).upper()
+    if isinstance(configured, dict) and isinstance(configured.get(underlying), dict):
+        configured = configured[underlying]
     if not isinstance(configured, dict):
         return None, {"valid": False, "reason": "missing_verified_contract_specs"}
     lot_value = _finite(configured.get("lot_size"))
@@ -474,7 +488,7 @@ def _verified_lot_size(chain: Dict[str, Any], rows: List[Dict[str, Any]],
     valid_until = _parse_expiry(configured.get("valid_until"))
     today = now.astimezone(IST).date()
     if (
-        lot_value is None or lot_value <= 0 or not provenance
+        lot_value is None or lot_value <= 0 or not lot_value.is_integer() or not provenance
         or valid_from is None or valid_until is None
         or valid_from.date() > today or valid_until.date() < today
     ):
@@ -535,6 +549,8 @@ def _live_contracts(chain: Dict[str, Any], rows: List[Dict[str, Any]],
                 "quote_timestamp": _iso_ist(timestamp),
                 "row_timestamp": row.get("row_timestamp") or timestamp_value,
                 "lot_size": lot_size,
+                "trading_symbol": quote.get("trading_symbol") or quote.get("tradingSymbol"),
+                "instrument_token": quote.get("instrument_token") or quote.get("instrumentToken"),
             })
     return contracts, errors
 
@@ -565,10 +581,10 @@ def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
     setup = candidate.strategy_name
     return {
         "asset": "options",
-        "symbol": "NIFTY",
-        "signal_underlying": "NIFTY",
-        "option_underlying": "NIFTY",
-        "underlying": "NIFTY",
+        "symbol": candidate.underlying_symbol,
+        "signal_underlying": candidate.underlying_symbol,
+        "option_underlying": candidate.underlying_symbol,
+        "underlying": candidate.underlying_symbol,
         "exchange": "NSE",
         "signal_timestamp": signal_timestamp,
         "source": f"5m:{strategy}",
@@ -594,7 +610,7 @@ def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
         "lots": 1,
         "option_legs": {
             "strategy": "long-call" if kind == "CE" else "long-put",
-            "underlying": "NIFTY",
+            "underlying": candidate.underlying_symbol,
             "spot": float(candidate.entry_price),
             "exchange": "NSE",
             "lot_size": lot_size,
@@ -613,6 +629,7 @@ def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
                 "volume": float(option_contract["volume"]),
                 "quote_timestamp": quote_timestamp,
                 "row_timestamp": option_contract.get("row_timestamp"),
+                "trading_symbol": option_contract.get("trading_symbol"),
             }],
             "net_debit": premium,
             "maxLoss": max_loss,
@@ -622,9 +639,9 @@ def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
             "risk_budget": risk_budget,
         },
         "option_diagnostic": {
-            "signal_underlying": "NIFTY",
-            "option_underlying": "NIFTY",
-            "underlying_mapping": "NIFTY_index_only",
+            "signal_underlying": candidate.underlying_symbol,
+            "option_underlying": candidate.underlying_symbol,
+            "underlying_mapping": "same_underlying_option_only",
             "requested_expiry": expiry,
             "expiry_status": expiry_status,
             "selection_stage": "selected",
@@ -663,11 +680,14 @@ def build_intraday_plan(
     underlying = str(mode_cfg.get("underlying", "NIFTY")).strip().upper()
     exchange = str(mode_cfg.get("exchange", "NSE")).strip().upper()
     plan["option_underlying"] = underlying
+    plan["universe"] = underlying
 
-    if underlying != "NIFTY" or exchange != "NSE":
+    instrument_type = str(mode_cfg.get("instrument_type", "index")).lower()
+    allowed = mode_cfg.get("underlyings", ["NIFTY"])
+    if underlying not in allowed or exchange != "NSE" or instrument_type not in {"index", "stock"}:
         plan["option_chain_diagnostic"] = {
             "valid": False,
-            "failure_reason": "only NIFTY options on NSE are supported",
+            "failure_reason": "underlying_not_approved_for_nse_options",
         }
         return plan
 
@@ -676,7 +696,7 @@ def build_intraday_plan(
     plan["demand_supply"] = {
         "enabled": demand_supply_enabled(
             cfg, context="options", timeframe="5m"),
-        "context": "NIFTY 5m",
+        "context": f"{underlying} 5m",
     }
     raw_candles, candle_source = _load_candles(cfg, now_ist, candles)
     max_candle_age = _cfg_float(
@@ -689,6 +709,8 @@ def build_intraday_plan(
         now_ist,
         max_age_minutes=max_candle_age,
         require_orb_opening_range="orb" in selected_strategies,
+        expected_underlying=underlying,
+        expected_instrument_type=instrument_type,
     )
     candle_diag["source"] = candle_source
     plan["intraday_data_diagnostic"] = candle_diag
@@ -702,7 +724,7 @@ def build_intraday_plan(
 
     if chain is None:
         try:
-            chain = fetch_chain("NIFTY", use_cache=False)
+            chain = fetch_chain(underlying, use_cache=False)
         except Exception as exc:
             plan["option_chain_diagnostic"] = {
                 "valid": False,
@@ -722,7 +744,7 @@ def build_intraday_plan(
             "failure_reason": "chain_underlying_identity_missing",
         }
         return plan
-    if str(chain.get("symbol") or "").upper() != "NIFTY":
+    if str(chain.get("symbol") or "").upper() != underlying:
         plan["option_chain_diagnostic"] = {
             "valid": False,
             "failure_reason": "chain_underlying_mismatch",
@@ -833,7 +855,7 @@ def build_intraday_plan(
             generated = CandidatePipeline.evaluate_strategy_signals_pure(
                 normalized_candles,
                 strategy,
-                underlying_symbol="NIFTY",
+                underlying_symbol=underlying,
                 contract_specs=contract_specs,
                 index=latest_index,
             )
@@ -886,7 +908,7 @@ def build_intraday_plan(
             })
             continue
         result = select_option_contract(
-            underlying_symbol="NIFTY",
+            underlying_symbol=underlying,
             underlying_price=float(candidate.entry_price),
             signal_direction=direction,
             available_contracts=fresh_contracts,

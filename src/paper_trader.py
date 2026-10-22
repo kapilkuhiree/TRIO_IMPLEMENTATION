@@ -11,6 +11,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 import csv
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from src.options_intraday import (
     COMBINED,
     combined_mode_enabled,
     options_intraday_enabled,
+    options_intraday_config,
     resolve_trading_mode,
     strict_options_enabled,
     validate_option_candidate,
@@ -1732,10 +1734,95 @@ class PaperTrader:
             pass
         return cands
 
+    def _run_options_only_session(self, interval_seconds: int,
+                                  max_seconds: Optional[int],
+                                  management_only: bool) -> None:
+        """Serialize fresh entry scans independently of the management cadence.
+
+        There is deliberately no plan input or fixed-slot catchup schedule.
+        Each scan finishes before the next can start, and failed attempts wait
+        the same interval before retrying.  The strict runtime owns all entry,
+        risk, exit and finalization decisions.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        runtime = None
+        try:
+            cfg = load_config()
+            runtime = self._get_options_runtime(cfg)
+            runtime.management_interval_seconds = max(5, interval_seconds)
+            self.ensure_option_broker(cfg)
+            mode_cfg = options_intraday_config(cfg)
+            try:
+                scan_interval = float(mode_cfg.get("scan_interval_seconds", 300))
+                if not math.isfinite(scan_interval) or scan_interval <= 0:
+                    raise ValueError("scan interval must be positive and finite")
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Invalid options scan interval; using 300 seconds.")
+                scan_interval = 300.0
+
+            started = time.monotonic()
+            next_scan_at = None
+            while True:
+                tick_started = time.monotonic()
+                ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+                try:
+                    runtime.tick(now=ist_now)
+                except Exception as exc:
+                    logger.critical("options_intraday tick unresolved: %s", exc)
+
+                # Management comes first; recheck the clock before attempting
+                # an entry scan in case exit/reconciliation work took time.
+                ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+                can_enter = self._session_open(now_ist=ist_now)
+                if (not management_only and can_enter and
+                        (next_scan_at is None or time.monotonic() >= next_scan_at)):
+                    scan_started = time.monotonic()
+                    try:
+                        runtime.scan_and_execute(now=ist_now)
+                    except Exception as exc:
+                        logger.error("Options live scan failed; still managing exits: %s",
+                                     exc)
+                    finally:
+                        next_scan_at = scan_started + scan_interval
+                        if next_scan_at <= time.monotonic():
+                            # A scan that overran its entire interval must not
+                            # trigger a burst of overdue catchup scans.
+                            next_scan_at = time.monotonic() + scan_interval
+
+                ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+                try:
+                    self._log_event("scan", {
+                        "session_open": can_enter,
+                        "positions": len(runtime._state.get("positions", {})),
+                    })
+                    from src.alerts import handle_all_joins
+                    handle_all_joins()
+                except Exception as exc:
+                    logger.warning("Options session tick reporting failed: %s", exc)
+
+                if not self._market_still_running(now_ist=ist_now):
+                    logger.info("Market closed — final options square-off.")
+                    break
+                if max_seconds and time.monotonic() - started >= max_seconds:
+                    logger.info("run_session: max_seconds reached.")
+                    break
+                time.sleep(max(0, max(5, interval_seconds) -
+                               (time.monotonic() - tick_started)))
+        finally:
+            if runtime is not None:
+                try:
+                    runtime.finalize()
+                except Exception as exc:
+                    logger.critical("options_intraday finalization unresolved: %s", exc)
+                    self._options_unresolved_exits = {"strict_options": str(exc)}
+            self._write_trade_log_csv()
+
     def run_session(self, plan: Optional[Dict[str, Any]] = None,
                     interval_seconds: int = 60,
                     max_seconds: Optional[int] = None,
-                    tick_hook: Any = None) -> None:
+                    tick_hook: Any = None,
+                    management_only: bool = False) -> None:
         """Session job: execute the plan once, then manage until EOD.
 
         Designed for a single GitHub Actions job (09:15–15:10 IST). Places
@@ -1748,7 +1835,16 @@ class PaperTrader:
         ``tick_hook`` (optional callable, no args) runs at the END of every
         guard tick — used by scripts/session.py to mark option spreads to
         the live chain mid. Never raises out of this loop.
+
+        Explicit options-only mode ignores ``plan`` and scans fresh live data
+        on its own interval. ``management_only`` disables those entry scans
+        while retaining every runtime management tick and finalization.
         """
+        if self.options_only:
+            self._run_options_only_session(
+                interval_seconds, max_seconds, management_only)
+            return
+
         options_runtime = None
         equity_enabled = not self.options_only
         if self.strict_options_mode:

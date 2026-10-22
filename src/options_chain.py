@@ -2,10 +2,10 @@
 TRIO — NSE Options Chain Fetcher
 Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
-Free chain source: NSE public API (option-chain-indices?symbol=NIFTY).
-Cookie session required; cloud IPs get blocked often — every failure is
-fail-closed to (Kite chain if keys exist, else None) so the caller falls
-back to the Black-Scholes sim in options_pricing.py.
+Free chain source: NSE public API (index and individual equity options).
+Cookie session required; cloud IPs get blocked often. Failure returns None;
+this module never substitutes synthetic data. Strict use_cache=False also
+requires response-side underlying identity and never reads cached chains.
 
 Chain row per strike: CE/PE {lastPrice, bidPrice, askPrice, openInterest,
 changeinOpenInterest, impliedVolatility, totalTradedVolume}.
@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -40,6 +41,7 @@ NSE_CHAIN_PATHS = [
 ]
 NSE_EXPIRY_PATH = "/api/option-chain-contract-info?symbol={symbol}"
 NSE_HOME = "https://www.nseindia.com/option-chain"
+INDEX_SYMBOLS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTYNXT50", "MIDCPNIFTY"})
 
 TIMEOUT = 20
 RETRIES = 2
@@ -216,7 +218,7 @@ def _parse_strike_row(expiry: str, strike: Any,
 def _expiries_for(s: "requests.Session", symbol: str) -> List[str]:
     """Expiry list via contract-info (probed live 2026-10-08)."""
     try:
-        r = s.get(NSE_BASE + NSE_EXPIRY_PATH.format(symbol=symbol),
+        r = s.get(NSE_BASE + NSE_EXPIRY_PATH.format(symbol=quote(symbol, safe="")),
                   timeout=TIMEOUT)
         if r.status_code != 200:
             return []
@@ -225,16 +227,64 @@ def _expiries_for(s: "requests.Session", symbol: str) -> List[str]:
         return []
 
 
+def _symbol_identity(value: Any) -> str:
+    """Canonical NSE underlying, without inferring an index from a stock."""
+    return str(value or "").strip().upper().removesuffix(".NS")
+
+
+def _response_identity_failure(data: Dict[str, Any], symbol: str,
+                               require_identity: bool) -> Optional[str]:
+    """Validate headers, rows and both legs before normalization loses identity.
+
+    NSE commonly supplies the symbol only in CE/PE ``underlying`` fields.
+    Strict callers require evidence for every quote, inherited from a header
+    or row when available. Legacy cache-enabled callers may accept omitted
+    identity, but explicit contradictory identity is never relabelled.
+    """
+    def identities(item: Dict[str, Any]) -> List[str]:
+        return [_symbol_identity(item[key])
+                for key in ("symbol", "underlying_symbol", "underlyingSymbol", "underlying")
+                if isinstance(item.get(key), str) and item[key].strip()]
+
+    rec = data.get("records") or {}
+    filtered = data.get("filtered") or {}
+    headers = identities(data) + identities(rec) + identities(filtered)
+    for identity in headers:
+        if identity != symbol:
+            return f"symbol_mismatch:{identity}"
+    raw_rows = rec.get("data") or filtered.get("data") or data.get("data") or []
+    if not raw_rows and require_identity and not headers:
+        return "missing_symbol_identity"
+    for row in raw_rows:
+        row_ids = identities(row)
+        for identity in row_ids:
+            if identity != symbol:
+                return f"symbol_mismatch:{identity}"
+        evidence = bool(headers or row_ids)
+        legs = [row[side] for side in ("CE", "PE") if row.get(side)]
+        for leg in legs:
+            leg_ids = identities(leg)
+            for identity in leg_ids:
+                if identity != symbol:
+                    return f"symbol_mismatch:{identity}"
+            if require_identity and not (evidence or leg_ids):
+                return "missing_symbol_identity"
+        if require_identity and not legs and not evidence:
+            return "missing_symbol_identity"
+    return None
+
+
 def fetch_chain(symbol: str = "NIFTY",
                 use_cache: bool = True,
                 diagnostic_label: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Fetch the full NSE option chain for an index symbol.
+    """Fetch an NSE index or actual stock-underlying option chain.
 
     Returns {"underlying": float, "expiries": [...], "by_expiry": {expiry:
-    [strike rows...]}} or None when blocked/unreachable (caller falls back
-    to BS sim). Never raises.
+    [strike rows...]}} or None when blocked/unreachable/identity-invalid.
+    ``use_cache=False`` bypasses all cached data and requires exchange-side
+    symbol identity. No simulated quotes or alternate underlyings are used.
     """
-    symbol = (symbol or "NIFTY").upper()
+    symbol = _symbol_identity(symbol or "NIFTY")
     cfg = {}
     try:
         cfg = load_config().get("options", {}) or {}
@@ -244,7 +294,7 @@ def fetch_chain(symbol: str = "NIFTY",
 
     if use_cache:
         hit = _cache_fresh(symbol, ttl)
-        if hit is not None:
+        if hit is not None and _symbol_identity(hit.get("symbol") or symbol) == symbol:
             hit = dict(hit)
             hit.setdefault("symbol", symbol)
             retrieval = {
@@ -266,17 +316,19 @@ def fetch_chain(symbol: str = "NIFTY",
             if not _warm_cookies(s):
                 raise RuntimeError("NSE cookie warmup failed (likely blocked)")
             expiries = _expiries_for(s, symbol)
-            # Fetch per-expiry via v3 (the shape NSE serves today), then the
-            # legacy indices path as a last resort.
+            # Known indices and actual stocks have different NSE endpoints.
+            chain_type = "Indices" if symbol in INDEX_SYMBOLS else "Equity"
+            legacy_kind = "indices" if symbol in INDEX_SYMBOLS else "equities"
+            encoded_symbol = quote(symbol, safe="")
             paths: List[tuple[str, str]] = []
             for exp in (expiries[:4] or [""]):
                 paths.append((
-                    "/api/option-chain-v3?type=Indices&symbol={s}&expiry={e}"
-                    .format(s=symbol, e=exp) if exp else
-                    "/api/option-chain-v3?type=Indices&symbol={s}".format(s=symbol),
+                    "/api/option-chain-v3?type={t}&symbol={s}&expiry={e}"
+                    .format(t=chain_type, s=encoded_symbol, e=quote(exp, safe="")) if exp else
+                    "/api/option-chain-v3?type={t}&symbol={s}".format(t=chain_type, s=encoded_symbol),
                     exp,
                 ))
-            paths.append(("/api/option-chain-indices?symbol={s}".format(s=symbol), ""))
+            paths.append((f"/api/option-chain-{legacy_kind}?symbol={encoded_symbol}", ""))
             responses: List[tuple[Dict[str, Any], str]] = []
             response_diagnostics: List[Dict[str, Any]] = []
             for path, requested_expiry in paths:
@@ -311,6 +363,17 @@ def fetch_chain(symbol: str = "NIFTY",
                     response_diag["failure_reason"] = f"invalid_json: {exc}"
                     response_diagnostics.append(response_diag)
                     continue
+                if not isinstance(data, dict):
+                    response_diag["failure_reason"] = "invalid_response_shape"
+                    response_diagnostics.append(response_diag)
+                    continue
+                identity_failure = _response_identity_failure(
+                    data, symbol, require_identity=not use_cache)
+                if identity_failure:
+                    response_diag["failure_reason"] = identity_failure
+                    response_diag["validation_failures"].append(identity_failure)
+                    response_diagnostics.append(response_diag)
+                    continue
                 if (data.get("records") or data.get("filtered")
                         or data.get("data")):
                     responses.append((data, requested_expiry))
@@ -326,7 +389,9 @@ def fetch_chain(symbol: str = "NIFTY",
                     response_diag["failure_reason"] = "empty_response"
                     response_diagnostics.append(response_diag)
             if not responses:
-                raise RuntimeError("all NSE chain paths 404/blocked")
+                failures = ", ".join(dict.fromkeys(
+                    item.get("failure_reason", "unavailable") for item in response_diagnostics))
+                raise RuntimeError(f"all NSE chain paths unavailable: {failures}")
             underlying = 0.0
             by_expiry: Dict[str, List[Dict[str, Any]]] = {}
             all_expiries = list(expiries or [])

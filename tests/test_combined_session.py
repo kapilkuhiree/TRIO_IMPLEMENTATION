@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+from src.plan import today_ist_str
+
 
 class _StrictRuntimeSpy:
     def __init__(self):
@@ -47,10 +49,15 @@ def _combined_trader(monkeypatch):
     trader._maybe_eod_square_off = lambda now_ist=None: []
     trader._guard_open_positions = lambda: trader.events.append(("equity_guard", {}))
     trader._manage_open_positions = lambda: trader.events.append(("equity_manage", {}))
+    # These tests own only the same-tick entry/exit handoff, not live discovery.
+    trader._live_rescan = lambda slot: []
     trader.execute_plan = lambda plan: trader.events.append(("equity_entry", plan)) or []
     trader.execute_option_plan = lambda plan, opt_broker=None: (
         trader.events.append(("options_entry", plan)) or [])
     monkeypatch.setattr(lifecycle, "reconcile_broker", lambda _trader: {})
+    monkeypatch.setattr("src.alerts.handle_all_joins", lambda: [])
+    monkeypatch.setattr("src.alerts.send_telegram", lambda *args: None)
+    monkeypatch.setattr("src.alerts.send_options_telegram", lambda *args: None)
     return trader
 
 
@@ -61,7 +68,7 @@ def test_combined_session_runs_both_entry_and_exit_lifecycles(monkeypatch):
         "candidates": [{"symbol": "RELIANCE.NS"}],
         "options_intraday_plan": {
             "trading_mode": "options_intraday",
-            "date": "2026-10-15",
+            "date": today_ist_str(),
             "option_candidates": [],
         },
     }
@@ -85,7 +92,7 @@ def test_combined_runtime_does_not_use_legacy_option_tick_hook(monkeypatch):
         "candidates": [],
         "options_intraday_plan": {
             "trading_mode": "options_intraday",
-            "date": "2026-10-15",
+            "date": today_ist_str(),
             "option_candidates": [],
         },
     }

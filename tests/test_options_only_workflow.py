@@ -1,9 +1,28 @@
 """Static safety checks for the controlled scheduled paper mode."""
 
 from pathlib import Path
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_paper_workflows_parse_and_use_pinned_runtime_and_lock():
+    for name, job in (("premarket.yml", "premarket"), ("session.yml", "session")):
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8"))
+        steps = workflow["jobs"][job]["steps"]
+        setup = next(step for step in steps if step.get("uses", "").startswith("actions/setup-python@"))
+        assert setup["with"]["python-version-file"] == ".python-version"
+        assert setup["with"]["cache-dependency-path"] == "requirements-server.lock"
+        install = next(step for step in steps if step.get("name") == "Install dependencies")
+        assert "--require-hashes -r requirements-server.lock" in install["run"]
+
+
+def test_options_overlay_defaults_to_nifty50_scan():
+    overlay = yaml.safe_load(
+        (ROOT / "config" / "options_intraday.yaml").read_text(encoding="utf-8")
+    )
+    assert overlay["options_intraday"]["scan_basket"] == "nifty50"
 
 
 def test_scheduled_workflows_are_options_only():

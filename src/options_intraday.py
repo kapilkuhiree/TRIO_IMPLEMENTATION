@@ -37,9 +37,9 @@ _DEFAULTS: Dict[str, Any] = {
     "hard_flat": "15:10",
     "strategies": ["orb", "pullback", "momentum"],
     "stop_premium_fraction": 0.20,
+    "profit_lock_step_fraction": 0.10,
     "target_premium_fraction": 0.30,
     "max_daily_entries": 5,
-    "max_daily_loss_pct": 1.0,
     "max_consecutive_losses": 2,
     "max_unrealized_loss_pct": 1.0,
     "max_portfolio_risk_pct": 1.0,
@@ -50,6 +50,61 @@ _DEFAULTS: Dict[str, Any] = {
     "chain_max_age_minutes": 15,
     "state_dir": "",
 }
+
+
+# These values are deliberately not in ``_DEFAULTS``.  A strict options
+# session must fail closed when its paper-risk policy is absent or malformed;
+# inheriting a stock/default risk policy would make the effective mode unsafe.
+_REQUIRED_RISK_KEYS = (
+    "risk_per_trade_pct",
+    "max_daily_loss_pct",
+    "max_open_positions",
+    "max_premium_exposure_pct",
+    "allow_averaging_down",
+    "PAPER_TRADING",
+)
+
+
+def validate_options_intraday_risk_config(
+    mode_cfg: Optional[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Validate the complete effective remote-paper risk policy.
+
+    Do not coerce missing values or borrow values from the general risk
+    manager here.  This is the policy used immediately before an options
+    broker can be acquired, so an incomplete policy is an admission failure.
+    """
+    mode_cfg = mode_cfg if isinstance(mode_cfg, dict) else {}
+    for key in _REQUIRED_RISK_KEYS:
+        if key not in mode_cfg:
+            return False, f"options_intraday risk key is missing: {key}"
+
+    for key in ("risk_per_trade_pct", "max_daily_loss_pct",
+                "max_premium_exposure_pct"):
+        value = _finite(mode_cfg.get(key))
+        if value is None or value <= 0 or value > 100:
+            return False, f"options_intraday risk key is invalid: {key}"
+
+    max_positions = mode_cfg.get("max_open_positions")
+    if isinstance(max_positions, bool):
+        return False, "options_intraday risk key is invalid: max_open_positions"
+    max_positions_number = _finite(max_positions)
+    if (max_positions_number is None or max_positions_number <= 0 or
+            max_positions_number != int(max_positions_number)):
+        return False, "options_intraday risk key is invalid: max_open_positions"
+
+    if not isinstance(mode_cfg.get("allow_averaging_down"), bool):
+        return False, "options_intraday risk key is invalid: allow_averaging_down"
+    if mode_cfg.get("allow_averaging_down"):
+        return False, "options_intraday allow_averaging_down must be false"
+    if mode_cfg.get("PAPER_TRADING") is not True:
+        return False, "options_intraday requires PAPER_TRADING=true"
+
+    stop_fraction = _finite(mode_cfg.get("stop_premium_fraction"))
+    if stop_fraction is None or not math.isclose(
+            stop_fraction, 0.20, rel_tol=0.0, abs_tol=1e-12):
+        return False, "options_intraday requires a 20% initial premium stop"
+    return True, ""
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,13 +184,16 @@ def load_options_intraday_config(
             if isinstance(loaded, dict):
                 nested = loaded.get("options_intraday")
                 overlay = (nested if isinstance(nested, dict) else loaded)
-    except (OSError, UnicodeError, yaml.YAMLError):
-        # A malformed optional overlay is not allowed to silently alter the
-        # production path.  The runtime will use built-in safe defaults.
-        overlay = {}
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        # A malformed paper-risk overlay must fail closed rather than silently
+        # replacing the approved policy with permissive built-in defaults.
+        raise ValueError("options_intraday overlay is unreadable") from exc
 
     mode_cfg = _deep_merge(_DEFAULTS, overlay)
     mode_cfg = _deep_merge(mode_cfg, result.get("options_intraday", {}) or {})
+    valid, reason = validate_options_intraday_risk_config(mode_cfg)
+    if not valid:
+        raise ValueError(reason)
     result["options_intraday"] = mode_cfg
     return result
 
@@ -208,7 +266,7 @@ def _option_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     mode_values = {
         key: mode[key] for key in (
             "underlying", "underlyings", "exchange", "lot_size", "strike_step",
-            "min_oi", "max_spread_pct", "chain_max_age_minutes",
+            "min_oi", "max_spread_pct", "chain_max_age_minutes", "exact_contract",
         ) if key in mode
     }
     return _deep_merge(
@@ -331,6 +389,10 @@ def validate_option_candidate(
                       candidate.get("option_underlying") or "").strip().upper()
     if not underlying or underlying not in set(_configured_underlyings(settings)):
         return False, f"unapproved option underlying: {underlying or '?'}"
+    for field in ("signal_underlying", "option_underlying", "symbol", "underlying"):
+        identity = candidate.get(field)
+        if identity and str(identity).strip().upper().removesuffix(".NS") != underlying:
+            return False, "signal/option underlying mismatch"
     expected_exchange = str(settings.get("exchange", "NSE") or "NSE").upper()
     exchange = str(option.get("exchange") or leg.get("exchange") or "").upper()
     if exchange != expected_exchange:
@@ -342,9 +404,18 @@ def validate_option_candidate(
     strike = _finite(leg.get("strike"))
     if strike is None or strike <= 0:
         return False, "invalid strike"
-    step = _finite(settings.get("strike_step", 50))
-    if step is None or step <= 0 or abs(strike / step - round(strike / step)) > 1e-8:
-        return False, "strike does not match configured interval"
+    exact = settings.get("exact_contract")
+    if exact is not None:
+        if (not isinstance(exact, dict) or exact.get("underlying_symbol") != underlying or
+                not _same_expiry(exact.get("expiry"), expiry) or
+                _finite(exact.get("strike")) != strike or exact.get("option_type") != kind or
+                not exact.get("instrument_token") or
+                exact.get("trading_symbol") != leg.get("trading_symbol")):
+            return False, "selected contract differs from current broker listing"
+    else:
+        step = _finite(settings.get("strike_step", 50))
+        if step is None or step <= 0 or abs(strike / step - round(strike / step)) > 1e-8:
+            return False, "strike does not match configured interval"
 
     lot_size = option.get("lot_size", candidate.get("lot_size"))
     if isinstance(lot_size, bool) or not isinstance(lot_size, int) or lot_size <= 0:
@@ -475,7 +546,23 @@ def validate_options_mode_environment(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     if (cfg.get("execution", {}) or {}).get("allow_local_option_shadow") is True:
         return False, "options_intraday forbids local option shadowing"
     mode_cfg = cfg.get("options_intraday", {}) or {}
-    if str(mode_cfg.get("execution_class", "remote_paper")) != "remote_paper":
+    valid_risk, risk_reason = validate_options_intraday_risk_config(mode_cfg)
+    if not valid_risk:
+        return False, risk_reason
+    paper_env = os.environ.get("PAPER_TRADING")
+    paper_env_enabled = {
+        "1", "true", "yes", "on", "y"
+    }
+    if paper_env is not None and str(paper_env).strip().lower() not in paper_env_enabled:
+        return False, "options_intraday requires PAPER_TRADING=true"
+    # The options-only workflow declares the environment switch explicitly.
+    # Combined-mode callers historically supplied the effective config only;
+    # the config remains authoritative there while an explicit false env value
+    # is rejected above.
+    if (resolve_trading_mode(cfg) == OPTIONS_INTRADAY and
+            str(paper_env or "").strip().lower() not in paper_env_enabled):
+        return False, "options_intraday requires PAPER_TRADING=true"
+    if str(mode_cfg.get("execution_class")) != "remote_paper":
         return False, "options_intraday execution_class must be remote_paper"
     return True, ""
 
@@ -488,6 +575,7 @@ __all__ = [
     "options_intraday_config", "options_intraday_enabled",
     "parse_exchange_timestamp",
     "parse_timestamp", "resolve_trading_mode", "strict_options_enabled",
+    "validate_options_intraday_risk_config",
     "validate_option_candidate",
     "validate_options_mode_environment",
 ]
