@@ -97,8 +97,15 @@ class ZerodhaMarketData:
     @staticmethod
     def _equity_symbol(symbol: str) -> str:
         value = str(symbol or "").strip().upper()
-        if value in {"^NSEI", "NIFTY", "NIFTY50", "NIFTY 50"}:
-            return "NIFTY 50"
+        indices = {
+            "^NSEI": "NIFTY 50", "NIFTY": "NIFTY 50", "NIFTY50": "NIFTY 50",
+            "^NSEBANK": "NIFTY BANK", "BANKNIFTY": "NIFTY BANK",
+            "FINNIFTY": "NIFTY FIN SERVICE", "NIFTY_FIN_SERVICE.NS": "NIFTY FIN SERVICE",
+            "^NSMIDCP": "NIFTY NEXT 50", "NIFTYNXT50": "NIFTY NEXT 50",
+            "MIDCPNIFTY": "NIFTY MID SELECT", "NIFTY_MID_SELECT.NS": "NIFTY MID SELECT",
+        }
+        if value in indices:
+            return indices[value]
         return value.replace(".NS", "").replace(".BO", "")
 
     def find_instrument(self, exchange: str, trading_symbol: str,

@@ -128,8 +128,10 @@ class MegaBullOptionsBroker(BaseBroker):
                       ref_price: float, reason: str) -> bool:
         """Fire one leg's exit; True only when the remote book flattened."""
         try:
+            price = (float(ref_price) if getattr(self, "strict_options_only", False)
+                     else self._leg_price(mega_symbol, ref_price))
             rec = self.mega.close_position(
-                mega_symbol, self._leg_price(mega_symbol, ref_price),
+                mega_symbol, price,
                 reason, fraction=1.0)
             return bool(rec)
         except Exception as exc:
@@ -172,6 +174,10 @@ class MegaBullOptionsBroker(BaseBroker):
         expiry = str(d.get("expiry") or "")
         strat = str(d.get("strategy") or "spread")
         single = (len(legs) == 1 and strat in ("long-call", "long-put"))
+        strict = bool(getattr(self, "strict_options_only", False) or d.get("strict_options_only"))
+        if strict and (not single or legs[0].get("side") != "BUY" or
+                       legs[0].get("kind") != ("CE" if strat == "long-call" else "PE")):
+            return self._reject(strat, lots, 0.0, "strict mode requires one BUY CE/PE leg")
         if len(legs) < 2 and not single:
             return self._reject(d.get("strategy", "?"), lots, 0.0,
                                 "spread needs 2 legs")
@@ -189,24 +195,54 @@ class MegaBullOptionsBroker(BaseBroker):
         short_k = float(shorts[0].get("strike") or 0) if shorts else 0.0
         net = float(d.get("net_debit") or 0.0)
         contract_lot_size = d.get("lot_size")
+        effective_lot = self.lot_size
         if contract_lot_size not in (None, 0):
             if (isinstance(contract_lot_size, bool) or
                     not isinstance(contract_lot_size, int) or contract_lot_size <= 0):
                 return self._reject(strat, lots, net, "invalid contract lot size")
-            if contract_lot_size != self.lot_size:
+            if contract_lot_size != self.lot_size and not strict:
                 return self._reject(strat, lots, net,
-                                    "contract lot size does not match broker")
+                                     "contract lot size does not match broker")
+            effective_lot = contract_lot_size
+        if strict:
+            from src.options_intraday import _same_expiry
+            contract = d.get("validated_contract") or {}
+            symbol = str(d.get("trading_symbol") or "")
+            # Do not synthesize a stock/monthly/decimal-strike trading symbol.
+            # The runtime's exact instrument must still resolve identically.
+            try:
+                current = self.mega.instrument_for(symbol)
+                keys = ("instrumentToken", "tradingSymbol", "exchange",
+                        "instrumentType", "lotSize", "expiry", "strike")
+                valid = (contract_lot_size is not None and isinstance(current, dict) and
+                         all(contract.get(key) not in (None, "") and
+                             str(current.get(key)) == str(contract[key]) for key in keys) and
+                         contract["tradingSymbol"] == symbol and
+                         contract["exchange"] == "NSE" and
+                         contract["instrumentType"] in {"OPTIDX", "OPTSTK"} and
+                         _same_expiry(contract["expiry"], expiry) and
+                         float(contract["strike"]) == long_k and
+                         float(contract["lotSize"]) == effective_lot and
+                         symbol.startswith(underlying) and
+                         symbol[len(underlying):len(underlying) + 1].isdigit() and
+                         symbol.endswith(str(legs[0]["kind"])) and
+                         not isinstance(lots, bool) and float(lots) > 0 and float(lots).is_integer())
+            except (AttributeError, TypeError, ValueError, KeyError):
+                valid = False
+            if not valid:
+                return self._reject(strat, lots, net, "exact strict contract metadata is required")
         lots = max(1, int(lots or 1))
-        sid = self._spread_id(strat, expiry, long_k, short_k)
+        sid = (f"OPT_{d['trading_symbol']}" if strict else
+               self._spread_id(strat, expiry, long_k, short_k))
         if sid in self.positions:
             return self._reject(sid, lots, net,
                                 "already holding this spread")
 
-        units = max(1, int(lots) * max(1, int(self.lot_size)))
+        units = max(1, int(lots) * max(1, int(effective_lot)))
         opened: List[Dict[str, Any]] = []
         pending_statuses = {"PENDING", "SUBMITTED", "ACCEPTED", "OPEN", "UNKNOWN"}
         for leg in legs:
-            mega_symbol = option_symbol(underlying, expiry,
+            mega_symbol = d["trading_symbol"] if strict else option_symbol(underlying, expiry,
                                         float(leg.get("strike") or 0),
                                         str(leg.get("kind") or ""))
             try:
@@ -272,8 +308,9 @@ class MegaBullOptionsBroker(BaseBroker):
                              "price": l["price"], "closed": False}
                             for l in opened],
             "underlying": underlying,
+            "lot_size": effective_lot,
             "net_debit": net, "lots": lots,
-            "maxLoss": float(d.get("maxLoss") or net * lots * self.lot_size),
+            "maxLoss": float(d.get("maxLoss") or net * lots * effective_lot),
             "maxGain": float(d.get("maxGain") or 0.0),
             "breakeven": float(d.get("breakeven") or 0.0),
         }
@@ -294,10 +331,11 @@ class MegaBullOptionsBroker(BaseBroker):
         if pos is None:
             return
         pos.current_price = float(mid)
-        pos.pnl = (float(mid) - pos.avg_price) * pos.quantity * self.lot_size
+        lot_size = self.spreads.get(spread_id, {}).get("lot_size", self.lot_size)
+        pos.pnl = (float(mid) - pos.avg_price) * pos.quantity * lot_size
         if pos.avg_price > 0:
             pos.pnl_pct = (pos.pnl / (pos.avg_price * pos.quantity
-                                      * self.lot_size)) * 100
+                                      * lot_size)) * 100
 
     def close_spread(self, spread_id: str, mid: float,
                      reason: str = "close") -> Dict[str, Any]:
@@ -312,6 +350,7 @@ class MegaBullOptionsBroker(BaseBroker):
         if pos is None or pos.quantity <= 0:
             return {}
         detail = self.spreads.get(spread_id, {})
+        lot_size = detail.get("lot_size", self.lot_size)
         lots = pos.quantity
         debit = pos.avg_price
         remote = detail.get("remote_legs") or []
@@ -339,14 +378,14 @@ class MegaBullOptionsBroker(BaseBroker):
             logger.error("Spread %s close is uncertain; keeping it open for "
                          "retry", spread_id)
             return {}
-        gross = (float(mid) - debit) * lots * self.lot_size
+        gross = (float(mid) - debit) * lots * lot_size
         # Net of round-trip cost (spec §3), mirroring options_paper and the
         # backtest so the shared digest never mixes gross and net P&L.
         cost = 0.0
         try:
             from src.options_pricing import round_trip_cost as _rtc
             cost = _rtc(detail.get("strategy", ""), debit, float(mid),
-                        lots, self.lot_size)
+                        lots, lot_size)
         except Exception:
             cost = 0.0
         pnl = round(gross - cost, 2)
@@ -361,7 +400,7 @@ class MegaBullOptionsBroker(BaseBroker):
             "symbol": spread_id, "side": "LONG", "quantity": lots,
             "entry": round(debit, 2), "exit": round(float(mid), 2),
             "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl / (debit * lots * self.lot_size) * 100, 2)
+            "pnl_pct": round(pnl / (debit * lots * lot_size) * 100, 2)
             if debit and lots else 0.0,
             "reason": reason, "result": "PASS" if pnl > 0 else "FAIL",
             "entry_time": entry_at, "closed_at": closed_at,

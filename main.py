@@ -240,16 +240,23 @@ def cmd_paper(args: argparse.Namespace) -> None:
     symbols = args.symbols
     if not symbols:
         symbols = load_config().get("symbols", [])
-    interval = args.interval or 300
+    trader = PaperTrader(symbols=symbols, timeframe=args.timeframe,
+                         trading_mode=getattr(args, "trading_mode", None))
+    options_only = getattr(trader, "options_only", False)
+    interval = args.interval or (60 if options_only else 300)
 
     print(f"\nStarting paper trading:")
     print(f"  Symbols ({len(symbols)}):  {', '.join(symbols)}")
     print(f"  Interval: {interval}s")
     print(f"  Press Ctrl+C to stop\n")
 
-    trader = PaperTrader(symbols=symbols, timeframe=args.timeframe,
-                         trading_mode=getattr(args, "trading_mode", None))
-    if getattr(trader, "strict_options_mode", False):
+    if options_only:
+        trader.ensure_option_broker(load_config())
+        max_seconds = (interval * args.max_iterations
+                       if args.max_iterations else None)
+        trader.run_session(plan=None, interval_seconds=interval,
+                           max_seconds=max_seconds)
+    elif getattr(trader, "strict_options_mode", False):
         from src.plan import load_plan, today_ist_str
         cfg = load_config()
         session_date = today_ist_str()
@@ -358,7 +365,9 @@ def main() -> None:
     p_paper.add_argument("--symbols", "-s", nargs="+", required=False, default=None,
                          help="Symbols to trade (default: config watchlist)")
     p_paper.add_argument("--timeframe", "-t", default="15m", help="Timeframe")
-    p_paper.add_argument("--interval", type=int, default=300, help="Scan interval in seconds")
+    p_paper.add_argument(
+        "--interval", type=int, default=None,
+        help="Loop interval in seconds (default: 300; options_intraday management: 60)")
     p_paper.add_argument("--max-iterations", type=int, help="Stop after N scans")
     p_paper.add_argument(
         "--trading-mode", default=None,

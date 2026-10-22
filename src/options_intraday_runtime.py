@@ -17,6 +17,7 @@ reconciliation aid, not an experimental risk implementation.
 from __future__ import annotations
 
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as ScanTimeout
 from datetime import date, datetime, timedelta, timezone
 import json
 import math
@@ -36,6 +37,7 @@ from src.options_intraday import (
     parse_exchange_timestamp,
     parse_timestamp,
     resolve_trading_mode,
+    validate_options_intraday_risk_config,
     validate_option_candidate,
     validate_options_mode_environment,
 )
@@ -187,8 +189,11 @@ class OptionsIntradayRuntime:
                  trading_mode: Optional[str] = None):
         self.trader = trader
         source_cfg = cfg if cfg is not None else getattr(trader, "cfg", None)
-        self.cfg = (load_options_intraday_config(source_cfg)
-                    if source_cfg is not None else load_options_intraday_config())
+        try:
+            self.cfg = (load_options_intraday_config(source_cfg)
+                        if source_cfg is not None else load_options_intraday_config())
+        except ValueError as exc:
+            raise OptionsIntradayPolicyError(str(exc)) from exc
         requested_mode = trading_mode or getattr(trader, "trading_mode", None)
         resolved_mode = resolve_trading_mode(self.cfg, requested_mode)
         if resolved_mode not in {OPTIONS_INTRADAY, _COMBINED}:
@@ -200,8 +205,12 @@ class OptionsIntradayRuntime:
             raise OptionsIntradayPolicyError(reason)
 
         self.mode_cfg = options_intraday_config(self.cfg)
+        valid_risk, risk_reason = validate_options_intraday_risk_config(self.mode_cfg)
+        if not valid_risk:
+            raise OptionsIntradayPolicyError(risk_reason)
         self._broker: Any = getattr(trader, "opt_broker", None)
         self._last_plan: Optional[Dict[str, Any]] = None
+        self.last_scan_diagnostics: Dict[str, Any] = {}
         self._state_path = self._resolve_state_path()
         self._state = self._load_state()
         self._broker_blocked = bool(self._state.get("broker_blocked", False))
@@ -397,6 +406,9 @@ class OptionsIntradayRuntime:
         return market_clock_from_config(raw)
 
     def _require_broker(self, opt_broker: Any = None) -> Any:
+        ok, reason = validate_options_mode_environment(self.cfg)
+        if not ok:
+            raise OptionsIntradayPolicyError(reason)
         broker = opt_broker or self._broker or getattr(self.trader, "opt_broker", None)
         if broker is None:
             ensure = getattr(self.trader, "ensure_option_broker", None)
@@ -668,7 +680,7 @@ class OptionsIntradayRuntime:
         actual_lot = self._row_value(row, "lotSize", "lot_size", "lot")
         actual_expiry = self._row_value(row, "expiry", "expiryDate", "expiry_date")
         actual_strike = self._row_value(row, "strike", "strikePrice", "strike_price")
-        actual_underlying = self._row_value(row, "instrumentName", "underlying", "underlyingSymbol")
+        actual_underlying = self._row_value(row, "underlying", "underlyingSymbol", "instrumentName")
         if any(value in (None, "") for value in
                (actual_symbol, token, exchange, instrument_type, actual_lot,
                 actual_expiry, actual_strike)):
@@ -679,8 +691,10 @@ class OptionsIntradayRuntime:
             raise OptionsIntradayPolicyError("MegaBull instrument exchange mismatch")
         if "OPT" not in str(instrument_type).upper() and "OPTION" not in str(instrument_type).upper():
             raise OptionsIntradayPolicyError("MegaBull instrument is not an option")
+        if not trading_symbol.upper().endswith(kind):
+            raise OptionsIntradayPolicyError("MegaBull instrument CE/PE mismatch")
         try:
-            if int(float(actual_lot)) != int(option.get("lot_size")):
+            if float(actual_lot) != int(option.get("lot_size")):
                 raise OptionsIntradayPolicyError("MegaBull instrument lot-size mismatch")
         except (TypeError, ValueError, OverflowError) as exc:
             raise OptionsIntradayPolicyError("MegaBull instrument lot-size is invalid") from exc
@@ -688,8 +702,11 @@ class OptionsIntradayRuntime:
             raise OptionsIntradayPolicyError("MegaBull instrument expiry mismatch")
         if abs(_finite_number(actual_strike, -1.0) - strike) > 1e-8:
             raise OptionsIntradayPolicyError("MegaBull instrument strike mismatch")
-        if actual_underlying not in (None, "") and str(actual_underlying).strip().upper() != underlying:
+        actual_root = str(actual_underlying or "").strip().upper()
+        if actual_root and actual_root != underlying and not actual_root.startswith(underlying + " "):
             raise OptionsIntradayPolicyError("MegaBull instrument underlying mismatch")
+        if not trading_symbol.upper().startswith(underlying) or not trading_symbol[len(underlying):len(underlying) + 1].isdigit():
+            raise OptionsIntradayPolicyError("MegaBull instrument underlying root mismatch")
         return trading_symbol, row
 
     def _adapter_payload(self, candidate: Dict[str, Any], option: Dict[str, Any],
@@ -725,35 +742,95 @@ class OptionsIntradayRuntime:
 
     def _capital(self) -> float:
         risk_cfg = self.cfg.get("risk_management", {}) or {}
-        return max(0.0, _finite_number(risk_cfg.get("capital"), 500000.0))
-
-    def _production_max_positions(self) -> int:
-        risk_cfg = self.cfg.get("risk_management", {}) or {}
-        try:
-            return max(0, int(risk_cfg.get("max_open_positions", 5) or 5))
-        except (TypeError, ValueError):
-            return 5
+        raw = self.mode_cfg.get("capital", risk_cfg.get("capital"))
+        capital = _finite(raw)
+        if capital is None or capital <= 0:
+            raise OptionsIntradayPolicyError(
+                "options_intraday requires finite positive risk capital")
+        return capital
 
     def _max_open_positions(self) -> int:
-        try:
-            configured = int(self.mode_cfg.get("max_open_positions",
-                                             self._production_max_positions()) or 0)
-        except (TypeError, ValueError):
-            configured = self._production_max_positions()
-        production = self._production_max_positions()
-        return max(0, min(configured, production))
+        value = self.mode_cfg.get("max_open_positions")
+        if isinstance(value, bool) or _finite(value) is None:
+            raise OptionsIntradayPolicyError(
+                "options_intraday max_open_positions is invalid")
+        return int(value)
 
     def _brokerage_per_order(self) -> float:
-        return max(0.0, _finite_number(
-            self._option_settings().get("brokerage_per_order"), 20.0))
+        value = _finite(self._option_settings().get("brokerage_per_order"))
+        if value is None or value < 0:
+            raise OptionsIntradayPolicyError(
+                "options_intraday brokerage_per_order is unavailable")
+        return value
+
+    def _round_trip_charges(self) -> float:
+        """Return the configured entry-plus-exit brokerage for one long leg."""
+        return round(self._brokerage_per_order() * 2.0, 2)
+
+    def _stop_loss_cash(self, ask: float, lots: int, lot_size: int) -> float:
+        """Cash loss at the initial 20% premium stop plus round-trip brokerage."""
+        if lots <= 0 or ask <= 0 or lot_size <= 0:
+            return 0.0
+        stop_fraction = _finite(self.mode_cfg.get("stop_premium_fraction"))
+        if stop_fraction is None:
+            raise OptionsIntradayPolicyError(
+                "options_intraday stop_premium_fraction is unavailable")
+        return round(ask * stop_fraction * lots * lot_size +
+                     self._round_trip_charges(), 2)
 
     def _full_debit(self, ask: float, lots: int, lot_size: int) -> float:
         """Worst-case long debit reservation including round-trip charges."""
         if lots <= 0 or ask <= 0 or lot_size <= 0:
             return 0.0
-        # A single long has one entry and one exit order.  STT on a zero-value
-        # worst-case exit is zero; brokerage remains reserved on both sides.
-        return round(ask * lots * lot_size + self._brokerage_per_order() * 2.0, 2)
+        return round(ask * lots * lot_size + self._round_trip_charges(), 2)
+
+    def _position_premium_exposure(self, position: Dict[str, Any]) -> float:
+        explicit = _finite(position.get("premium_exposure"))
+        if explicit is not None and explicit >= 0:
+            return explicit
+        ask = _finite(position.get("ask_premium"))
+        lots = _finite(position.get("lots"))
+        lot_size = _finite(position.get("lot_size"))
+        if ask is None or lots is None or lot_size is None:
+            raise OptionsIntradayPolicyError(
+                "options position has no complete ask-debit exposure")
+        return self._full_debit(ask, int(lots), int(lot_size))
+
+    def _reserved_premium_exposure(self) -> float:
+        total = 0.0
+        for position in (self._state.get("positions", {}) or {}).values():
+            if isinstance(position, dict):
+                total += self._position_premium_exposure(position)
+        for intent in (self._state.get("intents", {}) or {}).values():
+            if (isinstance(intent, dict) and
+                    intent.get("status") in {"pending", "uncertain"}):
+                exposure = _finite(intent.get("premium_exposure"))
+                if exposure is None or exposure < 0:
+                    raise OptionsIntradayPolicyError(
+                        "options intent has no complete premium exposure")
+                total += exposure
+        return round(total, 2)
+
+    def _active_position_count(self) -> int:
+        count = sum(1 for item in (self._state.get("positions", {}) or {}).values()
+                    if isinstance(item, dict))
+        count += sum(1 for item in (self._state.get("intents", {}) or {}).values()
+                     if isinstance(item, dict) and
+                     item.get("status") in {"pending", "uncertain"})
+        return count
+
+    def _underlying_has_active_entry(self, underlying: str) -> bool:
+        wanted = _normalize_symbol(underlying)
+        for position in (self._state.get("positions", {}) or {}).values():
+            if (isinstance(position, dict) and
+                    _normalize_symbol(position.get("option_underlying")) == wanted):
+                return True
+        for intent in (self._state.get("intents", {}) or {}).values():
+            if (isinstance(intent, dict) and
+                    intent.get("status") in {"pending", "uncertain"} and
+                    _normalize_symbol(intent.get("option_underlying")) == wanted):
+                return True
+        return False
 
     def _balance_available(self, broker: Any) -> float:
         sources: List[Any] = []
@@ -796,18 +873,34 @@ class OptionsIntradayRuntime:
                 total += max(0.0, _finite_number(intent.get("risk_amount"), 0.0))
         return total
 
-    def _unrealized_loss(self) -> float:
-        loss = 0.0
+    def _fresh_mark(self, position: Dict[str, Any]) -> Optional[float]:
+        """Return a bid only when this management cycle proved it fresh."""
+        if position.get("mark_unresolved") or position.get("mark_status") == "unresolved":
+            return None
+        marked_at = _finite_number(position.get("last_bid_at_ms"), -1.0)
+        cycle = _finite_number(self._state.get("mark_cycle_ms"), 0.0)
+        if marked_at < 0 or cycle <= 0 or marked_at < cycle:
+            return None
+        bid = _finite(position.get("last_bid"))
+        if bid is None or bid <= 0:
+            return None
+        return bid
+
+    def _unrealized_pnl(self) -> Optional[float]:
+        pnl = 0.0
         for position in (self._state.get("positions", {}) or {}).values():
             if not isinstance(position, dict):
                 continue
             entry = _finite_number(position.get("entry_premium"), 0.0)
-            bid = _finite_number(position.get("last_bid"), entry)
             lots = int(_finite_number(position.get("lots"), 0.0))
             lot_size = int(_finite_number(position.get("lot_size"), 0.0))
-            if entry > 0 and bid >= 0 and bid < entry and lots > 0 and lot_size > 0:
-                loss += (bid - entry) * lots * lot_size
-        return min(0.0, loss)
+            if entry <= 0 or lots <= 0 or lot_size <= 0:
+                continue
+            bid = self._fresh_mark(position)
+            if bid is None:
+                return None
+            pnl += (bid - entry) * lots * lot_size
+        return pnl
 
     def _group_for(self, underlying: str) -> Optional[set[str]]:
         wanted = str(underlying).strip().upper()
@@ -820,9 +913,16 @@ class OptionsIntradayRuntime:
     def _correlated_count(self, group: Optional[set[str]]) -> int:
         if not group:
             return 0
-        return sum(1 for position in (self._state.get("positions", {}) or {}).values()
-                   if isinstance(position, dict) and
-                   str(position.get("option_underlying", "")).upper() in group)
+        count = sum(1 for position in (self._state.get("positions", {}) or {}).values()
+                    if isinstance(position, dict) and
+                    str(position.get("option_underlying", "")).upper() in group)
+        count += sum(
+            1 for intent in (self._state.get("intents", {}) or {}).values()
+            if isinstance(intent, dict)
+            and intent.get("status") in {"pending", "uncertain"}
+            and str(intent.get("option_underlying", "")).upper() in group
+        )
+        return count
 
     def _candidate_key(self, option: Dict[str, Any], leg: Dict[str, Any]) -> str:
         return "|".join((
@@ -837,7 +937,7 @@ class OptionsIntradayRuntime:
         state = self._risk_state()
         if bool(getattr(state, "halt_active", False)):
             return 0, 0.0, "production risk halt is active"
-        if len(self._state.get("positions", {}) or {}) >= self._max_open_positions():
+        if self._active_position_count() >= self._max_open_positions():
             return 0, 0.0, "options max-open-position limit reached"
         daily_entries = int(_finite_number(self._state.get("daily_entries"), 0.0))
         max_entries = int(_finite_number(self.mode_cfg.get("max_daily_entries"), 5.0))
@@ -849,26 +949,28 @@ class OptionsIntradayRuntime:
             return 0, 0.0, "options consecutive-loss limit reached"
 
         capital = self._capital()
-        max_loss_pct = max(0.0, _finite_number(
-            self.mode_cfg.get("max_daily_loss_pct"), 1.0))
+        max_loss_pct = _finite(self.mode_cfg.get("max_daily_loss_pct"))
+        risk_pct = _finite(self.mode_cfg.get("risk_per_trade_pct"))
+        exposure_pct = _finite(self.mode_cfg.get("max_premium_exposure_pct"))
+        if max_loss_pct is None or risk_pct is None or exposure_pct is None:
+            return 0, 0.0, "options strict risk policy is unavailable"
+        unrealized_pnl = self._unrealized_pnl()
+        if unrealized_pnl is None:
+            return 0, 0.0, "options mark is unresolved; new entries are blocked"
+        realized_plus_unrealized = (
+            _finite_number(getattr(state, "daily_pnl", 0.0), 0.0) + unrealized_pnl)
         daily_limit = capital * max_loss_pct / 100.0
-        daily_remaining = daily_limit + _finite_number(getattr(state, "daily_pnl", 0.0), 0.0)
-        daily_remaining += self._unrealized_loss()
-        max_unrealized_pct = max(0.0, _finite_number(
-            self.mode_cfg.get("max_unrealized_loss_pct"), max_loss_pct))
-        if self._unrealized_loss() <= -(capital * max_unrealized_pct / 100.0):
-            return 0, 0.0, "options unrealized-loss limit reached"
-        if daily_remaining <= 0:
+        # Equality is a hard stop: no entry may consume any amount after the
+        # realized-plus-unrealized daily budget reaches -1.50% of capital.
+        if realized_plus_unrealized <= -daily_limit:
             return 0, 0.0, "options daily-loss budget exhausted"
-
-        portfolio_pct = max(0.0, _finite_number(
-            self.mode_cfg.get("max_portfolio_risk_pct"), max_loss_pct))
-        portfolio_remaining = capital * portfolio_pct / 100.0 - self._reserved_risk()
-        budget = min(daily_remaining, portfolio_remaining)
-        if budget <= 0:
-            return 0, 0.0, "global options risk budget exhausted"
+        daily_remaining = daily_limit + realized_plus_unrealized
 
         underlying = str(option.get("underlying", "")).upper()
+        if (not self.mode_cfg.get("allow_averaging_down") and
+                self._underlying_has_active_entry(underlying)):
+            return 0, 0.0, "options averaging down is disabled for this underlying"
+
         group = self._group_for(underlying)
         group_limit = int(_finite_number(
             self.mode_cfg.get("max_correlated_positions"), 1.0))
@@ -880,18 +982,35 @@ class OptionsIntradayRuntime:
         if ask <= 0 or lot_size <= 0:
             return 0, 0.0, "complete-lot debit is unavailable"
         available = self._balance_available(broker)
-        # Do not floor and then force one lot.  Brokerage is a fixed charge,
-        # so decrement until the complete debit really fits both budgets.
-        lots = int(min(available / max(ask * lot_size, 0.01),
-                       budget / max(ask * lot_size, 0.01)))
+        exposure_limit = capital * exposure_pct / 100.0
+        exposure_remaining = exposure_limit - self._reserved_premium_exposure()
+        if exposure_remaining <= 0:
+            return 0, 0.0, "options premium-exposure limit reached"
+        if exposure_remaining < self._full_debit(ask, 1, lot_size):
+            return 0, 0.0, "options premium-exposure limit reached"
+
+        # Bound by the cash-loss cap (premium loss at the initial stop plus
+        # brokerage), the remaining daily budget, available cash, and full
+        # ask-debit exposure.  Fixed brokerage is checked again below because
+        # it means simple division can overstate the affordable lot count.
+        risk_budget = min(capital * risk_pct / 100.0, daily_remaining)
+        risk_per_premium_lot = ask * _finite(self.mode_cfg["stop_premium_fraction"]) * lot_size
+        lots = int(min(
+            available / max(ask * lot_size, 0.01),
+            exposure_remaining / max(ask * lot_size, 0.01),
+            risk_budget / max(risk_per_premium_lot, 0.01),
+        ))
         max_lots = int(_finite_number(self.mode_cfg.get("max_lots"), 0.0))
         if max_lots > 0:
             lots = min(lots, max_lots)
-        while lots > 0 and self._full_debit(ask, lots, lot_size) > min(available, budget):
+        while lots > 0 and (
+                self._full_debit(ask, lots, lot_size) >
+                min(available, exposure_remaining) or
+                self._stop_loss_cash(ask, lots, lot_size) > risk_budget):
             lots -= 1
         if lots <= 0:
-            return 0, 0.0, "complete lot is not affordable within global debit budget"
-        return lots, self._full_debit(ask, lots, lot_size), ""
+            return 0, 0.0, "complete lot is not affordable within strict risk limits"
+        return lots, self._stop_loss_cash(ask, lots, lot_size), ""
 
     # ------------------------------------------------------------------
     # Entry lifecycle
@@ -907,7 +1026,8 @@ class OptionsIntradayRuntime:
                 pass
 
     def _intent(self, key: str, candidate: Dict[str, Any], payload: Dict[str, Any],
-                lots: int, risk_amount: float) -> Dict[str, Any]:
+                lots: int, risk_amount: float,
+                premium_exposure: float) -> Dict[str, Any]:
         option = payload
         leg = (option.get("legs") or [{}])[0]
         return {
@@ -924,6 +1044,8 @@ class OptionsIntradayRuntime:
             "lots": lots,
             "lot_size": int(option.get("lot_size", 0) or 0),
             "risk_amount": risk_amount,
+            "ask_premium": _finite_number(leg.get("ask"), 0.0),
+            "premium_exposure": premium_exposure,
             "signal_timestamp": candidate.get("signal_timestamp"),
             "order_id": "",
         }
@@ -938,8 +1060,143 @@ class OptionsIntradayRuntime:
                 return order
         return order
 
+    def _current_option_rows(self, broker: Any) -> List[Dict[str, Any]]:
+        for source in (getattr(broker, "mega", None), broker,
+                       getattr(self.trader, "broker", None)):
+            listing = getattr(source, "option_instruments", None)
+            if callable(listing):
+                return list(listing())
+        raise OptionsIntradayPolicyError("current broker option listings are unavailable")
+
+    def _read_only_scan(self, cfg: Dict[str, Any], clock: Callable[[], datetime],
+                        instrument_rows: Any) -> Dict[str, Any]:
+        """Only discovery runs in the worker; all orders/management stay serial.
+
+        Slow batch/chain requests must not pause the 60-second exit cadence.
+        An abandoned read-only request cannot submit orders in the background.
+        """
+        from src.options_live_scan import build_live_options_scan
+        previous = getattr(self, "_scan_future", None)
+        if previous is not None and not previous.done():
+            raise OptionsIntradayPolicyError("previous read-only scan is still running")
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="option-discovery")
+        future = executor.submit(
+            build_live_options_scan, cfg, now=clock(), instrument_rows=instrument_rows,
+            market_data=self.mode_cfg.get("market_data_provider"),
+            chain_provider=self._chain_provider)
+        self._scan_future = future
+        cadence = max(1.0, _finite_number(
+            getattr(self, "management_interval_seconds", 60.0), 60.0))
+        try:
+            while True:
+                try:
+                    return future.result(timeout=cadence)
+                except ScanTimeout:
+                    if future.done():
+                        # A provider-raised TimeoutError is a scan failure,
+                        # not a reason to poll the completed future forever.
+                        return future.result()
+                    self.tick(now=clock())
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def scan_and_execute(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """Scan the configured broad universe, then freshly confirm each entry.
+
+        No saved plan is read or written. Planner dictionaries are ephemeral
+        signal/quote envelopes only. A second, single-underlying scan must
+        still produce the same contract, direction and strategy before entry.
+        """
+        from src.options_live_scan import _metadata, _symbol_cfg, _universe
+        initial, started = _now_ist(now), time.monotonic()
+
+        def clock():
+            return initial + timedelta(seconds=time.monotonic() - started)
+
+        self._roll_daily_state(initial.date().isoformat())
+        broker = self._require_broker()
+        self._reconcile(broker)
+        if not self._clock().can_enter(initial):
+            return []
+        rows: List[Dict[str, Any]] = []
+
+        def listings():
+            rows[:] = self._current_option_rows(broker)
+            return rows
+
+        found = self._read_only_scan(self.cfg, clock, listings)
+        self.last_scan_diagnostics = deepcopy(found["diagnostics"])
+        self.last_scan_diagnostics.update(submitted=0, entry_rejections=[])
+        logger.info("Options scan: %s", {key: self.last_scan_diagnostics.get(key, 0)
+                    for key in ("requested", "data_ok", "no_signal", "not_listed",
+                                "contract_rejection", "fetch_errors", "selected")})
+        self._record_event("options_scan", self.last_scan_diagnostics)
+        universe = _universe(self.cfg)
+        instruments = {item["symbol"]: item for item in universe}
+        contracts = _metadata(rows, universe, clock(), {})
+        pool = [(candidate, snapshot) for snapshot in found["snapshots"]
+                for candidate in snapshot.get("option_candidates", [])]
+        pool.sort(key=lambda item: item[0].get("rank", math.inf))
+        refreshed: Dict[str, Any] = {}
+        placed: List[Dict[str, Any]] = []
+        for original, snapshot in pool:
+            current = clock()
+            if not self._clock().can_enter(current):
+                break
+            symbol = str(original.get("option_underlying", "")).upper()
+            if symbol not in instruments:
+                raise OptionsIntradayPolicyError("scanner returned an unconfigured underlying")
+            option = original.get("option_legs") or {}
+            leg = (option.get("legs") or [{}])[0]
+            key = self._candidate_key(option, leg)
+            intent = (self._state.get("intents") or {}).get(key)
+            if intent and intent.get("status") != "rejected":
+                if intent.get("status") in {"pending", "uncertain"}:
+                    raise OptionsIntradayUnresolved((key,), "entry intent already unresolved")
+                continue
+            if symbol not in refreshed:
+                # Manage after the broad pass and between per-symbol refreshes.
+                self.tick(now=current)
+                scoped = deepcopy(self.cfg)
+                scoped["options_intraday"]["scan_underlyings"] = [symbol]
+                refreshed[symbol] = self._read_only_scan(scoped, clock, rows)
+            fresh_candidates = [(candidate, fresh) for fresh in refreshed[symbol]["snapshots"]
+                                for candidate in fresh.get("option_candidates", [])]
+            matched = next(((candidate, fresh) for candidate, fresh in fresh_candidates
+                            if self._candidate_key(candidate["option_legs"],
+                                                   candidate["option_legs"]["legs"][0]) == key
+                            and candidate.get("strategy") == original.get("strategy")
+                            and candidate.get("action") == original.get("action")), None)
+            if matched is None:
+                self.last_scan_diagnostics["entry_rejections"].append(
+                    {"underlying": symbol, "reason": "setup_or_contract_no_longer_valid"})
+                continue
+            candidate, fresh = matched
+            exact = candidate["option_legs"]
+            selected_leg = exact["legs"][0]
+            identity = (symbol, _date_for_expiry(exact["expiry"]),
+                        float(selected_leg["strike"]), selected_leg["kind"])
+            metadata = contracts.get(identity)
+            if metadata is None:
+                raise OptionsIntradayPolicyError("entry has no exact current broker listing")
+            validation_cfg = _symbol_cfg(self.cfg, instruments[symbol], contracts, clock())
+            validation_cfg["options_intraday"].update(
+                lot_size=metadata["lot_size"],
+                # Exact current listing, not an inherited NIFTY strike grid.
+                exact_contract=metadata)
+            envelope = dict(fresh, option_candidates=[candidate])
+            try:
+                placed.extend(self.execute_plan(envelope, broker, now=clock(),
+                                                _validation_cfg=validation_cfg))
+            except OptionsIntradayPolicyError as exc:
+                self.last_scan_diagnostics["entry_rejections"].append(
+                    {"underlying": symbol, "reason": str(exc)})
+        self.last_scan_diagnostics["submitted"] = len(placed)
+        return placed
+
     def execute_plan(self, plan: Optional[Dict[str, Any]], opt_broker: Any = None,
-                     now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+                     now: Optional[datetime] = None,
+                     _validation_cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Submit only valid long option candidates from today's plan.
 
         ``action`` on a plan is the signal (BUY or SELL); the routed order is
@@ -963,7 +1220,8 @@ class OptionsIntradayRuntime:
                 raise OptionsIntradayPolicyError("options candidate asset is not options")
             if not self._candidate_age_ok(candidate, current):
                 raise OptionsIntradayPolicyError("options signal is missing, future-dated, or stale")
-            valid, reason = validate_option_candidate(candidate, plan, self.cfg, current)
+            valid, reason = validate_option_candidate(
+                candidate, plan, _validation_cfg or self.cfg, current)
             if not valid:
                 raise OptionsIntradayPolicyError(f"invalid option candidate: {reason}")
             option = deepcopy(candidate.get("option_legs") or {})
@@ -987,7 +1245,11 @@ class OptionsIntradayRuntime:
                 self._record_event("skip", {"asset": "options", "reason": risk_reason,
                                              "execution_class": self.execution_class})
                 continue
-            intent = self._intent(key, candidate, payload, lots, risk_amount)
+            ask_premium = _finite_number(leg.get("ask"), 0.0)
+            premium_exposure = self._full_debit(
+                ask_premium, lots, int(option.get("lot_size", 0) or 0))
+            intent = self._intent(key, candidate, payload, lots, risk_amount,
+                                  premium_exposure)
             self._state.setdefault("intents", {})[key] = intent
             self._persist()  # intent precedes the remote request
             try:
@@ -1028,6 +1290,8 @@ class OptionsIntradayRuntime:
                 self.mode_cfg.get("stop_premium_fraction"), 0.20))
             target_fraction = max(0.0, _finite_number(
                 self.mode_cfg.get("target_premium_fraction"), 0.30))
+            profit_step_fraction = max(0.0, _finite_number(
+                self.mode_cfg.get("profit_lock_step_fraction"), 0.10))
             position = {
                 "position_id": position_id,
                 "status": "open",
@@ -1046,9 +1310,16 @@ class OptionsIntradayRuntime:
                 "lots": lots,
                 "lot_size": int(option.get("lot_size", 0) or 0),
                 "entry_premium": filled_premium,
+                "ask_premium": ask_premium,
+                "premium_exposure": premium_exposure,
                 "last_bid": _finite_number(leg.get("bid"), 0.0),
                 "stop_premium": round(filled_premium * (1.0 - stop_fraction), 2),
                 "target_premium": round(filled_premium * (1.0 + target_fraction), 2),
+                "initial_stop_premium": round(filled_premium * (1.0 - stop_fraction), 2),
+                "final_target_premium": round(filled_premium * (1.0 + target_fraction), 2),
+                "profit_lock_step_fraction": profit_step_fraction,
+                "profit_lock_stage": 0,
+                "exit_policy": "staged_bid_ladder",
                 "risk_amount": risk_amount,
                 "entry_order_id": order_id,
                 "opened_at": _iso(datetime.now(timezone.utc)),
@@ -1108,12 +1379,13 @@ class OptionsIntradayRuntime:
             except TypeError:
                 return provider()
 
-    def _fresh_chain(self, broker: Any, now: datetime) -> Optional[Dict[str, Any]]:
-        underlying = "NIFTY"
-        open_positions = self._state.get("positions", {}) or {}
-        if open_positions:
-            underlying = str(next(iter(open_positions.values())).get(
-                "option_underlying", underlying))
+    def _fresh_chain(self, broker: Any, now: datetime,
+                     underlying: str = "NIFTY") -> Optional[Dict[str, Any]]:
+        def admissible(chain):
+            return (isinstance(chain, dict) and
+                    str(chain.get("symbol", "")).upper() == underlying.upper() and
+                    str(chain.get("exchange", "NSE")).upper() == "NSE" and
+                    self._chain_timestamp_fresh(chain, now))
         providers: List[Callable[..., Any]] = []
         if callable(self._chain_provider):
             providers.append(self._chain_provider)
@@ -1130,35 +1402,41 @@ class OptionsIntradayRuntime:
                 chain = self._chain_from_provider(provider, underlying)
             except Exception:
                 continue
-            if isinstance(chain, dict) and self._chain_timestamp_fresh(chain, now):
+            if admissible(chain):
                 return chain
 
         # The generator's private snapshot can serve an immediate management
         # tick while it is still exchange-fresh.  It is not an LTP/BS fallback.
         snapshot = (self._last_plan or {}).get("option_chain")
-        if isinstance(snapshot, dict) and self._chain_timestamp_fresh(snapshot, now):
+        if self.trading_mode == _COMBINED and admissible(snapshot):
             return snapshot
         try:
             from src.options_chain import fetch_chain
             chain = fetch_chain(underlying, use_cache=False,
                                 diagnostic_label="options_intraday_runtime")
-            if isinstance(chain, dict) and self._chain_timestamp_fresh(chain, now):
+            if admissible(chain):
                 return chain
         except Exception:
             pass
         return None
 
     def _chain_timestamp_fresh(self, chain: Dict[str, Any], now: datetime) -> bool:
+        retrieval = {**((chain.get("diagnostics") or {}).get("retrieval") or {}),
+                     **(chain.get("retrieval") or {})}
+        if retrieval.get("served_from_cache") or retrieval.get("success") is False:
+            return False
         timestamp = parse_exchange_timestamp(chain.get("quote_timestamp"))
         if timestamp is None:
             return False
         age = now.astimezone(timezone.utc) - timestamp
         ttl = _finite_number(self.mode_cfg.get("chain_max_age_minutes"), 15.0)
-        return timedelta(seconds=-60) <= age <= timedelta(minutes=ttl)
+        return timedelta(0) <= age <= timedelta(minutes=ttl)
 
     def _chain_quote(self, chain: Dict[str, Any], position: Dict[str, Any],
                      now: datetime) -> Optional[float]:
         if not self._chain_timestamp_fresh(chain, now):
+            return None
+        if str(chain.get("symbol", "")).upper() != str(position.get("option_underlying", "")).upper():
             return None
         expiry = str(position.get("expiry", ""))
         strike = _finite_number(position.get("strike"), -1.0)
@@ -1176,6 +1454,23 @@ class OptionsIntradayRuntime:
         if not isinstance(row, dict) or not isinstance(row.get(kind), dict):
             return None
         quote = row[kind]
+        for item in (row, quote):
+            if str(item.get("exchange", "NSE")).upper() != "NSE":
+                return None
+            if (item.get("underlying_symbol") and
+                    str(item["underlying_symbol"]).upper() != str(position["option_underlying"]).upper()):
+                return None
+            if item.get("expiry") and not _same_expiry(item["expiry"], expiry):
+                return None
+        if quote.get("option_type") and quote["option_type"] != kind:
+            return None
+        if quote.get("strike") is not None and _finite(quote["strike"]) != strike:
+            return None
+        selected_time = (quote.get("quote_timestamp") or quote.get("row_timestamp") or
+                         row.get("quote_timestamp") or row.get("row_timestamp"))
+        if selected_time and not self._chain_timestamp_fresh(
+                {"quote_timestamp": selected_time}, now):
+            return None
         bid = _finite(quote.get("bidPrice", quote.get("bid",
                                   quote.get("buyPrice1"))))
         if bid is None or bid <= 0:
@@ -1220,6 +1515,69 @@ class OptionsIntradayRuntime:
             return "underlying-stop"
         if (bullish and spot >= high) or (not bullish and spot <= low):
             return "underlying-target"
+        return None
+
+    def _update_profit_ladder(self, position: Dict[str, Any], bid: float) -> Optional[str]:
+        """Advance the long-option bid ladder or return an exit reason.
+
+        This is a full-position ratchet: +10% and +20% only move the stop;
+        they do not create partial exits.  The executable bid is the only
+        trigger, and a jump over a rung advances directly to the highest rung
+        reached.
+        """
+        entry = _finite_number(position.get("entry_premium"), 0.0)
+        if entry <= 0 or bid <= 0:
+            return None
+        step = max(0.0, _finite_number(
+            position.get("profit_lock_step_fraction"),
+            _finite_number(self.mode_cfg.get("profit_lock_step_fraction"), 0.10),
+        ))
+        final_target = max(0.0, _finite_number(
+            position.get("final_target_premium"),
+            entry * (1.0 + _finite_number(
+                self.mode_cfg.get("target_premium_fraction"), 0.30)),
+        ))
+        if step <= 0 or final_target <= entry:
+            return None
+
+        initial_stop = _finite_number(
+            position.get("initial_stop_premium"),
+            entry * (1.0 - _finite_number(
+                self.mode_cfg.get("stop_premium_fraction"), 0.20)),
+        )
+        stage = max(0, int(_finite_number(position.get("profit_lock_stage"), 0.0)))
+        stop_level = _finite_number(position.get("stop_premium"), initial_stop)
+        if bid < stop_level or math.isclose(
+            bid, stop_level, rel_tol=0.0, abs_tol=1e-9
+        ):
+            position["last_bid"] = bid
+            return "stop-loss"
+        if bid > final_target or math.isclose(
+            bid, final_target, rel_tol=0.0, abs_tol=1e-9
+        ):
+            position["profit_lock_stage"] = max(stage, int(round(
+                (final_target / entry - 1.0) / step)))
+            position["last_bid"] = bid
+            return "target"
+
+        reached_stage = stage
+        while bid > entry * (1.0 + step * (reached_stage + 1)) or math.isclose(
+            bid,
+            entry * (1.0 + step * (reached_stage + 1)),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            reached_stage += 1
+        if reached_stage > stage:
+            position["profit_lock_stage"] = reached_stage
+            locked_stop = entry * (1.0 + step * reached_stage)
+            next_target = min(
+                final_target,
+                entry * (1.0 + step * (reached_stage + 1)),
+            )
+            position["stop_premium"] = round(locked_stop, 2)
+            position["target_premium"] = round(next_target, 2)
+        position["last_bid"] = bid
         return None
 
     # ------------------------------------------------------------------
@@ -1343,30 +1701,61 @@ class OptionsIntradayRuntime:
         broker = self._require_broker()
         self._reconcile(broker)
         positions = deepcopy(self._state.get("positions", {}) or {})
+        self._state["mark_cycle_ms"] = int(current.timestamp() * 1000)
         if not positions:
+            self._persist()
             return []
         clock = self._clock()
         hard_flat = force_flat or (clock.valid and clock.is_hard_flat(current))
-        chain = self._fresh_chain(broker, current)
+        chains: Dict[str, Any] = {}
         unresolved: List[str] = []
         closed: List[Dict[str, Any]] = []
+        state_changed = False
         for position_id, position in positions.items():
             if not isinstance(position, dict):
                 unresolved.append(str(position_id))
                 continue
+            underlying = str(position.get("option_underlying", "")).upper()
+            if underlying not in chains:
+                chains[underlying] = self._fresh_chain(broker, current, underlying)
+            chain = chains[underlying]
             bid = self._chain_quote(chain, position, current) if chain else None
             reason = ""
             if hard_flat:
                 reason = "eod-squareoff"
             elif bid is not None:
                 position["last_bid"] = bid
+                position["last_bid_at_ms"] = self._state["mark_cycle_ms"]
+                position["mark_status"] = "fresh"
+                position["mark_unresolved"] = False
                 bar_reason = self._completed_bar_trigger(position, current, chain)
-                # Premium stop is deliberately evaluated before target.
-                if bar_reason == "underlying-stop" or bid <= _finite_number(position.get("stop_premium"), -1.0):
+                if bar_reason == "underlying-stop":
                     reason = "stop-loss"
-                elif bar_reason == "underlying-target" or bid >= _finite_number(position.get("target_premium"), math.inf):
+                elif bar_reason == "underlying-target":
                     reason = "target"
+                else:
+                    reason = self._update_profit_ladder(position, bid) or ""
+                if not reason:
+                    # Persist ratchet state even when this tick does not close.
+                    self._state.setdefault("positions", {}).setdefault(
+                        position_id, {}
+                    ).update({
+                        key: position[key]
+                        for key in (
+                            "last_bid", "last_bid_at_ms", "mark_status",
+                            "mark_unresolved", "stop_premium", "target_premium",
+                            "profit_lock_stage", "exit_policy",
+                        )
+                        if key in position
+                    })
+                    state_changed = True
             if not reason:
+                if bid is None and not hard_flat:
+                    stored = self._state.setdefault("positions", {}).setdefault(position_id, {})
+                    stored["mark_status"] = "unresolved"
+                    stored["mark_unresolved"] = True
+                    stored.pop("last_bid_at_ms", None)
+                    state_changed = True
                 continue
             if bid is None or bid <= 0:
                 if hard_flat:
@@ -1377,7 +1766,7 @@ class OptionsIntradayRuntime:
                 closed.append(self._close_one(broker, str(position_id), position, bid, reason))
             except OptionsIntradayUnresolved as exc:
                 unresolved.extend(exc.identifiers or (str(position_id),))
-        if closed:
+        if closed or state_changed:
             self._persist()
         if unresolved:
             raise OptionsIntradayUnresolved(sorted(set(unresolved)),

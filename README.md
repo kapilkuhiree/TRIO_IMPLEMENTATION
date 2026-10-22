@@ -27,24 +27,35 @@ A screenshot-driven trading assistant that:
 
 ## Project Root
 
-```
-C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION   (this checkout — the production repo)
-  docs: C:\Users\Kapil Kuhire\Downloads\Claud_TRIO_v2  (research fork — do not merge wholesale)
-```
+Run commands from this repository's root. Research results are not executable
+session instructions; do not merge a separate research fork wholesale.
 
 ## Setup
 
+The server/paper-session build pins **Python 3.11.17** in `.python-version` and
+82 exact, hashed dependencies in `requirements-server.lock` (Linux amd64).
+The broader `requirements.txt` remains an optional desktop/research stack.
+
 ```bash
-cd "C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION"
+# Recommended on Linux or Windows with Docker; installs system packages too.
+docker build --platform linux/amd64 -t trio .
+docker run --rm --network none trio                 # CLI help only; no orders
+docker run --rm --network none --entrypoint make trio test
 
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
-
-pip install -r requirements.txt
-copy .env.example .env       # then edit .env with your keys
-# edit config/config.yaml and config/market.yaml
+# Native Linux alternative, with Python 3.11.17 and build prerequisites present:
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --require-hashes -r requirements-server.lock
+cp .env.example .env                                # private; never commit
+make test                                          # offline after installation
 ```
+
+Without `make`, including on Windows, the same test entry point is
+`python scripts/test_offline.py`. It blocks external requests before collection,
+disables local dotenv credentials, forces test ledgers, and isolates default
+plan/chain diagnostic files. Scoped pytest paths may follow the command.
+Docker/CPython 3.11 execution still needs verification on a machine providing
+those tools; the local integration suite was run on Python 3.14.7.
 
 ## CLI Commands
 
@@ -70,7 +81,7 @@ python scripts/session.py   --date 2026-10-10 --allow-stale-plan   # stale guard
 python scripts/digest.py    --date 2026-10-10 --no-alert
 
 # Tests & compile
-python -m pytest -q --basetemp C:\Users\KAPILK~1\AppData\Local\Temp\trio-pytest
+python scripts/test_offline.py
 python -m pytest tests/test_guard.py tests/test_session_hours.py tests/test_eod_squareoff.py tests/test_risk_manager.py tests/test_paper_broker.py tests/test_megabull.py tests/test_options.py tests/test_backtester.py tests/test_trade_log.py -q
 python -m compileall -q src scripts main.py
 ```
@@ -87,12 +98,197 @@ python -m compileall -q src scripts main.py
 ## Paper vs Remote Paper vs Options
 
 * **Equity:** local `PaperBroker` or `MegaBullBroker` (refresh_positions, PENDING≠FILLED, idempotent).
-* **Options:** NIFTY index only, weekly tactical expiry, defined-risk debit spreads.
+* **Legacy options path (production/combined):** NIFTY index, weekly tactical
+  expiry, defined-risk debit spreads.
   Paper fills via `OptionsPaperBroker` (chain-mid / LTP / BS sim + bidask side);
   remote legs via `MegaBullOptionsBroker` (remote spread id per session,
   max 4/session). Backtest and paper broker share `round_trip_cost`.
 
+## Fresh options-only scanning
+
+Explicit `options_intraday` sessions do **not** load, save, mark executed, or
+fall back to a premarket/previous-day plan. The first entry-eligible tick scans
+fresh 5m underlying candles; scans repeat every 300 seconds. Exits/reconciliation
+run every 60 seconds, including while read-only discovery is slow or fails.
+All order submission and management remain serialized on the session thread.
+
+`config/options_intraday.yaml` controls discovery without changing production
+`config/config.yaml`:
+
+```yaml
+options_intraday:
+  scan_basket: nifty50        # nifty100 also supported
+  scan_interval_seconds: 300
+  # Optional explicit replacement, instead of the basket/index union:
+  # scan_underlyings: [NIFTY, BANKNIFTY, RELIANCE, TCS]
+  stop_premium_fraction: 0.20
+  profit_lock_step_fraction: 0.10
+  target_premium_fraction: 0.30
+  risk_per_trade_pct: 0.50
+  max_daily_loss_pct: 1.50
+  max_open_positions: 2
+  max_premium_exposure_pct: 5.00
+  allow_averaging_down: false
+  PAPER_TRADING: true
+```
+
+- The repository overlay currently resolves **NIFTY50 stocks + 4 configured
+  indices = 54 unique underlyings**. Set `scan_basket: nifty100` to widen it;
+  this is a requested basket count, not a count of eligible contracts.
+- Only current, unambiguous NSE option listings proceed. Non-F&O stocks,
+  missing/expired contracts, stale/incomplete/gapped bars and provider failures
+  are rejected with diagnostic counts. A stock signal is never mapped to NIFTY.
+- ORB/pullback/momentum and configured demand/supply confirmation remain in use.
+  Chain requests bypass caches and occur only for listed underlyings with a
+  completed-bar signal. Candidates are ranked globally, without an equity top-3 cap.
+- Each entry gets a fresh same-underlying signal/chain confirmation and exact
+  broker expiry/strike/type/symbol/lot validation. Bullish signals submit **BUY CE**;
+  bearish signals submit **BUY PE**, never equity, futures or short-option orders.
+- Tomorrow's approved remote-paper limits are strict: 0.50% cash risk per trade
+  at the initial premium stop, 1.50% realized-plus-unrealized daily loss, 2
+  open positions, 5.00% aggregate full-premium exposure, no averaging down,
+  and no new entries after the daily-loss boundary. `PAPER_TRADING=true` and
+  `remote_paper` are mandatory. Five daily entries, configured correlation
+  limits, 14:30 entry cutoff and 15:10 hard-flat (IST) remain active. Wider
+  discovery does not guarantee or force any entries.
+- Option-premium exits use the staged bid ladder: initial stop at **−20%**;
+  an executable bid at **+10%** moves the stop to +10% and the next target to
+  +20%; +20% moves the stop to +20% and the next target to +30%; +30% closes
+  the full remaining position. A price jump skips directly to the highest
+  reached rung. The +10% and +20% levels do not partially close the position.
+  Missing/stale bids do not trigger a level, and exits use the fresh executable
+  bid rather than option candle high/low.
+- Management fetches each owned underlying's own fresh bid. There is no saved
+  discovery-snapshot fallback in options-only mode. Private/persistent intents
+  prevent duplicate or uncertain submissions across scans/restarts.
+
+Read-only discovery (network/data credentials needed, **no orders**):
+
+```bash
+python -c "from src.utils import load_env, load_config; from src.options_live_scan import build_live_options_scan; load_env(); d=build_live_options_scan(load_config())['diagnostics']; print({k:d[k] for k in ('requested','data_ok','no_signal','not_listed','contract_rejection','fetch_errors','selected')})"
+```
+
+Only after verifying remote-paper credentials and reconciling existing holdings,
+start a paper session. This command **can place remote-paper option orders**:
+
+```bash
+docker run --rm --env-file .env \
+  -e TRIO_TRADING_MODE=options_intraday -e TRIO_BROKER_PROVIDER=megabull \
+  -e PAPER_TRADING=true \
+  -e TRIO_REMOTE_REQUIRED=1 -e TRIO_ALLOW_LOCAL_OPTION_SHADOW=0 \
+  -e TRIO_DEMAND_SUPPLY=1 \
+  --mount type=volume,src=trio-options-state,dst=/app/runtime \
+  --entrypoint python trio scripts/session.py \
+  --trading-mode options_intraday --interval 60 --max-seconds 21300
+```
+
+Add `--no-plan` for **management only** (the name is legacy; the new mode never
+reads a plan). A historical/future `--date` is also management-only; stale-plan
+flags cannot enable stale options. The scheduled workflow already selects this
+mode; premarket previews are optional research artifacts, not prerequisites.
+No live canary or genuine-premium profitability validation is claimed.
+
+## Zerodha research capture and genuine premium backtest
+
+The research path is read-only and separate from the remote-paper order path.
+It records exact NFO CE/PE contracts, real option candles, provider quote
+timestamps, local observation times and depth. It never imports an order
+adapter and every report includes `orders_placed: 0`.
+
+If the credentials are in a different local checkout, pass that `.env` path;
+the value is loaded locally and never printed:
+
+```powershell
+python scripts/zerodha_live_capture.py `
+  --env-file "C:\Users\YOUR_USERNAME\Downloads\TRIO_IMPLEMENTATION\.env" `
+  --underlyings NIFTY BANKNIFTY `
+  --period 1d `
+  --max-contracts 20 `
+  --quote-batch-size 5 `
+  --rate-limit-seconds 1 `
+  --cycles 72 `
+  --interval-seconds 300
+```
+
+Run this during NSE hours if you want approximately one quote snapshot per
+5-minute bar. Use `--once` for a bounded smoke capture. It is intentionally a
+sample unless the contract selection is expanded; `--max-contracts` is reported
+as partial coverage. Do not run it with `--network none`; it requires the
+read-only Zerodha API.
+
+Capture current-day completed strategy signals separately:
+
+```powershell
+python scripts/zerodha_signal_capture.py `
+  --env-file "C:\Users\YOUR_USERNAME\Downloads\TRIO_IMPLEMENTATION\.env" `
+  --underlyings NIFTY BANKNIFTY `
+  --strategies orb pullback momentum `
+  --period 5d `
+  --max-provider-clock-skew-seconds 120 `
+  --require-demand-supply `
+  --output reports\zerodha-signals.json `
+  --dry-run
+```
+
+The new `trend_pullback_breakout_research` strategy is available only when
+explicitly selected through this read-only capture command; it is not part of
+the production `options_intraday` strategy list and never places orders:
+
+```powershell
+python scripts/zerodha_signal_capture.py `
+  --env-file "C:\Users\YOUR_USERNAME\Downloads\TRIO_IMPLEMENTATION\.env" `
+  --underlyings NIFTY BANKNIFTY `
+  --strategies trend_pullback_breakout_research `
+  --period 30d `
+  --max-provider-clock-skew-seconds 120 `
+  --require-demand-supply `
+  --output reports\zerodha-signals-research.json `
+  --dry-run
+```
+
+It is a causal EMA20/EMA50 trend, EMA20 pullback and completed-candle
+breakout candidate definition. Bullish candidates map to `BUY CE`; bearish
+candidates map to `BUY PE`. It selects no option contract and estimates no
+premium. It is a research candidate, not a profitability claim or a live
+strategy; the 20-session out-of-sample gate must pass before any promotion.
+
+Older signals are rejected rather than paired with current quotes. A
+`READY` signal artifact still needs matching archived option candles and
+historical bid/ask rows before P&L is calculated.
+
+When those inputs exist, run the genuine premium backtest with interval-aware
+provider timestamps:
+
+```powershell
+python scripts/options_premium_backtest.py `
+  --db "C:\Users\YOUR_USERNAME\AppData\Local\TRIO\options\options_archive.sqlite3" `
+  --signals reports\zerodha-signals.json `
+  --underlyings NIFTY BANKNIFTY `
+  --start 2026-10-01 `
+  --end 2026-10-31 `
+  --quote-policy interval_aligned
+```
+
+`interval_aligned` uses the actual provider quote timestamp only when it falls
+inside the option candle's interval and the quote was observed before that
+candle completed. Exact/ambiguous/missing quotes are rejected; no current
+quote, midpoint, Black-Scholes value or underlying substitute is used. The
+backtest remains `NOT_READY_FOR_OPTIONS_PNL` until real aligned data and exact
+signal identities are present.
+
+The signal-capture clock-skew tolerance is research-only and bounded at 120
+seconds for the observed Zerodha timestamp offset. It does not relax the
+historical backtest timestamp rules or live order validation. Demand/supply is
+fail-closed when requested: a missing fresh causal zone rejects the signal.
+
+Walk-forward comparison is chronological: candidate selection uses validation
+data, with training as a tie-breaker; the test period is never used for tuning.
+No parameter is promoted because it merely produces a high in-sample score.
+
 ## Plan & Session
+
+The following describes the unchanged production/combined path, **not** the
+plan-free options-only session above.
 
 * Premarket writes the next valid NSE session plan to
   `output/plans/YYYY-MM-DD.json` (scan stats `requested/failed/scanned`).

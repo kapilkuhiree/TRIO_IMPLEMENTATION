@@ -95,7 +95,7 @@ def test_premarket_plan_has_requested_and_failed():
                return_value={
                    "A.NS": type("MD", (), {"latest_price": 100.0, "ohlcv": _ohlcv()})(),
                }), \
-         patch("src.screener.screen", return_value=[]), \
+         patch("scripts.premarket.screen", return_value=[]), \
          patch("scripts.premarket.load_config", return_value={
              "screener": {"min_rank": 40.0, "min_confidence": 60,
                           "max_positions_to_open": 3},
@@ -138,7 +138,9 @@ def test_premarket_keeps_equity_cap_but_builds_wider_option_pool():
          patch("src.options_chain.fetch_chain", return_value={"ok": True}), \
          patch("src.options_chain.nearest_expiry", return_value="30-Oct-2026"), \
          patch("src.options_selector.select", return_value=option_pick):
-        plan = build_plan("nifty100", "1d", 1)
+        # Exercise pool sizing, not external quote/history providers.
+        with patch("src.data_fetcher.fetch_market_data", return_value=SimpleNamespace(ohlcv=_ohlcv())):
+            plan = build_plan("nifty100", "1d", 1)
 
     assert len(plan["candidates"]) == 1
     assert len(plan["option_candidates"]) == 3

@@ -146,8 +146,10 @@ def _fetch_yfinance(
     # Drop rows where all OHLC are NaN
     df.dropna(subset=["Open", "High", "Low", "Close"], how="all", inplace=True)
 
-    # Forward-fill minor gaps (e.g., 1–2 missing candles)
-    df.ffill(inplace=True)
+    # Intraday gaps must remain visible to completed-bar validation. Filling
+    # them would manufacture prices/volume and can create a false signal.
+    if timeframe not in INTRADAY_INTERVALS:
+        df.ffill(inplace=True)
 
     logger.info("Fetched %d candles for %s", len(df), symbol)
     return df
@@ -217,6 +219,7 @@ def fetch_market_data(
 def fetch_multiple(
     symbols: Optional[List[str]] = None,
     timeframe: Optional[str] = None,
+    period: Optional[str] = None,
 ) -> Dict[str, MarketData]:
     """
     Fetch market data for multiple symbols.
@@ -226,7 +229,9 @@ def fetch_multiple(
     HTTP round-trip replaces N per-symbol fetches. The per-batch frame
     is sliced per-ticker and normalized, so callers and error handling
     stay identical. Falls back to a per-symbol loop when batch fetch
-    is unavailable or the downloaded frame is empty.
+    is unavailable or the downloaded frame is empty. An explicit ``period``
+    applies to both batch and per-symbol requests; existing defaults are
+    retained when it is omitted.
 
     Rate limits: ~1000 tickers is fine, but a 100-name nightly scan
     still bursts once. A 59d/2y lookback on sub-daily bars is bounded
@@ -239,12 +244,19 @@ def fetch_multiple(
     if not symbols:
         return {}
 
+    requested_period = period
+
+    def _fetch_one(sym: str) -> MarketData:
+        if requested_period is not None:
+            return fetch_market_data(sym, timeframe, period=requested_period)
+        return fetch_market_data(sym, timeframe)
+
     # Degenerate / fallback path: per-symbol fetch (cached, rate-safe).
     def _per_symbol() -> Dict[str, MarketData]:
         out: Dict[str, MarketData] = {}
         for sym in symbols:
             try:
-                out[sym] = fetch_market_data(sym, timeframe)
+                out[sym] = _fetch_one(sym)
             except Exception as exc:
                 logger.error("Failed to fetch %s: %s", sym, exc)
         logger.info("Fetched data for %d / %d symbols", len(out), len(symbols))
@@ -268,11 +280,11 @@ def fetch_multiple(
 
     tf_cfg = cfg.get("timeframes", {})
     tf = timeframe or tf_cfg.get("default", "15m")
-    period = None
-    if tf in INTRADAY_INTERVALS:
-        period = df_cfg.get("intraday_history_period", "59d")
-    else:
-        period = df_cfg.get("history_period", "2y")
+    if period is None:
+        if tf in INTRADAY_INTERVALS:
+            period = df_cfg.get("intraday_history_period", "59d")
+        else:
+            period = df_cfg.get("history_period", "2y")
     # Allow overrides already used by fetch_market_data(period=...)
     # Trigger premarket (history period set by caller via screen → fetch_market_data)
     # to reuse the configured value rather than a blank default.
@@ -312,7 +324,8 @@ def fetch_multiple(
                         raise ValueError(f"Missing {col} in batch for {sym}")
                 df = raw[required].copy()
                 df.dropna(subset=["Open", "High", "Low", "Close"], how="all", inplace=True)
-                df.ffill(inplace=True)
+                if tf not in INTRADAY_INTERVALS:
+                    df.ffill(inplace=True)
                 if df.empty:
                     raise ValueError(f"Empty frame for {sym}")
                 latest = float(df["Close"].iloc[-1]) if not df.empty else None
@@ -324,7 +337,7 @@ def fetch_multiple(
                 # One-ticker failure must not kill the other 99.
                 logger.warning("Batch fetch of %s failed (%s); retrying per-symbol", sym, exc)
                 try:
-                    results[sym] = fetch_market_data(sym, timeframe)
+                    results[sym] = _fetch_one(sym)
                 except Exception as exc2:
                     logger.error("Failed to fetch %s: %s", sym, exc2)
         logger.info("Fetched data for %d / %d symbols", len(results), len(symbols))

@@ -3,20 +3,33 @@
 # production config/config.yaml is intentionally not modified by this file.
 options_intraday:
   execution_class: remote_paper
+  PAPER_TRADING: true
   entry_cutoff: "14:30"
   hard_flat: "15:10"
   strategies: [orb, pullback, momentum]
+  # Discovery only: scan stock underlyings, but route BUY CE/PE options only.
+  # Options must exist in today's exact broker listing; no equity fallback.
+  scan_basket: nifty50  # configured indices are unioned; stocks remain NIFTY50
+  scan_interval_seconds: 300
   stop_premium_fraction: 0.20
   target_premium_fraction: 0.30
-  max_open_positions: 3
+  profit_lock_step_fraction: 0.10
+  # Tomorrow's approved paper-test risk policy.  These keys are mandatory;
+  # the runtime rejects an incomplete or non-finite effective policy.
+  risk_per_trade_pct: 0.50
+  max_daily_loss_pct: 1.50
+  max_open_positions: 2
+  max_premium_exposure_pct: 5.00
+  allow_averaging_down: false
   max_daily_entries: 5
-  max_daily_loss_pct: 1.0
-  max_unrealized_loss_pct: 1.0
+  max_unrealized_loss_pct: 1.50
   max_consecutive_losses: 2
   max_portfolio_risk_pct: 1.0
   max_correlated_positions: 1
   correlated_groups:
     - [NIFTY, FINNIFTY]
+    - [BANKNIFTY, SBIN, ICICIBANK, HDFCBANK]
+    - [RELIANCE, TCS, INFY]
   # Planning-time contract identity.  The broker instrument list is still
   # revalidated immediately before every remote submission.
   contract_specs:

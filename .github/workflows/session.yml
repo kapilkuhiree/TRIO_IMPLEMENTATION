@@ -1,7 +1,7 @@
 name: TRIO session
 
-# One long job for the NSE session: reads the premarket plan, places the
-# orders at the open, then manages stops/targets/partials every minute until
+# One long options-only job: fresh NIFTY100 + configured-index discovery,
+# no executable saved plan. Manage owned CE/PE positions every minute until
 # the 15:10 IST square-off. Cron is UTC: 03:48 UTC = 09:18 IST, Mon-Fri.
 # Keep runtime below GitHub's hard 6h job cap so digest/state persistence runs.
 # Public repo => unlimited minutes, so a ~6h job is free.
@@ -31,6 +31,7 @@ jobs:
       TRIO_BROKER_PROVIDER: megabull
       TRIO_REMOTE_REQUIRED: "1"
       TRIO_ALLOW_LOCAL_OPTION_SHADOW: "0"
+      PAPER_TRADING: "true"
       TRIO_DEMAND_SUPPLY: "1"
       TRIO_TRADING_MODE: options_intraday
       TRIO_OPTIONS_INTRADAY_STATE_PATH: output/runtime/options_intraday_state.json
@@ -40,11 +41,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version-file: ".python-version"
           cache: pip
+          cache-dependency-path: requirements-server.lock
 
       - name: Install dependencies
-        run: pip install -r requirements-server.txt
+        run: python -m pip install --require-hashes -r requirements-server.lock
 
       - name: Validate Telegram bot tokens
         run: |

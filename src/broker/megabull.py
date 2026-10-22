@@ -23,18 +23,20 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 """
 
 import csv
+import io
 import logging
 import re
 import time
 import uuid
 from collections.abc import Mapping
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
 from src.broker.base import BaseBroker, BrokerOrder, Position
-from src.utils import get_logger, utc_now
+from src.utils import IST, get_logger, utc_now
 
 logger = get_logger("broker.megabull")
 
@@ -273,6 +275,8 @@ class MegaBullBroker(BaseBroker):
         self.closed_trades: List[Dict[str, Any]] = []
         self._pending_orders: Set[str] = set()  # remote LIMIT accepted, not yet confirmed
         self._tokens: Dict[str, str] = {}  # TRADINGSYMBOL -> instrumentToken
+        self._option_rows: Optional[List[Dict[str, Any]]] = None
+        self._option_rows_date: Optional[date] = None
         self._name_map_cache: Optional[Dict[str, str]] = None  # instName -> sym
         self._position_metadata: Dict[str, Dict[str, Any]] = {}
         self._session = session or _QuietSession()
@@ -368,10 +372,17 @@ class MegaBullBroker(BaseBroker):
                             return self._tokens[tsym]
             except (OSError, UnicodeDecodeError) as exc:
                 logger.warning("Instrument cache unreadable (%s), refetching", exc)
+        logger.info("Refreshing MegaBull instrument list for %s ...", tsym)
+        self._refresh_instruments()
+        if tsym not in self._tokens:
+            raise KeyError(f"No MegaBull instrument for {symbol} ({tsym})")
+        return self._tokens[tsym]
+
+    def _refresh_instruments(self) -> List[Dict[str, Any]]:
+        """Load the vendor CSV via the existing read-only instrument API."""
         if getattr(self, "_auth_failed", False):
             raise PermissionError(
                 "MegaBull 401: bad/expired api-key (cached list unavailable)")
-        logger.info("Refreshing MegaBull instrument list for %s ...", tsym)
         info = self._get("/api/marketwatch/instruments")
         url = (info or {}).get("downloadUrl", "")
         if not url:
@@ -379,17 +390,68 @@ class MegaBullBroker(BaseBroker):
         resp = self._session.get(url, timeout=60)
         resp.raise_for_status()
         text = resp.text if isinstance(resp.text, str) else resp.content.decode()
+        reader = csv.DictReader(io.StringIO(text))
+        if not {"tradingSymbol", "instrumentToken"}.issubset(reader.fieldnames or []):
+            raise RuntimeError("MegaBull instruments: invalid CSV header")
+        rows = list(reader)
+        if not rows:
+            raise RuntimeError("MegaBull instruments: empty CSV")
         self.instrument_cache.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.instrument_cache, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-        for row in csv.DictReader(text.splitlines()):
+        temporary = self.instrument_cache.with_name(
+            f".{self.instrument_cache.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            # Management may read instrument identity during read-only discovery.
+            # It must see the old complete listing or the new complete listing.
+            temporary.replace(self.instrument_cache)
+        finally:
+            temporary.unlink(missing_ok=True)
+        tokens = {}
+        for row in rows:
             key = (row.get("tradingSymbol") or "").upper()
             tok = row.get("instrumentToken", "")
             if key and tok:
-                self._tokens[key] = tok
-        if tsym not in self._tokens:
-            raise KeyError(f"No MegaBull instrument for {symbol} ({tsym})")
-        return self._tokens[tsym]
+                tokens[key] = tok
+        self._tokens = tokens
+        self._name_map_cache = None
+        self._option_rows = None
+        self._option_rows_date = None
+        return rows
+
+    def option_instruments(self) -> List[Dict[str, Any]]:
+        """Return today's raw NSE OPTIDX/OPTSTK listing rows, read-only.
+
+        The shared CSV loader refreshes missing, unreadable, or prior-calendar-
+        date caches (IST). Repeated calls on the same date reuse the listing.
+        All vendor fields/values are retained, including exact contract/lot/
+        token metadata; callers validate expiry and contract eligibility.
+        Download/auth errors propagate rather than serving yesterday's rows.
+        This accessor never resolves an order or reads/mutates the account.
+        """
+        today = datetime.now(IST).date()
+        if self._option_rows is None or self._option_rows_date != today:
+            rows = None
+            try:
+                cache_date = datetime.fromtimestamp(
+                    self.instrument_cache.stat().st_mtime, IST).date()
+                if cache_date == today:
+                    with open(self.instrument_cache, encoding="utf-8", newline="") as handle:
+                        reader = csv.DictReader(handle)
+                        if {"tradingSymbol", "instrumentToken", "instrumentType",
+                            "exchange"}.issubset(reader.fieldnames or []):
+                            rows = list(reader) or None
+            except (OSError, UnicodeDecodeError, csv.Error) as exc:
+                logger.debug("Current option instrument cache unavailable: %s", exc)
+            if rows is None:
+                rows = self._refresh_instruments()
+            self._option_rows = [
+                dict(row) for row in rows
+                if str(row.get("instrumentType") or "").strip().upper() in {"OPTIDX", "OPTSTK"}
+                and str(row.get("exchange") or "").strip().upper() == "NSE"
+            ]
+            self._option_rows_date = today
+        return [dict(row) for row in self._option_rows]
 
     def instrument_metadata(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Read one instrument row from the local cache without refreshing it.
