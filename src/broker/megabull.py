@@ -98,6 +98,12 @@ def _metadata_value(metadata: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _canonical_symbol(value: Any) -> str:
+    """Normalize broker/cache symbols for identity comparisons only."""
+    return (str(value or "").strip().upper()
+            .removesuffix(".NS").removesuffix(".BO"))
+
+
 def classify_instrument(symbol: Any, metadata: Any = None) -> str:
     """Classify one instrument using only supplied metadata.
 
@@ -127,10 +133,9 @@ def classify_instrument(symbol: Any, metadata: Any = None) -> str:
     if type_compact in _EQUITY_TYPES:
         return ASSET_EQUITY
 
-    trading_symbol = str(
-        symbol or _metadata_value(data, "tradingSymbol", "trading_symbol", "symbol")
-        or "").strip().upper()
-    suffix_symbol = trading_symbol.removesuffix(".NS").removesuffix(".BO")
+    trading_symbol = _canonical_symbol(
+        symbol or _metadata_value(data, "tradingSymbol", "trading_symbol", "symbol"))
+    suffix_symbol = trading_symbol
     suffix_option = bool(_OPTION_SYMBOL_SUFFIX.search(suffix_symbol))
     option_type = str(_metadata_value(data, *_OPTION_TYPE_KEYS) or "").strip().upper()
     contract_fields = any(
@@ -142,6 +147,26 @@ def classify_instrument(symbol: Any, metadata: Any = None) -> str:
     option_segment = "OPT" in re.sub(r"[^A-Z0-9]", "", exchange)
     if suffix_option and (contract_fields or option_segment or option_type in {"CE", "PE", "CALL", "PUT"}):
         return ASSET_OPTIONS
+
+    # Some MegaBull instrument snapshots contain only tradingSymbol,
+    # instrumentName and instrumentToken.  A cache-backed identity is enough
+    # to recognize an ordinary cash instrument.  For a symbol ending in
+    # CE/PE, require the cache display name to be the same symbol; an option
+    # row normally names its underlying and therefore remains unknown without
+    # contract metadata.  This lets an existing equity such as RELIANCE
+    # coexist with the options-only runtime while preserving fail-closed
+    # handling for unowned option holdings.
+    cache_symbol = _canonical_symbol(
+        _metadata_value(data, "tradingSymbol", "trading_symbol"))
+    cache_name = _canonical_symbol(
+        _metadata_value(data, "instrumentName", "instrument_name", "name"))
+    instrument_token = _metadata_value(
+        data, "instrumentToken", "instrument_token", "token")
+    known_cache_identity = (cache_symbol and instrument_token not in (None, "") and
+                            cache_symbol == trading_symbol)
+    if (known_cache_identity and
+            (not suffix_option or cache_name == cache_symbol)):
+        return ASSET_EQUITY
 
     # A known non-option type must remain equity even when its symbol happens
     # to end in CE/PE.  All other incomplete metadata stays conservative.

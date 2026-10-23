@@ -11,7 +11,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.broker.megabull import MegaBullBroker
+from src.broker.megabull import (
+    ASSET_EQUITY,
+    ASSET_UNKNOWN,
+    MegaBullBroker,
+)
 
 
 class _Resp:
@@ -62,7 +66,8 @@ class FakeSession:
 
     _NAMES = {"633601": "Oil & Natural Gas Corporation Limited",
                 "519937": "Mahindra & Mahindra Ltd",
-                "341249": "HDFC Bank Ltd"}
+                 "341249": "HDFC Bank Ltd"}
+
 
     def _net(self, tok, side, qty, price):
         # Mirror the production API: instrumentName is the company name
@@ -138,6 +143,21 @@ class FakeSession:
         else:
             self.open_orders.append(dict(rec, status="PENDING"))
         return _Resp(rec)
+
+
+def test_sparse_cache_identifies_cash_holding_without_hiding_options(tmp_path):
+    """Production's sparse CSV still must classify RELIANCE as equity."""
+    cache = tmp_path / "instruments.csv"
+    cache.write_text(
+        "tradingSymbol,instrumentName,instrumentToken\n"
+        "RELIANCE,RELIANCE,738561\n"
+        "NIFTY26O3025000CE,NIFTY,900001\n",
+        encoding="utf-8",
+    )
+    broker = MegaBullBroker(api_key="test", instrument_cache=cache)
+
+    assert broker.classify_position("RELIANCE.NS") == ASSET_EQUITY
+    assert broker.classify_position("NIFTY26O3025000CE") == ASSET_UNKNOWN
 
 
 def _broker(tmp_path, **kw):

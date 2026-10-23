@@ -30,6 +30,16 @@ def _cache(tmp_path):
     return path
 
 
+def _sparse_cache(tmp_path):
+    path = tmp_path / "sparse-instruments.csv"
+    path.write_text(
+        "tradingSymbol,instrumentName,instrumentToken\n"
+        "RELIANCE,RELIANCE,738561\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_megabull_partition_is_cache_only_and_conservative(tmp_path):
     broker = MegaBullBroker(api_key="test", instrument_cache=_cache(tmp_path))
     positions = {
@@ -44,6 +54,28 @@ def test_megabull_partition_is_cache_only_and_conservative(tmp_path):
     assert set(buckets[ASSET_EQUITY]) == {"RELIANCE.NS"}
     assert set(buckets[ASSET_OPTIONS]) == {"NIFTY26O3025000CE"}
     assert set(buckets[ASSET_UNKNOWN]) == {"MYSTERY"}
+
+
+def test_options_runtime_ignores_sparse_cache_equity_holding(tmp_path, monkeypatch):
+    """An existing cash position must not block Monday's options session."""
+    monkeypatch.setenv("TRIO_TRADING_MODE", "combined")
+    monkeypatch.setenv("TRIO_BROKER_PROVIDER", "megabull")
+    monkeypatch.setenv("TRIO_REMOTE_REQUIRED", "1")
+    reset_risk_state()
+
+    equity = MegaBullBroker(api_key="test", instrument_cache=_sparse_cache(tmp_path))
+    equity.positions = {
+        "RELIANCE.NS": Position("RELIANCE.NS", "LONG", 2, 100.0, 100.0),
+    }
+    equity.refresh_positions = lambda: True
+    options = _OptionsMirror()
+    trader = _Trader(equity, options, tmp_path / "runtime.state.json")
+    runtime = OptionsIntradayRuntime(trader, _runtime_cfg(tmp_path),
+                                     trading_mode="combined")
+
+    assert runtime._reconcile(options) == []
+    assert not runtime._state.get("broker_blocked")
+    assert not get_risk_state().halt_active
 
 
 def test_lifecycle_rebuild_excludes_equity_broker_options_and_merges_strict_risk(
