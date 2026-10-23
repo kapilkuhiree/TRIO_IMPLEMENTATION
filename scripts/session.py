@@ -16,6 +16,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,7 +37,22 @@ from src.options_intraday import (  # noqa: E402
     strict_options_enabled,
 )
 
-load_env()
+env_path = Path(r"C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION\.env")
+if env_path.exists():
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            key, val = line.split("=", 1)
+            os.environ[key.strip()] = val.strip().strip('"').strip("'")
+    env_path = Path(r"C:\Users\Kapil Kuhire\Downloads\TRIO_IMPLEMENTATION\.env")
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                key, val = line.split("=", 1)
+                os.environ[key.strip()] = val.strip().strip('"').strip("'")
+    load_env()
+    os.environ["TRIO_BROKER_PROVIDER"] = "megabull"
+    os.environ["PAPER_TRADING"] = "true"
+    os.environ["TRIO_REMOTE_REQUIRED"] = "true"
 logger = get_logger("session")
 
 IST = timezone(timedelta(hours=5, minutes=30))

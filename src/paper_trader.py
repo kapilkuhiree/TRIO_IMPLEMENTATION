@@ -202,7 +202,8 @@ class PaperTrader:
         overlay may still construct a local options paper broker in ordinary
         production mode, but never in ``options_intraday`` or ``combined``.
         """
-        cfg = cfg or load_config()
+        from src.options_intraday import load_options_intraday_config
+        cfg = load_options_intraday_config(cfg)
         existing = getattr(self, "opt_broker", None)
         if existing is not None:
             return existing
