@@ -66,7 +66,7 @@ class FakeSession:
 
     _NAMES = {"633601": "Oil & Natural Gas Corporation Limited",
                 "519937": "Mahindra & Mahindra Ltd",
-                 "341249": "HDFC Bank Ltd"}
+                "341249": "HDFC Bank Ltd"}
 
 
     def _net(self, tok, side, qty, price):
