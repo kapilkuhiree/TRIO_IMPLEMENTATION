@@ -94,15 +94,16 @@ class PaperTrader:
         # instead of silently returning a paper simulator that hides the error.
         allowed = {"paper", "megabull"}
         # Optional: add "zerodha" here when that adapter is fully implemented.
+        env_provider = os.environ.get("TRIO_BROKER_PROVIDER", "").strip().lower()
         raw = provider = (
-            os.environ.get("TRIO_BROKER_PROVIDER", "").strip().lower()
+            env_provider
             or (cfg.get("broker", {}) or {}).get("provider", "paper")
         )
         configured_provider = str(
             (cfg.get("broker", {}) or {}).get("provider", "paper")
         ).strip().lower()
         if (test_isolation and not explicit_mode
-                and not os.environ.get("TRIO_BROKER_PROVIDER")
+                and env_provider != "megabull"
                 and configured_provider in {"paper", "megabull"}):
             raw = provider = "paper"
         if raw not in allowed:
