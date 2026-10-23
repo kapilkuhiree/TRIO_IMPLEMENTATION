@@ -34,4 +34,16 @@ def _restore_offline_broker_environment(monkeypatch):
     monkeypatch.setenv("TRIO_TEST_MODE", "1")
     monkeypatch.setenv("TRIO_LIVE", "0")
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
-    yield
+    try:
+        yield
+    finally:
+        # Some tests intentionally mutate the process environment with
+        # patch.dict/os.environ rather than this fixture's MonkeyPatch. Reset
+        # the complete offline boundary before pytest unwinds MonkeyPatch so
+        # those mutations cannot affect the next test's PaperTrader setup.
+        os.environ["TRIO_BROKER_PROVIDER"] = "paper"
+        os.environ["TRIO_REMOTE_REQUIRED"] = "0"
+        os.environ["TRIO_TEST_MODE"] = "1"
+        os.environ["TRIO_LIVE"] = "0"
+        os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+        os.environ.pop("TRIO_TRADING_MODE", None)

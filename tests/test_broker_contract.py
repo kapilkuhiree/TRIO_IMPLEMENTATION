@@ -24,6 +24,23 @@ def test_unknown_broker_provider_raises(monkeypatch):
             assert "Unknown broker provider" in str(exc)
 
 
+def test_offline_paper_trader_ignores_inherited_trading_mode(tmp_path, monkeypatch):
+    """A leaked options-mode env var must not select remote paper in tests."""
+    monkeypatch.delenv("TRIO_BROKER_PROVIDER", raising=False)
+    monkeypatch.setenv("TRIO_TRADING_MODE", "options_intraday")
+    cfg = {
+        "broker": {"provider": "megabull"},
+        "risk_management": {"capital": 10000},
+        "forward_test": {},
+        "logging": {"trade_log": str(Path(tmp_path) / "trades.jsonl")},
+    }
+    with patch("src.paper_trader.load_config", return_value=cfg):
+        trader = PaperTrader(symbols=["A"], test_mode=False)
+
+    assert trader.trading_mode == "production"
+    assert trader.broker_name == "paper"
+
+
 def test_pending_not_booked_as_filled():
     """A PENDING order must not be treated as a confirmed fill."""
     from src.broker.base import BrokerOrder

@@ -76,13 +76,15 @@ class PaperTrader:
         # available for strict options-runtime tests, but default ordinary
         # PaperTrader fixtures to the local production path.
         test_isolation = bool(test_mode or os.environ.get("TRIO_TEST_MODE") == "1")
-        explicit_mode = trading_mode or os.environ.get("TRIO_TRADING_MODE")
-        mode_for_resolution = (
-            trading_mode
-            if trading_mode is not None
-            else ("production" if test_isolation and not explicit_mode else None)
-        )
-        self.trading_mode = resolve_trading_mode(cfg, mode_for_resolution)
+        # In the offline suite, a process-level trading-mode override may be
+        # left by a different fixture. Only an argument passed to this
+        # constructor is explicit; ordinary PaperTrader tests must not inherit
+        # the repository's remote-paper options mode from the environment.
+        explicit_mode = trading_mode
+        if test_isolation and trading_mode is None:
+            self.trading_mode = "production"
+        else:
+            self.trading_mode = resolve_trading_mode(cfg, trading_mode)
         self.options_only = self.trading_mode == OPTIONS_INTRADAY
         self.combined_mode = self.trading_mode == COMBINED
         self.strict_options_mode = self.options_only or self.combined_mode
@@ -102,7 +104,7 @@ class PaperTrader:
         configured_provider = str(
             (cfg.get("broker", {}) or {}).get("provider", "paper")
         ).strip().lower()
-        if (test_isolation and not explicit_mode
+        if (test_isolation and explicit_mode is None
                 and env_provider != "megabull"
                 and configured_provider in {"paper", "megabull"}):
             raw = provider = "paper"
