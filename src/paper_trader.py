@@ -21,6 +21,7 @@ from src.utils import (get_logger, load_config, utc_now, remote_paper_required,
                        local_option_shadow_allowed)
 from src.options_intraday import (
     COMBINED,
+    OPTIONS_INTRADAY,
     combined_mode_enabled,
     options_intraday_enabled,
     options_intraday_config,
@@ -70,10 +71,21 @@ class PaperTrader:
         self.symbols = symbols or cfg.get("symbols", [])
         self.timeframe = timeframe or cfg.get("timeframes", {}).get("default", "15m")
         self.test_mode = test_mode  # smoke/unit runs write a SEPARATE log file
-        self.trading_mode = resolve_trading_mode(cfg, trading_mode)
-        self.options_only = options_intraday_enabled(cfg, trading_mode)
-        self.combined_mode = combined_mode_enabled(cfg, trading_mode)
-        self.strict_options_mode = strict_options_enabled(cfg, trading_mode)
+        # Offline/unit runs must not inherit the repository's remote-paper
+        # session selection from config.  Keep an explicitly requested mode
+        # available for strict options-runtime tests, but default ordinary
+        # PaperTrader fixtures to the local production path.
+        test_isolation = bool(test_mode or os.environ.get("TRIO_TEST_MODE") == "1")
+        explicit_mode = trading_mode or os.environ.get("TRIO_TRADING_MODE")
+        mode_for_resolution = (
+            trading_mode
+            if trading_mode is not None
+            else ("production" if test_isolation and not explicit_mode else None)
+        )
+        self.trading_mode = resolve_trading_mode(cfg, mode_for_resolution)
+        self.options_only = self.trading_mode == OPTIONS_INTRADAY
+        self.combined_mode = self.trading_mode == COMBINED
+        self.strict_options_mode = self.options_only or self.combined_mode
 
         rm_cfg = cfg.get("risk_management", {})
         capital = initial_capital or rm_cfg.get("capital", 100000)
@@ -86,11 +98,18 @@ class PaperTrader:
             os.environ.get("TRIO_BROKER_PROVIDER", "").strip().lower()
             or (cfg.get("broker", {}) or {}).get("provider", "paper")
         )
+        configured_provider = str(
+            (cfg.get("broker", {}) or {}).get("provider", "paper")
+        ).strip().lower()
+        if (test_isolation and not explicit_mode
+                and not os.environ.get("TRIO_BROKER_PROVIDER")
+                and configured_provider in {"paper", "megabull"}):
+            raw = provider = "paper"
         if raw not in allowed:
             raise ValueError(
                 f"Unknown broker provider '{raw}' — allowed: {sorted(allowed)}. "
                 f"Refusing to trade silently on a typoed simulator.")
-        if remote_paper_required(cfg):
+        if remote_paper_required(cfg) and not test_isolation:
             from src.remote_paper import validate_remote_config
             validate_remote_config(cfg, provider=provider)
         # MegaBull paper requires intent: env or config "megabull" plus a
@@ -1252,7 +1271,9 @@ class PaperTrader:
             if not ok:
                 logger.error("execute_option_plan blocked: %s", reason)
                 return []
-        required = remote_paper_required(cfg)
+        required = remote_paper_required(cfg) and not (
+            os.environ.get("TRIO_TEST_MODE") == "1"
+        )
         if (required or options_mode) and not self._session_open():
             return []
         if opt_broker is None:

@@ -11,15 +11,22 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      TRIO_TEST_MODE: "1"
+      TRIO_BROKER_PROVIDER: paper
+      TRIO_REMOTE_REQUIRED: "0"
+      TRIO_LIVE: "0"
+      PYTHON_DOTENV_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version-file: ".python-version"
           cache: pip
+          cache-dependency-path: requirements-server.lock
       - name: Install CI dependencies
-        run: pip install -r requirements-server.txt pytest
+        run: python -m pip install --require-hashes -r requirements-server.lock
       - name: Compile
         run: python -m compileall -q src scripts main.py
       - name: Test
-        run: python -m pytest -q --basetemp /tmp/trio-pytest
+        run: python scripts/test_offline.py

@@ -12,6 +12,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("TRIO_BROKER_PROVIDER", "paper")
@@ -22,3 +24,14 @@ os.environ["TRIO_REMOTE_REQUIRED"] = "0"
 # price=100 unit fixtures booked into the live ledger; this makes that
 # impossible even when a test forgets `test_mode=True`.
 os.environ["TRIO_TEST_MODE"] = "1"
+
+
+@pytest.fixture(autouse=True)
+def _restore_offline_broker_environment(monkeypatch):
+    """Keep one test's broker-mode mutation from leaking into later tests."""
+    monkeypatch.setenv("TRIO_BROKER_PROVIDER", "paper")
+    monkeypatch.setenv("TRIO_REMOTE_REQUIRED", "0")
+    monkeypatch.setenv("TRIO_TEST_MODE", "1")
+    monkeypatch.setenv("TRIO_LIVE", "0")
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    yield
