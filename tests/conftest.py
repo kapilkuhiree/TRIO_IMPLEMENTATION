@@ -26,6 +26,23 @@ os.environ["TRIO_REMOTE_REQUIRED"] = "0"
 os.environ["TRIO_TEST_MODE"] = "1"
 
 
+def _reset_offline_environment():
+    """Restore the process-wide safety boundary after all test finalizers."""
+    os.environ["TRIO_BROKER_PROVIDER"] = "paper"
+    os.environ["TRIO_REMOTE_REQUIRED"] = "0"
+    os.environ["TRIO_TEST_MODE"] = "1"
+    os.environ["TRIO_LIVE"] = "0"
+    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+    os.environ.pop("TRIO_TRADING_MODE", None)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Clean env mutations after every fixture has finished tearing down."""
+    yield
+    _reset_offline_environment()
+
+
 @pytest.fixture(autouse=True)
 def _restore_offline_broker_environment(monkeypatch):
     """Keep one test's broker-mode mutation from leaking into later tests."""
@@ -41,9 +58,4 @@ def _restore_offline_broker_environment(monkeypatch):
         # patch.dict/os.environ rather than this fixture's MonkeyPatch. Reset
         # the complete offline boundary before pytest unwinds MonkeyPatch so
         # those mutations cannot affect the next test's PaperTrader setup.
-        os.environ["TRIO_BROKER_PROVIDER"] = "paper"
-        os.environ["TRIO_REMOTE_REQUIRED"] = "0"
-        os.environ["TRIO_TEST_MODE"] = "1"
-        os.environ["TRIO_LIVE"] = "0"
-        os.environ["PYTHON_DOTENV_DISABLED"] = "1"
-        os.environ.pop("TRIO_TRADING_MODE", None)
+        _reset_offline_environment()
