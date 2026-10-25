@@ -1,6 +1,6 @@
 {
   "date": "2026-10-26",
-  "generated_at": "2026-10-23T14:32:49.675353+00:00",
+  "generated_at": "2026-10-25T11:47:14.231945+00:00",
   "trading_mode": "options_intraday",
   "asset": "options",
   "candidates": [],
@@ -32,12 +32,12 @@
   "intraday_data_diagnostic": {
     "valid": false,
     "rows": 4246,
-    "current_date_rows": 72,
+    "current_date_rows": 0,
     "max_age_minutes": 15.0,
-    "latest_timestamp": "2026-10-23T15:10:00+05:30",
-    "latest_completion_timestamp": "2026-10-23T15:15:00+05:30",
+    "latest_timestamp": null,
+    "latest_completion_timestamp": null,
     "errors": [
-      "stale_latest_bar:287.8m"
+      "no_completed_bar_for_current_ist_date"
     ],
     "ignored_rows": {
       "outside_session": 175,
@@ -47,7 +47,7 @@
     "source": {
       "source": "yfinance",
       "symbol": "^NSEI",
-      "fetched_at": "2026-10-23T14:32:50.205144+00:00"
+      "fetched_at": "2026-10-25T11:47:14.916815+00:00"
     }
   },
   "execution_ready": false,
