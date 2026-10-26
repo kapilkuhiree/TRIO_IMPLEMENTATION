@@ -1,5 +1,5 @@
 {
-  "broker_blocked": false,
+  "broker_blocked": true,
   "closed": [],
   "daily_entries": 0,
   "intents": {},
