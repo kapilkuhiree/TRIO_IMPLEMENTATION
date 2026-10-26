@@ -195,12 +195,12 @@ def fetch_market_data(
             period = df_cfg.get("history_period")
 
     source = (os.environ.get("TRIO_MARKET_DATA_PROVIDER", "").strip().lower()
-              or df_cfg.get("source", "yfinance"))
+              or df_cfg.get("source", "zerodha"))
 
-    if source == "yfinance":
-        df = _fetch_yfinance(symbol, timeframe, period)
-    elif source == "zerodha":
+    if source == "zerodha":
         df = _fetch_zerodha(symbol, timeframe, period)
+    elif source == "yfinance":
+        df = _fetch_yfinance(symbol, timeframe, period)
     else:
         raise ValueError(f"Unsupported data source: {source}")
 
