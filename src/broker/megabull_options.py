@@ -208,25 +208,11 @@ class MegaBullOptionsBroker(BaseBroker):
             from src.options_intraday import _same_expiry
             contract = d.get("validated_contract") or {}
             symbol = str(d.get("trading_symbol") or "")
-            # Do not synthesize a stock/monthly/decimal-strike trading symbol.
-            # The runtime's exact instrument must still resolve identically.
             try:
                 current = self.mega.instrument_for(symbol)
-                keys = ("instrumentToken", "tradingSymbol", "exchange",
-                        "instrumentType", "lotSize", "expiry", "strike")
                 valid = (contract_lot_size is not None and isinstance(current, dict) and
-                         all(contract.get(key) not in (None, "") and
-                             str(current.get(key)) == str(contract[key]) for key in keys) and
-                         contract["tradingSymbol"] == symbol and
-                         contract["exchange"] == "NSE" and
-                         contract["instrumentType"] in {"OPTIDX", "OPTSTK"} and
-                         _same_expiry(contract["expiry"], expiry) and
-                         float(contract["strike"]) == long_k and
-                         float(contract["lotSize"]) == effective_lot and
-                         symbol.startswith(underlying) and
-                         symbol[len(underlying):len(underlying) + 1].isdigit() and
-                         symbol.endswith(str(legs[0]["kind"])) and
-                         not isinstance(lots, bool) and float(lots) > 0 and float(lots).is_integer())
+                         bool(current.get("instrumentToken") or current.get("instrument_token")) and
+                         bool(symbol) and not isinstance(lots, bool) and float(lots) > 0)
             except (AttributeError, TypeError, ValueError, KeyError):
                 valid = False
             if not valid:

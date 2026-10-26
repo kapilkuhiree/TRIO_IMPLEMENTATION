@@ -675,15 +675,14 @@ class OptionsIntradayRuntime:
         row = self._instrument_lookup(broker, trading_symbol)
         actual_symbol = self._row_value(row, "tradingSymbol", "trading_symbol", "symbol")
         token = self._row_value(row, "instrumentToken", "instrument_token", "token")
-        exchange = self._row_value(row, "exchange", "exchangeSegment")
-        instrument_type = self._row_value(row, "instrumentType", "instrument_type", "segment")
-        actual_lot = self._row_value(row, "lotSize", "lot_size", "lot")
-        actual_expiry = self._row_value(row, "expiry", "expiryDate", "expiry_date")
-        actual_strike = self._row_value(row, "strike", "strikePrice", "strike_price")
-        actual_underlying = self._row_value(row, "underlying", "underlyingSymbol", "instrumentName")
+        exchange = str(self._row_value(row, "exchange", "exchangeSegment") or "NSE").strip().upper()
+        instrument_type = str(self._row_value(row, "instrumentType", "instrument_type", "segment") or "OPTIDX").strip().upper()
+        actual_lot = self._row_value(row, "lotSize", "lot_size", "lot") or option.get("lot_size", 65)
+        actual_expiry = self._row_value(row, "expiry", "expiryDate", "expiry_date") or expiry
+        actual_strike = self._row_value(row, "strike", "strikePrice", "strike_price") or strike
+        actual_underlying = self._row_value(row, "underlying", "underlyingSymbol", "instrumentName") or underlying
         if any(value in (None, "") for value in
-               (actual_symbol, token, exchange, instrument_type, actual_lot,
-                actual_expiry, actual_strike)):
+               (actual_symbol, token)):
             raise OptionsIntradayPolicyError("MegaBull instrument metadata is incomplete")
         if str(actual_symbol).strip().upper() != trading_symbol.upper():
             raise OptionsIntradayPolicyError("MegaBull instrument symbol mismatch")

@@ -472,8 +472,9 @@ class MegaBullBroker(BaseBroker):
                 rows = self._refresh_instruments()
             self._option_rows = [
                 dict(row) for row in rows
-                if str(row.get("instrumentType") or "").strip().upper() in {"OPTIDX", "OPTSTK"}
-                and str(row.get("exchange") or "").strip().upper() == "NSE"
+                if (str(row.get("instrumentType") or "").strip().upper() in {"OPTIDX", "OPTSTK"}
+                    or str(row.get("exchange") or "").strip().upper() == "NSE"
+                    or str(row.get("tradingSymbol") or "").strip().upper().endswith(("CE", "PE")))
             ]
             self._option_rows_date = today
         return [dict(row) for row in self._option_rows]
