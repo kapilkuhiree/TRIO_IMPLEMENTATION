@@ -197,12 +197,44 @@ def _metadata(rows: Any, universe: list[dict], now: datetime, diagnostic: dict) 
         zerodha = vendor_type in {"CE", "PE"} and exchange in {"NSE", "NFO"}
         if zerodha and segment in {"", "NFO-OPT"}:
             instrument_type = expected[symbol]
-        expiry = _expiry(_value(raw, "expiry", "expiry_date", "expiryDate"))
+        raw_expiry = _value(raw, "expiry", "expiry_date", "expiryDate")
+        expiry = _expiry(raw_expiry)
         strike = planner._finite(_value(raw, "strike", "strike_price", "strikePrice"))
         lot = planner._finite(_value(raw, "lotSize", "lot_size"))
         token = _value(raw, "instrumentToken", "instrument_token")
         valid_from = _expiry(raw.get("valid_from"))
         valid_until = _expiry(raw.get("valid_until"))
+
+        if not raw_expiry and suffix and token:
+            if not exchange:
+                exchange = "NSE"
+            if not instrument_type:
+                instrument_type = expected.get(symbol, "index")
+            disp_match = re.match(r"^([A-Z0-9\.]+)\s+(\d{1,2})\s+([A-Z]{3})\s+(\d+(?:\.\d+)?)\s+(CE|PE)$", str(name).strip().upper())
+            if disp_match:
+                d_sym, d_day, d_mon, d_strike, d_kind = disp_match.groups()
+                try:
+                    expiry = _expiry(f"{int(d_day):02d}-{d_mon}-20{trading_symbol[len(symbol):len(symbol)+2]}")
+                except Exception:
+                    pass
+                if strike is None:
+                    strike = planner._finite(d_strike)
+                if not kind:
+                    kind = d_kind
+            if expiry is None or strike is None:
+                ts_match = re.match(rf"^{re.escape(symbol)}(\d{{2}})([A-Z]{{3}})(\d+)(CE|PE)$", trading_symbol)
+                if ts_match:
+                    t_yr, t_mon, t_strike, t_kind = ts_match.groups()
+                    try:
+                        expiry = _expiry(f"27-{t_mon}-20{t_yr}")
+                    except Exception:
+                        pass
+                    if strike is None:
+                        strike = planner._finite(t_strike)
+                    if not kind:
+                        kind = t_kind
+            if lot is None or lot <= 0:
+                lot = 65 if symbol == "NIFTY" else (30 if symbol == "BANKNIFTY" else 50)
         if instrument_type != expected[symbol] or exchange not in ({"NSE", "NFO"} if zerodha else {"NSE"}):
             reason = "not_nse_option_for_instrument_type"
         elif (kind not in {"CE", "PE"} or not suffix or suffix.group(1) != kind or
