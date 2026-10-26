@@ -35,16 +35,10 @@ def main() -> int:
     os.environ["TRIO_REMOTE_REQUIRED"] = "true"
     os.environ["TRIO_MARKET_DATA_PROVIDER"] = "yfinance"
 
-    import yaml
-    config_path = ROOT / "config" / "options_intraday.yaml"
-    cfg = {}
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-
-    cfg.setdefault("options_intraday", {})
-    cfg["options_intraday"]["scan_basket"] = "indices"
+    from src.options_intraday import load_options_intraday_config
+    cfg = load_options_intraday_config()
     cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY"]
+    cfg["options_intraday"].pop("scan_basket", None)
 
     from src.broker.megabull import MegaBullBroker, load_dotenv_key
     from src.broker.megabull_options import MegaBullOptionsBroker
