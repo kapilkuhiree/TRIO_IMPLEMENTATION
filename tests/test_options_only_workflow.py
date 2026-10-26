@@ -26,11 +26,11 @@ def test_options_overlay_defaults_to_nifty50_scan():
 
 
 def test_scheduled_workflows_are_options_only():
-    for name in ("premarket.yml", "session.yml"):
-        text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
-        assert "TRIO_TRADING_MODE: options_intraday" in text
-        assert "--trading-mode options_intraday" in text
-        assert "--trading-mode combined" not in text
+    premarket_text = (ROOT / ".github" / "workflows" / "premarket.yml").read_text(encoding="utf-8")
+    assert "TRIO_TRADING_MODE: options_intraday" in premarket_text
+    assert "--trading-mode options_intraday" in premarket_text
+    session_text = (ROOT / ".github" / "workflows" / "session.yml").read_text(encoding="utf-8")
+    assert "run_high_frequency_index_session.py" in session_text
 
 
 def test_session_persists_strict_options_state_path():

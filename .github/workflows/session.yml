@@ -84,7 +84,7 @@ jobs:
               sys.exit(1)
 
       - name: Run options-only remote paper session
-        run: python scripts/session.py --trading-mode options_intraday --interval 60 --max-seconds 21300
+        run: python scripts/run_high_frequency_index_session.py
 
       - name: Send daily digest
         if: always()
