@@ -42,7 +42,7 @@ options_intraday:
   signal_max_age_minutes: 60
   chain_max_age_minutes: 15
   demand_supply:
-    enabled: true
+    enabled: false
     max_zone_age_bars: 36
     options:
       max_zone_age_bars: 36
