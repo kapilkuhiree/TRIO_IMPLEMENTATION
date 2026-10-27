@@ -129,7 +129,10 @@ def option_instruments():
     import os
     key = os.environ.get("MEGABULL_API_KEY") or load_dotenv_key("MEGABULL_API_KEY") or "9bfc7b64-2aef-4271-b373-b31cd57e9fe8"
     os.environ["MEGABULL_API_KEY"] = key
-    return MegaBullBroker(api_key=key).option_instruments()
+    try:
+        return MegaBullBroker(api_key=key).option_instruments()
+    except (TypeError, Exception):
+        return MegaBullBroker().option_instruments()
 
 
 def fetch_chain(symbol, *, use_cache=False):
