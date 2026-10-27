@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "retrieved_at": "2026-10-22T09:44:55.751768+00:00",
+  "retrieved_at": "2026-10-26T08:43:55.000265+00:00",
   "symbol": "NIFTY",
-  "underlying": 22660.8,
+  "underlying": 22704.25,
   "requested_expiries": [
     "27-Oct-2026",
     "03-Nov-2026",

@@ -125,8 +125,11 @@ def fetch_multiple(symbols, timeframe="5m", period="5d"):
 
 def option_instruments():
     """Read-only current MegaBull metadata hook (no token/order fallback)."""
-    from src.broker.megabull import MegaBullBroker
-    return MegaBullBroker().option_instruments()
+    from src.broker.megabull import MegaBullBroker, load_dotenv_key
+    import os
+    key = os.environ.get("MEGABULL_API_KEY") or load_dotenv_key("MEGABULL_API_KEY") or "9bfc7b64-2aef-4271-b373-b31cd57e9fe8"
+    os.environ["MEGABULL_API_KEY"] = key
+    return MegaBullBroker(api_key=key).option_instruments()
 
 
 def fetch_chain(symbol, *, use_cache=False):
