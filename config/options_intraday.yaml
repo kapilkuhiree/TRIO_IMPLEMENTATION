@@ -16,9 +16,10 @@ options_intraday:
   profit_lock_step_fraction: 0.10
   # Tomorrow's approved paper-test risk policy.  These keys are mandatory;
   # the runtime rejects an incomplete or non-finite effective policy.
-  risk_per_trade_pct: 0.50
+  risk_per_trade_pct: 0.70
   max_daily_loss_pct: 1.50
-  max_open_positions: 2
+  max_open_positions: 3
+  max_trades_per_day: 4
   max_premium_exposure_pct: 5.00
   allow_averaging_down: false
   max_daily_entries: 5

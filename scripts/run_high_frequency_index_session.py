@@ -37,8 +37,13 @@ def main() -> int:
 
     from src.options_intraday import load_options_intraday_config
     cfg = load_options_intraday_config()
-    cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY"]
+    cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
     cfg["options_intraday"].pop("scan_basket", None)
+    # --- probability‑boosting risk controls (still within §3 limits) ---
+    cfg["options_intraday"]["risk_per_trade_pct"] = 0.70          # 0.70 % of capital per trade
+    cfg["options_intraday"]["max_open_positions"] = 3            # allow up to 3 simultaneous option legs
+    cfg["options_intraday"]["max_trades_per_day"] = 4            # allow up to 4 approvals per day
+    cfg["options_intraday"]["time_cutoff_ist"] = "15:15"         # keep the session open until 15:15 IST
 
     from src.broker.megabull import MegaBullBroker, load_dotenv_key
     from src.broker.megabull_options import MegaBullOptionsBroker
