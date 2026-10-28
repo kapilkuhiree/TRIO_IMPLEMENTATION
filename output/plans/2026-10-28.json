@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-28",
+  "generated_at": "2026-10-27T15:37:10.006487+00:00",
+  "trading_mode": "options_intraday",
+  "asset": "options",
+  "candidates": [],
+  "option_candidates": [],
+  "option_chain": null,
+  "option_chain_diagnostic": {
+    "valid": false,
+    "failure_reason": "invalid_or_stale_intraday_data"
+  },
+  "options_pnl_readiness": "NOT_READY_FOR_OPTIONS_PNL",
+  "historical_options_pnl": "NOT_READY",
+  "universe": "NIFTY",
+  "timeframe": "5m",
+  "scanned": 1,
+  "requested": 1,
+  "failed": 1,
+  "actionable": 0,
+  "executed": false,
+  "option_underlying": "NIFTY",
+  "strategies": [
+    "orb",
+    "pullback",
+    "momentum"
+  ],
+  "demand_supply": {
+    "enabled": true,
+    "context": "NIFTY 5m"
+  },
+  "intraday_data_diagnostic": {
+    "valid": false,
+    "rows": 4246,
+    "current_date_rows": 72,
+    "max_age_minutes": 15.0,
+    "latest_timestamp": "2026-10-27T15:10:00+05:30",
+    "latest_completion_timestamp": "2026-10-27T15:15:00+05:30",
+    "errors": [
+      "stale_latest_bar:352.2m"
+    ],
+    "ignored_rows": {
+      "outside_session": 175,
+      "future_or_incomplete": 0
+    },
+    "timestamp_timezone": "Asia/Kolkata",
+    "source": {
+      "source": "yfinance",
+      "symbol": "^NSEI",
+      "fetched_at": "2026-10-27T15:37:10.826298+00:00"
+    }
+  },
+  "execution_ready": false,
+  "execution_blocked_reason": "options_intraday plans are rebuilt during the live session"
+}
