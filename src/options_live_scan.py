@@ -126,19 +126,30 @@ def fetch_multiple(symbols, timeframe="5m", period="5d"):
 def option_instruments():
     """Read-only current MegaBull metadata hook with retries."""
     from src.broker.megabull import MegaBullBroker, load_dotenv_key
-    import os, time
-    key = os.environ.get("MEGABULL_API_KEY") or load_dotenv_key("MEGABULL_API_KEY") or "9bfc7b64-2aef-4271-b373-b31cd57e9fe8"
+    import os, time, logging
+    logger = logging.getLogger("options_scan")
+    
+    key = os.environ.get("MEGABULL_API_KEY") or load_dotenv_key("MEGABULL_API_KEY")
+    if not key:
+        logger.error("MEGABULL_API_KEY not found in environment")
+        key = "9bfc7b64-2aef-4271-b373-b31cd57e9fe8"
+    
     os.environ["MEGABULL_API_KEY"] = key
+    
     last_exc = None
     for attempt in range(3):
         try:
             return MegaBullBroker(api_key=key).option_instruments()
         except Exception as exc:
             last_exc = exc
-            time.sleep(2)
+            logger.warning(f"Metadata fetch attempt {attempt+1} failed: {exc}")
+            time.sleep(5)
+    
+    logger.error(f"Metadata fetch failed after 3 attempts: {last_exc}")
     try:
         return MegaBullBroker().option_instruments()
-    except Exception:
+    except Exception as exc:
+        logger.error(f"Fallback metadata fetch also failed: {exc}")
         raise last_exc
 
 
