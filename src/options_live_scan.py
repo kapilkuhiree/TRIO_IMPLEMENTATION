@@ -177,7 +177,9 @@ def _metadata(rows: Any, universe: list[dict], now: datetime, diagnostic: dict) 
         trading_symbol = str(_value(raw, "tradingSymbol", "tradingsymbol", "trading_symbol") or "").strip().upper()
         symbol = _symbol(explicit) if explicit else name
         named_root = _symbol(name.split(" ", 1)[0])
-        if not explicit and named_root in {*expected, *INDEX_MARKET_SYMBOLS}:
+        if "FINNIFTY" in expected and ("NIFTY FIN" in name or "FINNIFTY" in name or "NIFTY_FIN" in trading_symbol):
+            symbol = "FINNIFTY"
+        elif not explicit and named_root in {*expected, *INDEX_MARKET_SYMBOLS}:
             symbol = named_root
         if not explicit and symbol not in expected and (not name or " " in name):
             # MegaBull may use a full display name, e.g. "RELIANCE 16 OCT

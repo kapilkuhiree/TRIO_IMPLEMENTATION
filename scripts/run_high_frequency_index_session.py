@@ -37,7 +37,7 @@ def main() -> int:
 
     from src.options_intraday import load_options_intraday_config
     cfg = load_options_intraday_config()
-    cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY"]
     cfg["options_intraday"].pop("scan_basket", None)
     # --- probability‑boosting risk controls (still within §3 limits) ---
     cfg["options_intraday"]["risk_per_trade_pct"] = 0.70          # 0.70 % of capital per trade
