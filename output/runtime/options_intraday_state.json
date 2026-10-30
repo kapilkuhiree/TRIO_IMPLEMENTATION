@@ -1,9 +1,9 @@
 {
-  "broker_blocked": true,
+  "broker_blocked": false,
   "closed": [],
   "daily_entries": 0,
   "intents": {},
-  "last_reconciled_at": "2026-10-30T07:03:36.192133+00:00",
+  "last_reconciled_at": "2026-10-30T16:29:10.229558+00:00",
   "mark_cycle_ms": 1792989581124,
   "positions": {},
   "schema_version": 1,
