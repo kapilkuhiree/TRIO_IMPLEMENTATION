@@ -73,9 +73,10 @@ class MarketClock:
     hard_flat: str = "15:10"
     close: str = "15:30"
     holidays: Set[str] = field(default_factory=set)
-    # Per-date session overrides, e.g. the one-off Diwali Muhurat session on a
-    # Sunday.  A key here makes that date a trading day even at a weekend; the
-    # date's own ``open``/``entry_start``/... replace the base window.
+    # Per-date session overrides for exchange-declared special sessions (for
+    # example a weekend/holiday trading day).  A key here makes that date a
+    # trading day even at a weekend; the date's own
+    # ``open``/``entry_start``/... replace the base window.
     special_sessions: Dict[str, Dict[str, str]] = field(default_factory=dict)
     valid: bool = True
     error: str = ""

@@ -50,7 +50,7 @@ class _Market:
 
     def option_quote(self, row):
         return {"bid": 99.0, "ask": 100.0, "last_price": 100.0,
-                "timestamp": "2026-11-08T14:30:00+05:30"}
+                "timestamp": "2026-11-09T10:30:00+05:30"}
 
 
 class _Trader:
@@ -63,10 +63,13 @@ class _Trader:
 
 
 def _mode(tmp_path):
-    with (ROOT / "config" / "options_intraday_muhurat.yaml").open(
+    with (ROOT / "config" / "options_intraday.yaml").open(
             encoding="utf-8") as handle:
         mode = (yaml.safe_load(handle) or {})["options_intraday"]
     mode = deepcopy(mode)
+    mode["execution_class"] = "live"
+    mode["PAPER_TRADING"] = False
+    mode["live_session_date"] = "2026-11-09"
     mode["state_path"] = str(tmp_path / "state.json")
     return mode
 
@@ -76,7 +79,7 @@ def test_runtime_accepts_zerodha_adapter_and_normalized_contract(monkeypatch, tm
     monkeypatch.setenv("TRIO_BROKER_PROVIDER", "zerodha")
     monkeypatch.setenv("PAPER_TRADING", "false")
 
-    fixed = datetime(2026, 11, 8, 14, 30, tzinfo=IST)
+    fixed = datetime(2026, 11, 9, 10, 30, tzinfo=IST)
 
     class FixedDateTime(datetime):
         @classmethod

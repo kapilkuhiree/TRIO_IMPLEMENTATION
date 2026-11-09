@@ -6,9 +6,6 @@ Rs 18,000 premium cap, Rs 40,000 wallet floor. The only differences from paper
 are the venue (`execution_class=live`, `PAPER_TRADING=false`) and an explicit
 date lock.
 
-The Diwali/Muhurat overlay (`config/options_intraday_muhurat.yaml`) is **not**
-used here and is untouched.
-
 ---
 
 ## 1. Hard prerequisites (all must be true)
@@ -36,7 +33,7 @@ If prerequisites 1 or 2 fail, stop. The runner will refuse, but check first.
 ## 2. Preflight (read-only, no runtime)
 
 ```powershell
-python scripts/muhurat_live.py --preflight --weekday-live 2026-11-09
+python scripts/weekday_live.py --preflight --weekday-live 2026-11-09
 ```
 
 - The date in `--weekday-live` **must equal today (IST)** or the run is refused.
@@ -50,7 +47,7 @@ python scripts/muhurat_live.py --preflight --weekday-live 2026-11-09
 ## 3. Dry run (still sends no orders)
 
 ```powershell
-python scripts/muhurat_live.py --dry-run --weekday-live 2026-11-09 --once
+python scripts/weekday_live.py --dry-run --weekday-live 2026-11-09 --once
 ```
 
 Expected:
@@ -68,7 +65,7 @@ Dry run skips the typed confirmation because the adapter refuses every order.
 ## 4. Live start
 
 ```powershell
-python scripts/muhurat_live.py --weekday-live 2026-11-09 --confirm WEEKDAY-LIVE --interval 10
+python scripts/weekday_live.py --weekday-live 2026-11-09 --confirm WEEKDAY-LIVE --interval 10
 ```
 
 Safety model:
@@ -82,24 +79,13 @@ Safety model:
 Optional narrower universe (default is NIFTY only):
 
 ```powershell
-python scripts/muhurat_live.py --weekday-live 2026-11-09 --confirm WEEKDAY-LIVE --underlyings NIFTY,BANKNIFTY
+python scripts/weekday_live.py --weekday-live 2026-11-09 --confirm WEEKDAY-LIVE --underlyings NIFTY,BANKNIFTY
 ```
 
-## 5. Independent watchdog (second terminal)
+## 5. Emergency flatten
 
 ```powershell
-python scripts/muhurat_watchdog.py --at 15:11
-```
-
-It refuses any date other than the declared session unless `--force` is passed.
-Run it before the open; it sleeps until the flatten time.
-
----
-
-## 6. Emergency flatten
-
-```powershell
-python scripts/muhurat_live.py --flatten
+python scripts/weekday_live.py --flatten
 ```
 
 Cancels working NFO orders and squares off every NFO holding, regardless of the
@@ -107,10 +93,10 @@ strategy's state file.
 
 ---
 
-## 7. Current blockers (as of 2026-11-08)
+## 6. Current blockers
 
 - Kite segments: `MF, BSE, NSE, BFO` — **NFO missing**.
-- Available cash: **₹0.00** (floor ₹40,000).
+- Available cash: below the Rs 40,000 floor.
 
 Until both are fixed, weekday live is refused by design. MegaBull paper
 (`python scripts/session.py`) is unaffected and needs neither.

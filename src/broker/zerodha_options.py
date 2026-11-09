@@ -90,7 +90,7 @@ class ZerodhaOptionsBroker(BaseBroker):
         slippage_pct: float = 0.02,
         market_protection: int = -1,
         dry_run: bool = False,
-        tag: str = "TRIO-MUHURAT",
+        tag: str = "TRIO-WEEKDAY",
         underlyings: Optional[List[str]] = None,
     ):
         self.market_data = market_data
@@ -812,7 +812,7 @@ class ZerodhaOptionsBroker(BaseBroker):
             if not isinstance(row, dict):
                 continue
             # Never cancel an unrelated equity/commodity order from the
-            # one-off options runner or its watchdog.
+            # options live runner.
             if str(row.get("exchange") or "").strip().upper() != OPTION_EXCHANGE:
                 continue
             status = str(row.get("status") or "").upper()

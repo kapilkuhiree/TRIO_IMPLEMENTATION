@@ -38,6 +38,18 @@ def offline(monkeypatch):
     monkeypatch.setattr(alerts, "send_telegram", lambda *args: None)
     monkeypatch.setattr(alerts, "send_options_telegram", lambda *args: None)
     monkeypatch.delenv("TRIO_TRADING_MODE", raising=False)
+    # scripts.session._run_options_only_session uses os.environ.setdefault for
+    # the live policy.  Pin these to an empty value with monkeypatch (which
+    # registers an undo even when the key is absent) so one plan-free test
+    # cannot raise the capital/scan defaults for the rest of the suite.
+    for key in (
+        "TRIO_OPTIONS_CAPITAL",
+        "TRIO_OPTIONS_SCAN_UNDERLYINGS",
+        "TRIO_OPTIONS_SCAN_INTERVAL",
+        "TRIO_OPTIONS_CHAIN_PROVIDER",
+        "TRIO_OPTIONS_TARGET_FRACTION",
+    ):
+        monkeypatch.setenv(key, "")
 
 
 @pytest.fixture

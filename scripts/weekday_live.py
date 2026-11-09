@@ -1,15 +1,16 @@
-"""TRIO - Diwali Muhurat 2026 one-off LIVE session runner.
+"""TRIO - weekday LIVE options session runner (Zerodha NFO).
 
 Author: Kapil Kuhire <kapilkuhire89@gmail.com>
 
-This launcher is deliberately separate from the normal paper session.  It:
+This launcher is deliberately separate from the normal MegaBull paper session.
+It:
 
   * loads ``.env`` (Zerodha credentials) without printing any secret;
-  * forces the Zerodha data + chain providers (yfinance has no Sunday feed);
-  * overlays ``config/options_intraday_muhurat.yaml`` (mean-reversion only,
-    NRML, one position, Rs 20,000 premium cap, Rs 40,000 wallet floor);
+  * forces the Zerodha data + chain providers;
+  * overlays ``config/options_intraday.yaml`` (ORB + mean reversion, NRML,
+    two slots, Rs 18,000 premium cap, Rs 40,000 wallet floor);
   * refuses to construct the runtime unless the date-locked live gate passes;
-  * runs a 10-second manage/scan loop and is flat by 15:15 IST.
+  * runs a 10-second manage/scan loop and is flat by 15:10 IST.
 
 Safety modes
 ------------
@@ -21,7 +22,7 @@ Safety modes
 ``--dry-run``     the full live loop with a broker that refuses to send
                   orders.  Safe on the session date.
 ``--scan``        one read-only discovery pass (no runtime, no orders) using
-                  ``--as-of`` so it can be exercised on a weekday.
+                  ``--as-of``.
 
 DISCLAIMER: Educational purposes only. Not financial advice.
 """
@@ -41,15 +42,23 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 IST = timezone(timedelta(hours=5, minutes=30))
-SESSION_DATE = "2026-11-08"
-CONFIG_PATH = ROOT / "config" / "options_intraday_muhurat.yaml"
-NORMAL_CONFIG_PATH = ROOT / "config" / "options_intraday.yaml"
+CONFIG_PATH = ROOT / "config" / "options_intraday.yaml"
 
 
-def _default_state_path() -> Path:
+def _today_ist() -> str:
+    return datetime.now(IST).date().isoformat()
+
+
+def _session_date(args: argparse.Namespace) -> str:
+    """Declared session date, or today when an explicit date is not needed."""
+    declared = getattr(args, "weekday_live", None)
+    return str(declared) if declared else _today_ist()
+
+
+def _state_dir() -> Path:
     local = os.environ.get("LOCALAPPDATA")
     root = Path(local) if local else Path.home() / ".trio"
-    return root / "TRIO" / "options_intraday" / "muhurat_2026-11-08.json"
+    return root / "TRIO" / "options_intraday"
 
 
 def _load_env(env_file: Optional[str]) -> Path:
@@ -96,32 +105,12 @@ def _force_live_environment() -> None:
     os.environ["PAPER_TRADING"] = "false"
 
 
-def _force_paper_environment() -> None:
-    """MegaBull paper: no live gate, but still a remote broker."""
-    os.environ["TRIO_OPTIONS_LIVE"] = "0"
-    os.environ["TRIO_BROKER_PROVIDER"] = "megabull"
-    os.environ["PAPER_TRADING"] = "true"
-    os.environ["TRIO_REMOTE_REQUIRED"] = "true"
-
-
-def _muhurat_overlay() -> Dict[str, Any]:
+def _overlay() -> Dict[str, Any]:
+    """Normal weekday options overlay (the validated ORB + MR book)."""
     import yaml
     if not CONFIG_PATH.exists():
         raise SystemExit(f"missing overlay: {CONFIG_PATH}")
     with CONFIG_PATH.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
-    mode = loaded.get("options_intraday", loaded)
-    if not isinstance(mode, dict):
-        raise SystemExit("muhurat overlay is malformed")
-    return deepcopy(mode)
-
-
-def _normal_overlay() -> Dict[str, Any]:
-    """Normal weekday options overlay (the validated ORB + MR book)."""
-    import yaml
-    if not NORMAL_CONFIG_PATH.exists():
-        raise SystemExit(f"missing overlay: {NORMAL_CONFIG_PATH}")
-    with NORMAL_CONFIG_PATH.open("r", encoding="utf-8") as handle:
         loaded = yaml.safe_load(handle) or {}
     mode = loaded.get("options_intraday", loaded)
     if not isinstance(mode, dict):
@@ -130,38 +119,27 @@ def _normal_overlay() -> Dict[str, Any]:
 
 
 def _effective_config(args: argparse.Namespace) -> Dict[str, Any]:
-    """Base config + the selected mode section (no global mutation)."""
+    """Base config + the weekday overlay (no global mutation)."""
     from src.utils import load_config
 
     cfg = load_config()
-    weekday_live = getattr(args, "weekday_live", None)
-    mode = _normal_overlay() if weekday_live else _muhurat_overlay()
+    session_date = _session_date(args)
+    mode = _overlay()
 
-    # Restrict the option chain to the two nearest expiries.  A full NFO chain
-    # is thousands of quotes; two expiries keeps a 10-second scan inside
-    # Kite's quote rate limit while still covering the contract the planner
-    # can select.
+    # Restrict the option chain to the nearest expiry.  A full NFO chain is
+    # thousands of quotes; one expiry keeps a 10-second scan inside Kite's
+    # quote rate limit while still covering the contract the planner selects.
     def zerodha_chain(symbol: str, use_cache: bool = False) -> Any:
         from src.options_chain_zerodha import fetch_zerodha_chain
-        # The planner always selects the nearest future expiry and a
-        # near-the-money strike.  Quoting one expiry inside a +/-10% strike
-        # band keeps a 10-second live loop inside Kite's quote rate limit.
         return fetch_zerodha_chain(symbol, raise_errors=True, max_expiries=1,
                                    max_strike_distance_pct=0.10)
 
     mode["chain_provider"] = zerodha_chain
-    if weekday_live:
-        # Explicit, date-locked weekday live session on Zerodha.  The normal
-        # overlay keeps the validated ORB + mean-reversion book, two slots and
-        # the Rs 18k premium cap; only the venue and the date lock change.
-        mode["execution_class"] = "live"
-        mode["PAPER_TRADING"] = False
-        mode["live_session_date"] = str(weekday_live)
-    elif getattr(args, "broker", "zerodha") == "megabull":
-        # MegaBull is remote paper: the live date gate does not apply, but the
-        # runtime still validates remote_paper + PAPER_TRADING=true.
-        mode["execution_class"] = "remote_paper"
-        mode["PAPER_TRADING"] = True
+    # Explicit, date-locked weekday live session on Zerodha.  Only the venue
+    # and the date lock change; the validated weekday book stays intact.
+    mode["execution_class"] = "live"
+    mode["PAPER_TRADING"] = False
+    mode["live_session_date"] = session_date
     if args.capital is not None:
         mode["capital"] = float(args.capital)
     if args.state:
@@ -173,9 +151,7 @@ def _effective_config(args: argparse.Namespace) -> Dict[str, Any]:
             mode["underlyings"] = selected
             mode["scan_underlyings"] = selected
             os.environ["TRIO_OPTIONS_SCAN_UNDERLYINGS"] = ",".join(selected)
-    if args.live_date:
-        mode["live_session_date"] = str(args.live_date)
-    if weekday_live and not mode.get("scan_underlyings"):
+    if not mode.get("scan_underlyings"):
         # Parity with the normal paper launcher (scripts/session.py): NIFTY
         # only unless the operator names a wider list explicitly.  Kept in the
         # config (not the environment) so importing/building configs cannot
@@ -189,9 +165,7 @@ def _effective_config(args: argparse.Namespace) -> Dict[str, Any]:
 def _state_path(args: argparse.Namespace) -> Path:
     if args.state:
         return Path(args.state).expanduser()
-    if getattr(args, "weekday_live", None):
-        return _default_state_path().parent / f"live_{args.weekday_live}.json"
-    return _default_state_path()
+    return _state_dir() / f"live_{_session_date(args)}.json"
 
 
 WEEKDAY_CONFIRM = "WEEKDAY-LIVE"
@@ -204,7 +178,10 @@ def _nfo_segments(market_data: Any) -> List[str]:
 
 def _weekday_guards(args: argparse.Namespace, market_data: Any) -> None:
     """Hard preconditions for an explicit weekday live session."""
-    date_text = str(args.weekday_live)
+    date_text = str(getattr(args, "weekday_live", "") or "")
+    if not date_text:
+        raise SystemExit(
+            "refusing to start: pass --weekday-live YYYY-MM-DD")
     try:
         declared = datetime.fromisoformat(date_text).date()
     except ValueError as exc:
@@ -227,59 +204,9 @@ def _weekday_guards(args: argparse.Namespace, market_data: Any) -> None:
             f"({', '.join(exchanges) or '-'}); enable F&O on NFO, not BFO")
 
 
-class _MegaBullRunnerAdapter:
-    """Bridge MegaBullOptionsBroker to the runner's small broker surface."""
-
-    provider_name = "megabull_options"
-
-    def __init__(self, mega: Any, options: Any):
-        self._inner = options
-        self.mega = mega
-        self.strict_options_only = True
-        # Keep live references: close_spread mutates these dicts in place.
-        self.positions = options.positions
-        self.spreads = options.spreads
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-    def refresh_positions(self) -> bool:
-        try:
-            self.mega.refresh_positions()
-        except Exception:
-            pass
-        return True
-
-    def option_instruments(self) -> List[Dict[str, Any]]:
-        return self.mega.option_instruments()
-
-    def flatten_all(self, reason: str = "manual-flatten") -> Dict[str, Any]:
-        closed: Dict[str, Any] = {}
-        failed: List[str] = []
-        for spread_id in list(self.spreads):
-            position = self.positions.get(spread_id)
-            mid = float(getattr(position, "current_price", 0.0) or 0.0) \
-                if position is not None else 0.0
-            try:
-                record = self._inner.close_spread(spread_id, mid, reason)
-            except Exception as exc:
-                print(f"megabull close {spread_id} raised: {exc}")
-                record = {}
-            if record:
-                closed[spread_id] = True
-            else:
-                failed.append(spread_id)
-        return {
-            "cancelled": [],
-            "closed": closed,
-            "remaining": list(self.positions),
-            "positions_ok": True,
-            "failed": failed,
-        }
-
-
 def _broker(args: argparse.Namespace, restrict: bool = True):
     from src.zerodha_market_data import ZerodhaMarketData
+    from src.broker.zerodha_options import ZerodhaOptionsBroker
 
     selected: List[str] = []
     if restrict:
@@ -288,30 +215,15 @@ def _broker(args: argparse.Namespace, restrict: bool = True):
                     if item.strip()]
         if not selected:
             selected = [str(item).upper() for item in
-                        (_muhurat_overlay().get("underlyings") or ["NIFTY", "BANKNIFTY"])]
+                        (_overlay().get("underlyings") or ["NIFTY"])]
     market_data = ZerodhaMarketData.from_env()
-
-    if getattr(args, "broker", "zerodha") == "megabull":
-        from src.broker.megabull import MegaBullBroker
-        from src.broker.megabull_options import MegaBullOptionsBroker
-
-        mega = MegaBullBroker(
-            api_key=os.environ.get("MEGABULL_API_KEY", ""),
-            initial_capital=500000.0,
-        )
-        options = MegaBullOptionsBroker(mega, lot_size=65,
-                                        initial_capital=500000.0)
-        return market_data, _MegaBullRunnerAdapter(mega, options)
-
-    from src.broker.zerodha_options import ZerodhaOptionsBroker
-
     broker = ZerodhaOptionsBroker(
         market_data,
         product="NRML",
         order_timeout_seconds=8.0,
         exit_timeout_seconds=5.0,
         dry_run=bool(args.dry_run),
-        tag="TRIO-MUHURAT",
+        tag="TRIO-WEEKDAY",
         underlyings=selected,
     )
     return market_data, broker
@@ -370,34 +282,25 @@ def _preflight(args: argparse.Namespace) -> int:
     cfg = _effective_config(args)
     mode = cfg["options_intraday"]
     clock = market_clock_from_config(cfg)
-    _print_header("TRIO WEEKDAY LIVE PREFLIGHT (read-only)"
-                  if getattr(args, "weekday_live", None)
-                  else "TRIO MUHURAT LIVE PREFLIGHT (read-only)")
+    _print_header("TRIO WEEKDAY LIVE PREFLIGHT (read-only)")
 
     print(f"session date      : {mode.get('live_session_date')}")
-    print(f"today (IST)       : {datetime.now(IST).date().isoformat()}")
+    today = datetime.now(IST).date().isoformat()
+    print(f"today (IST)       : {today}")
     if getattr(args, "weekday_live", None):
         declared = str(args.weekday_live)
-        today = datetime.now(IST).date().isoformat()
         print(f"weekday live date : {declared} "
               f"({'OK' if declared == today else 'NOT TODAY'})")
         if declared != today:
             print("WEEKDAY LIVE BLOCKED: the date lock must equal today.")
             return 2
     print(f"market clock      : valid={clock.valid} error={clock.error or '-'}")
-    print(f"special session   : {clock.special_sessions.get(SESSION_DATE, '-')}")
     print(f"scan underlyings  : {mode.get('scan_underlyings') or mode.get('underlyings')}")
     print(f"strategies        : {mode.get('strategies')}")
-    if getattr(args, "broker", "zerodha") == "megabull":
-        print("broker            : MegaBull paper (virtual)")
-        print("product           : MKT (MegaBull paper)")
-    else:
-        print("broker            : Zerodha live (NFO)")
-        print("product           : NRML (adapter)")
+    print("broker            : Zerodha live (NFO)")
+    print("product           : NRML (adapter)")
 
     required = ["ZERODHA_API_KEY", "ZERODHA_API_SECRET", "ZERODHA_ACCESS_TOKEN"]
-    if getattr(args, "broker", "zerodha") == "megabull":
-        required.append("MEGABULL_API_KEY")
     missing = [key for key in required if not os.environ.get(key)]
     print(f"credentials       : {'OK' if not missing else 'MISSING ' + ','.join(missing)}")
     if missing:
@@ -405,8 +308,7 @@ def _preflight(args: argparse.Namespace) -> int:
 
     try:
         from src.options_intraday import validate_options_intraday_risk_config
-        ok, reason = validate_options_intraday_risk_config(
-            mode, live=getattr(args, "broker", "zerodha") != "megabull")
+        ok, reason = validate_options_intraday_risk_config(mode, live=True)
         print(f"risk config       : {'OK' if ok else 'INVALID: ' + reason}")
         if not ok:
             return 2
@@ -421,8 +323,7 @@ def _preflight(args: argparse.Namespace) -> int:
         segments = profile.get("exchanges") or []
         print(f"kite segments     : {', '.join(segments) if segments else '-'} "
               f"(NFO required for F&O options)")
-        if getattr(args, "weekday_live", None) and \
-                "NFO" not in {str(item).upper() for item in segments}:
+        if "NFO" not in {str(item).upper() for item in segments}:
             print(f"WEEKDAY LIVE BLOCKED: no NFO segment in {segments}; "
                   "enable F&O on NFO (not BFO).")
             return 2
@@ -434,15 +335,12 @@ def _preflight(args: argparse.Namespace) -> int:
         balance = broker.get_balance()
         floor = float(mode.get("min_wallet") or 0.0)
         available = float(balance.get("available") or 0.0)
-        if getattr(args, "broker", "zerodha") == "megabull":
-            print(f"megabull cash     : {available:,.2f} (virtual paper)")
-        else:
-            funded = available >= floor
-            print(f"available cash    : {available:,.2f} (floor {floor:,.2f}) "
-                  f"{'OK' if funded else 'BELOW FLOOR'}")
-            if not funded:
-                print("  WARNING: fund the account before the session; the live "
-                      "runner will refuse to start below the floor.")
+        funded = available >= floor
+        print(f"available cash    : {available:,.2f} (floor {floor:,.2f}) "
+              f"{'OK' if funded else 'BELOW FLOOR'}")
+        if not funded:
+            print("  WARNING: fund the account before the session; the live "
+                  "runner will refuse to start below the floor.")
         if not broker.refresh_positions():
             print("account check     : FAILED: positions could not be read "
                   "(cannot prove the account is flat)")
@@ -450,12 +348,8 @@ def _preflight(args: argparse.Namespace) -> int:
         holdings = sorted(broker.positions)
         print(f"NFO holdings      : {len(holdings)}"
               + (f" {holdings}" if holdings else " (flat)"))
-        if getattr(args, "broker", "zerodha") == "megabull":
-            open_orders = []
-            print("open NFO orders   : skipped (MegaBull paper)")
-        else:
-            open_orders = _open_nfo_orders(broker)
-            print(f"open NFO orders   : {len(open_orders)}")
+        open_orders = _open_nfo_orders(broker)
+        print(f"open NFO orders   : {len(open_orders)}")
         if holdings or open_orders:
             print("PREFLIGHT BLOCKED: start flat with no working orders "
                   "(run --flatten to cancel and square off).")
@@ -533,23 +427,15 @@ def _preflight(args: argparse.Namespace) -> int:
     try:
         from src.options_intraday import validate_options_mode_environment
         saved = dict(os.environ)
-        paper = getattr(args, "broker", "zerodha") == "megabull"
-        if paper:
-            os.environ["TRIO_OPTIONS_LIVE"] = "0"
-            os.environ["TRIO_BROKER_PROVIDER"] = "megabull"
-            os.environ["PAPER_TRADING"] = "true"
-            os.environ["TRIO_REMOTE_REQUIRED"] = "true"
-        else:
-            os.environ["TRIO_OPTIONS_LIVE"] = "1"
-            os.environ["TRIO_BROKER_PROVIDER"] = "zerodha"
-            os.environ["PAPER_TRADING"] = "false"
+        os.environ["TRIO_OPTIONS_LIVE"] = "1"
+        os.environ["TRIO_BROKER_PROVIDER"] = "zerodha"
+        os.environ["PAPER_TRADING"] = "false"
         try:
             ok, reason = validate_options_mode_environment(cfg)
         finally:
             os.environ.clear()
             os.environ.update(saved)
-        label = "paper gate today  " if paper else "live gate today   "
-        print(f"\n{label}: {'PASS' if ok else 'BLOCKED: ' + reason}")
+        print(f"\nlive gate today   : {'PASS' if ok else 'BLOCKED: ' + reason}")
     except Exception as exc:
         print(f"\nlive gate today   : BLOCKED: {exc}")
     return 0
@@ -562,7 +448,8 @@ def _scan(args: argparse.Namespace) -> int:
     _force_market_environment()
     cfg = _effective_config(args)
     # This pass is read-only, so it must not need the live date gate.  The
-    # runtime's paper validation is only a schema check here.
+    # broker adapter and the scan only read instrument metadata; force the
+    # live flags off so no runtime/gate path can send an order.
     cfg["options_intraday"]["execution_class"] = "remote_paper"
     cfg["options_intraday"]["PAPER_TRADING"] = True
     os.environ.pop("TRIO_OPTIONS_LIVE", None)
@@ -576,7 +463,7 @@ def _scan(args: argparse.Namespace) -> int:
     result = build_live_options_scan(
         cfg, now=now, instrument_rows=broker.option_instruments())
     diagnostics = result.get("diagnostics") or {}
-    _print_header("TRIO MUHURAT READ-ONLY SCAN")
+    _print_header("TRIO WEEKDAY READ-ONLY SCAN")
     print({key: diagnostics.get(key, 0) for key in (
         "requested", "data_ok", "no_signal", "not_listed",
         "contract_rejection", "fetch_errors", "selected")})
@@ -601,8 +488,8 @@ def _flatten(args: argparse.Namespace) -> int:
     # Unrestricted instrument metadata: a stray NFO holding outside the
     # NIFTY/BANKNIFTY universe must still be closable.
     market_data, broker = _broker(args, restrict=False)
-    _print_header("TRIO MUHURAT FLATTEN")
-    result = broker.flatten_all(reason="manual-muhurat-flatten")
+    _print_header("TRIO WEEKDAY FLATTEN")
+    result = broker.flatten_all(reason="manual-weekday-flatten")
     print(f"cancelled orders : {result.get('cancelled')}")
     print(f"closed symbols   : {result.get('closed')}")
     print(f"remaining        : {result.get('remaining')}")
@@ -622,8 +509,6 @@ def _underlying_spot(market_data: Any, underlying: str) -> float:
 
 def _probe_order(args: argparse.Namespace) -> int:
     """Place one far-from-market 1-lot LIMIT, prove it is open, then cancel."""
-    if getattr(args, "broker", "zerodha") == "megabull":
-        raise SystemExit("--probe-order is Zerodha-only; use --once for MegaBull")
     _force_market_environment()
     market_data, broker = _broker(args)
     if args.dry_run:
@@ -720,7 +605,7 @@ def _finalize(runtime: Any, broker: Any, label: str) -> int:
     except Exception as exc:
         print(f"{label}: runtime finalize raised: {exc}")
     try:
-        result = broker.flatten_all(reason="muhurat-finalize")
+        result = broker.flatten_all(reason="weekday-finalize")
     except Exception as exc:
         print(f"{label}: broker flatten raised: {exc}")
         return 2
@@ -740,10 +625,7 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     _force_market_environment()
-    if getattr(args, "broker", "zerodha") == "megabull":
-        _force_paper_environment()
-    else:
-        _force_live_environment()
+    _force_live_environment()
     if getattr(args, "weekday_live", None):
         # Match scripts/session.py so the weekday live book is the same one
         # that has been running in paper (capital, target, cadence, chain).
@@ -752,15 +634,14 @@ def _run(args: argparse.Namespace) -> int:
         os.environ.setdefault("TRIO_OPTIONS_SCAN_INTERVAL", "10")
         os.environ["TRIO_OPTIONS_CHAIN_PROVIDER"] = "auto"
     cfg = _effective_config(args)
-    if args.live_date and not args.dry_run:
-        raise SystemExit("--live-date is only available with --dry-run/--scan")
 
     state_path = _state_path(args)
     if args.state:
         os.environ["TRIO_OPTIONS_INTRADAY_STATE_PATH"] = str(state_path)
     market_data, broker = _broker(args)
-    if getattr(args, "weekday_live", None):
-        _weekday_guards(args, market_data)
+    # The runtime is always live here, so the date lock and typed confirmation
+    # are mandatory even when --dry-run is set (the adapter refuses orders).
+    _weekday_guards(args, market_data)
 
     # Hard preconditions before the runtime is allowed to exist.
     profile = market_data.profile()
@@ -768,9 +649,7 @@ def _run(args: argparse.Namespace) -> int:
     balance = broker.get_balance()
     floor = float(cfg["options_intraday"].get("min_wallet") or 0.0)
     available = float(balance.get("available") or 0.0)
-    if getattr(args, "broker", "zerodha") == "megabull":
-        print(f"megabull cash    : {available:,.2f} (virtual paper)")
-    elif available < floor:
+    if available < floor:
         if args.dry_run:
             print(f"WARNING: available cash {available:,.2f} is below the "
                   f"Rs {floor:,.0f} floor; dry-run continues, entries will "
@@ -786,15 +665,11 @@ def _run(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"refusing to start: holdings already present {sorted(broker.positions)}"
             " (run --flatten)")
-    if getattr(args, "broker", "zerodha") != "megabull" and _open_nfo_orders(broker):
+    if _open_nfo_orders(broker):
         raise SystemExit("refusing to start: NFO orders are already working "
                          "(run --flatten)")
 
-    execution_class = ("remote_paper"
-                       if getattr(args, "broker", "zerodha") == "megabull"
-                       else "live")
-    trader = OptionsOnlyTrader(cfg, broker, state_path,
-                               execution_class=execution_class)
+    trader = OptionsOnlyTrader(cfg, broker, state_path, execution_class="live")
     try:
         runtime = OptionsIntradayRuntime(trader, cfg)
     except OptionsIntradayPolicyError as exc:
@@ -874,7 +749,7 @@ def _run(args: argparse.Namespace) -> int:
         try:
             from src.alerts import send_options_telegram
             send_options_telegram(
-                f"TRIO Muhurat session ended. Flat={final == 0}. "
+                f"TRIO weekday live session ended. Flat={final == 0}. "
                 f"State={state_path}")
         except Exception:
             pass
@@ -883,7 +758,7 @@ def _run(args: argparse.Namespace) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="TRIO Diwali Muhurat 2026 one-off live runner")
+        description="TRIO weekday LIVE options runner (Zerodha NFO)")
     parser.add_argument("--env-file", help="explicit .env path")
     parser.add_argument("--preflight", action="store_true",
                         help="read-only account/contract/data checks")
@@ -905,11 +780,6 @@ def _parser() -> argparse.ArgumentParser:
                         help="override notional sizing capital")
     parser.add_argument("--state", help="options runtime state file")
     parser.add_argument("--underlyings", help="comma-separated scan list")
-    parser.add_argument("--live-date",
-                        help="override the date lock for --dry-run/--scan only")
-    parser.add_argument("--broker", choices=("zerodha", "megabull"),
-                        default="zerodha",
-                        help="execution venue: zerodha (live) or megabull (paper)")
     parser.add_argument("--weekday-live", metavar="YYYY-MM-DD",
                         help="normal weekday live session on Zerodha; the date "
                              "must equal today (requires NFO segment + funds)")
@@ -923,15 +793,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     env_path = _load_env(args.env_file)
     print(f"env file         : {env_path if env_path.exists() else 'not found'}")
-    if args.live_date and not (args.dry_run or args.scan):
-        print("--live-date requires --dry-run or --scan")
-        return 2
-    if args.weekday_live and args.broker == "megabull":
-        print("--weekday-live is Zerodha-only; drop --broker megabull")
-        return 2
-    if args.weekday_live and args.live_date:
-        print("--weekday-live replaces --live-date")
-        return 2
     if args.flatten:
         return _flatten(args)
     if args.probe_order:

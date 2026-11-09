@@ -1,8 +1,8 @@
-"""Weekday live mode on the one-off options runner.
+"""Weekday live mode on the options live runner.
 
-These tests pin the safety contract: the normal weekday overlay is used (not
-the Muhurat overlay), the date lock must equal today, a typed confirmation is
-required before real orders, and a missing NFO segment is a hard refusal.
+These tests pin the safety contract: the normal weekday overlay is used, the
+date lock must equal today, a typed confirmation is required before real
+orders, and a missing NFO segment is a hard refusal.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _load_runner():
-    path = ROOT / "scripts" / "muhurat_live.py"
+    path = ROOT / "scripts" / "weekday_live.py"
     spec = importlib.util.spec_from_file_location("weekday_live_runner", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -34,7 +34,7 @@ def runner():
 
 def _args(**overrides):
     base = dict(
-        broker="zerodha", weekday_live=None, live_date=None, capital=None,
+        weekday_live=None, capital=None,
         state=None, underlyings=None, dry_run=False, confirm=None,
     )
     base.update(overrides)
@@ -54,13 +54,14 @@ def test_weekday_overlay_uses_normal_book(runner):
     assert mode["scan_underlyings"] == ["NIFTY"]
 
 
-def test_muhurat_overlay_is_unchanged(runner):
+def test_default_overlay_is_the_weekday_book(runner):
+    today = datetime.now(IST).date().isoformat()
     cfg = runner._effective_config(_args())
     mode = cfg["options_intraday"]
-    assert mode["strategies"] == ["mean_reversion"]
-    assert mode["max_open_positions"] == 1
-    assert mode["max_premium_per_position"] == 20000
-    assert mode.get("live_session_date") == "2026-11-08"
+    assert mode["strategies"] == ["orb", "mean_reversion"]
+    assert mode["max_open_positions"] == 2
+    assert mode["max_premium_per_position"] == 18000
+    assert mode["live_session_date"] == today
 
 
 def test_weekday_state_path_is_per_date(runner):

@@ -1,4 +1,4 @@
-"""Per-underlying lot validation for the live Muhurat session.
+"""Per-underlying lot validation for the live weekday options session.
 
 The global ``options.lot_size`` is NIFTY's 65.  BANKNIFTY trades in 30-lots,
 so validating every contract against 65 silently rejected every BANKNIFTY
@@ -16,15 +16,19 @@ from src.utils import load_config
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
-NOW = datetime(2026, 11, 8, 14, 30, tzinfo=IST)
+NOW = datetime(2026, 11, 9, 10, 30, tzinfo=IST)
 EXPIRY = "09-Nov-2026"
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _cfg():
-    with (ROOT / "config" / "options_intraday_muhurat.yaml").open(
+    with (ROOT / "config" / "options_intraday.yaml").open(
             encoding="utf-8") as handle:
         mode = (yaml.safe_load(handle) or {})["options_intraday"]
+    # Promote the normal weekday book to the explicit live path.
+    mode["execution_class"] = "live"
+    mode["PAPER_TRADING"] = False
+    mode["live_session_date"] = "2026-11-09"
     cfg = load_config()
     cfg["options_intraday"] = deepcopy(mode)
     return load_options_intraday_config(cfg)
@@ -36,7 +40,7 @@ def _quote():
         "ask": 100.0,
         "openInterest": 5000,
         "totalTradedVolume": 1200,
-        "quote_timestamp": "2026-11-08T14:29:30+05:30",
+        "quote_timestamp": "2026-11-09T10:29:30+05:30",
     }
 
 
@@ -73,7 +77,7 @@ def _plan(underlying, expiry=EXPIRY):
         "exchange": "NSE",
         "expiries": [expiry],
         "by_expiry": {expiry: [row]},
-        "quote_timestamp": "2026-11-08T14:29:30+05:30",
+        "quote_timestamp": "2026-11-09T10:29:30+05:30",
     }}
 
 
