@@ -72,7 +72,7 @@ def _contract():
     }
 
 
-def _candidate(chain=None, ask=50.0, bid=45.0):
+def _candidate(chain=None, ask=50.0, bid=45.0, strategy="orb"):
     return {
         "asset": "options",
         "signal_timestamp": "2026-10-14T04:20:00+00:00",
@@ -80,7 +80,9 @@ def _candidate(chain=None, ask=50.0, bid=45.0):
         "option_underlying": "NIFTY",
         "action": "BUY",
         "direction": "bullish",
-        "metadata": {"setup": "breakout"},
+        "strategy": strategy,
+        "setup": "breakout",
+        "metadata": {"setup": "breakout", "strategy": strategy},
         "option_diagnostic": {"expiry_status": {"listed_by_exchange": False}},
         "option_legs": {
             "strategy": "long-call",
@@ -268,7 +270,7 @@ def test_premium_exposure_includes_open_and_pending_ask_debits(tmp_path):
 
     assert runtime._reserved_premium_exposure() == 22000.0
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, leg, options)
+        _candidate(), option, leg, options, now=NOW)
     assert lots == 0
     assert "premium-exposure" in reason
 
@@ -282,10 +284,49 @@ def test_max_two_open_positions_includes_reserved_state(tmp_path):
         }
     option = _candidate()["option_legs"]
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, option["legs"][0], options)
+        _candidate(), option, option["legs"][0], options, now=NOW)
 
     assert lots == 0
     assert reason == "options max-open-position limit reached"
+
+
+def test_two_independent_strategies_may_hold_nifty(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, max_open_positions=2, max_correlated_positions=2,
+             max_premium_per_position=18000),
+    )
+    # First strategy opens a NIFTY CE
+    runtime.execute_plan(_plan(), options, now=NOW)
+    # Refresh mark for existing positions
+    cycle = int(NOW.timestamp() * 1000)
+    runtime._state["mark_cycle_ms"] = cycle
+    for pos in runtime._state["positions"].values():
+        pos["last_bid_at_ms"] = cycle
+        pos["mark_status"] = "fresh"
+    
+    assert runtime._active_position_count() == 1
+    pos1 = next(iter(runtime._state["positions"].values()))
+    assert pos1["strategy"] in ("orb", "long-call")
+    assert pos1["option_underlying"] == "NIFTY"
+    # Second strategy (different strategy) may also open a NIFTY CE
+    candidate2 = _candidate()
+    candidate2["strategy"] = "mean_reversion"
+    candidate2["metadata"] = {"setup": "mean_reversion"}
+    lots2, _, reason2 = runtime._risk_preflight(
+        candidate2, candidate2["option_legs"], candidate2["option_legs"]["legs"][0],
+        options, now=NOW)
+    assert lots2 > 0, f"Failed: {reason2}"
+    assert reason2 == ""
+    # Same strategy must still be blocked
+    candidate3 = _candidate()
+    candidate3["strategy"] = pos1["strategy"]
+    lots3, _, reason3 = runtime._risk_preflight(
+        candidate3, candidate3["option_legs"], candidate3["option_legs"]["legs"][0],
+        options, now=NOW)
+    assert lots3 == 0
+    assert "same-strategy" in reason3.lower() or "averaging down" in reason3.lower()
 
 
 def test_averaging_down_is_rejected_for_open_or_pending_underlying(tmp_path):
@@ -299,10 +340,10 @@ def test_averaging_down_is_rejected_for_open_or_pending_underlying(tmp_path):
     }
     option = _candidate()["option_legs"]
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, option["legs"][0], options)
+        _candidate(), option, option["legs"][0], options, now=NOW)
 
     assert lots == 0
-    assert "averaging down" in reason
+    assert "same-strategy" in reason or "averaging down" in reason
 
 
 def test_daily_loss_boundary_is_fail_closed_at_realized_plus_unrealized_limit(
@@ -321,7 +362,7 @@ def test_daily_loss_boundary_is_fail_closed_at_realized_plus_unrealized_limit(
     get_risk_state().daily_pnl = -7175.0
     option = _candidate()["option_legs"]
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, option["legs"][0], options)
+        _candidate(), option, option["legs"][0], options, now=NOW)
 
     assert lots == 0
     assert reason == "options daily-loss budget exhausted"
@@ -443,7 +484,7 @@ def test_stale_mark_blocks_new_entries_instead_of_using_old_bid(tmp_path):
     option = _candidate()["option_legs"]
 
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, option["legs"][0], options)
+        _candidate(), option, option["legs"][0], options, now=NOW)
 
     assert lots == 0
     assert "mark is unresolved" in reason
@@ -462,7 +503,7 @@ def test_pending_intent_counts_toward_correlation_limit(tmp_path):
     option = _candidate()["option_legs"]
 
     lots, _, reason = runtime._risk_preflight(
-        _candidate(), option, option["legs"][0], options)
+        _candidate(), option, option["legs"][0], options, now=NOW)
 
     assert lots == 0
     assert reason == "correlated-options limit reached"
@@ -503,7 +544,11 @@ def test_profit_ladder_locks_at_ten_percent_then_stops_on_bid_reversal(tmp_path)
     options = _OptionsDouble()
     runtime = OptionsIntradayRuntime(
         _Trader(options, tmp_path),
-        _cfg(tmp_path, chain_provider=lambda *args, **kwargs: next(quotes)),
+        _cfg(
+            tmp_path,
+            chain_provider=lambda *args, **kwargs: next(quotes),
+            profit_lock_rungs=[],
+        ),
     )
     runtime.execute_plan(_plan(), options, now=NOW)
 
@@ -515,9 +560,11 @@ def test_profit_ladder_locks_at_ten_percent_then_stops_on_bid_reversal(tmp_path)
     assert options.close_calls == []
 
     closed = runtime.tick(now=datetime(2026, 10, 14, 10, 10, tzinfo=IST))
-    assert closed[0]["reason"] == "stop-loss"
+    # The +10% rung lifted the stop above entry; closing there is a locked
+    # profit, not a stop-loss.
+    assert closed[0]["reason"] == "trailing-stop"
     assert options.close_calls == [
-        ("OPT_long-call_30-Oct-2026_25000x0", 54.0, "stop-loss")
+        ("OPT_long-call_30-Oct-2026_25000x0", 54.0, "trailing-stop")
     ]
 
 
@@ -529,7 +576,11 @@ def test_profit_ladder_skips_rungs_and_locks_highest_reached_level(tmp_path):
     options = _OptionsDouble()
     runtime = OptionsIntradayRuntime(
         _Trader(options, tmp_path),
-        _cfg(tmp_path, chain_provider=lambda *args, **kwargs: next(quotes)),
+        _cfg(
+            tmp_path,
+            chain_provider=lambda *args, **kwargs: next(quotes),
+            profit_lock_rungs=[],
+        ),
     )
     runtime.execute_plan(_plan(), options, now=NOW)
 
@@ -540,8 +591,172 @@ def test_profit_ladder_skips_rungs_and_locks_highest_reached_level(tmp_path):
     assert position["target_premium"] == 65.0
 
     closed = runtime.tick(now=datetime(2026, 10, 14, 10, 10, tzinfo=IST))
-    assert closed[0]["reason"] == "stop-loss"
-    assert options.close_calls[-1][1:] == (59.0, "stop-loss")
+    assert closed[0]["reason"] == "trailing-stop"
+    assert options.close_calls[-1][1:] == (59.0, "trailing-stop")
+
+
+def test_profit_ladder_walks_custom_rungs_ten_to_twenty_five_percent(tmp_path):
+    quotes = iter([
+        _chain(bid=55.0, ask=60.0, quote_timestamp="2026-10-14T04:35:00+00:00"),
+        _chain(bid=57.5, ask=62.5, quote_timestamp="2026-10-14T04:40:00+00:00"),
+        _chain(bid=60.0, ask=65.0, quote_timestamp="2026-10-14T04:45:00+00:00"),
+        _chain(bid=62.5, ask=67.5, quote_timestamp="2026-10-14T04:50:00+00:00"),
+        _chain(bid=62.4, ask=67.4, quote_timestamp="2026-10-14T04:55:00+00:00"),
+    ])
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(
+            tmp_path,
+            chain_provider=lambda *args, **kwargs: next(quotes),
+            profit_lock_rungs=[0.10, 0.15, 0.20, 0.25],
+        ),
+    )
+    runtime.execute_plan(_plan(), options, now=NOW)
+    position = next(iter(runtime._state["positions"].values()))
+    assert position["profit_lock_rungs"] == [0.10, 0.15, 0.20, 0.25]
+
+    steps = [
+        (datetime(2026, 10, 14, 10, 5, tzinfo=IST), 1, 55.0, 57.5),
+        (datetime(2026, 10, 14, 10, 10, tzinfo=IST), 2, 57.5, 60.0),
+        (datetime(2026, 10, 14, 10, 15, tzinfo=IST), 3, 60.0, 62.5),
+        (datetime(2026, 10, 14, 10, 20, tzinfo=IST), 4, 62.5, 65.0),
+    ]
+    for now, stage, stop, target in steps:
+        assert runtime.tick(now=now) == []
+        assert position["profit_lock_stage"] == stage
+        assert position["stop_premium"] == stop
+        assert position["target_premium"] == target
+
+    # Bid falls back below the +25% rung: the locked stop exits the position
+    # in profit rather than the -20% initial stop.
+    closed = runtime.tick(now=datetime(2026, 10, 14, 10, 25, tzinfo=IST))
+    assert closed[0]["reason"] == "trailing-stop"
+    assert options.close_calls[-1][1:] == (62.4, "trailing-stop")
+
+
+def test_custom_rungs_leave_the_target_exit_ahead_of_the_ladder(tmp_path):
+    """Live sessions target +25%; the target still exits before the rung arms."""
+    quotes = iter([
+        _chain(bid=62.5, ask=67.5, quote_timestamp="2026-10-14T04:35:00+00:00"),
+    ])
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(
+            tmp_path,
+            chain_provider=lambda *args, **kwargs: next(quotes),
+            profit_lock_rungs=[0.10, 0.15, 0.20, 0.25],
+            target_premium_fraction=0.25,
+        ),
+    )
+    runtime.execute_plan(_plan(), options, now=NOW)
+    closed = runtime.tick(now=datetime(2026, 10, 14, 10, 5, tzinfo=IST))
+    assert closed[0]["reason"] == "target"
+    assert options.close_calls[-1][1:] == (62.5, "target")
+
+
+def test_profitable_trailing_exit_does_not_arm_loss_cooldown(tmp_path):
+    quotes = iter([
+        _chain(bid=55.0, ask=60.0, quote_timestamp="2026-10-14T04:35:00+00:00"),
+        _chain(bid=54.0, ask=59.0, quote_timestamp="2026-10-14T04:40:00+00:00"),
+    ])
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(
+            tmp_path,
+            chain_provider=lambda *args, **kwargs: next(quotes),
+            underlying_stop_loss_cooldown_seconds=900,
+        ),
+    )
+    runtime.execute_plan(_plan(), options, now=NOW)
+    runtime.tick(now=datetime(2026, 10, 14, 10, 5, tzinfo=IST))
+
+    closed = runtime.tick(now=datetime(2026, 10, 14, 10, 10, tzinfo=IST))
+    assert closed[0]["reason"] == "trailing-stop"
+    # A locked-in profit must not arm the loss cooldown or the loss streak.
+    assert runtime._underlying_stop_times == {}
+    assert get_risk_state().consecutive_losses == 0
+
+    option = _candidate()["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        _candidate(), option, option["legs"][0], options,
+        now=datetime(2026, 10, 14, 10, 10, 31, tzinfo=IST))
+    assert lots > 0
+    assert reason != "options underlying stop-loss cooldown is active"
+
+
+def _stop_position(strategy="orb"):
+    return {
+        "position_id": "OPT_stop",
+        "status": "open",
+        "asset": "options",
+        "execution_class": "remote_paper",
+        "strategy": strategy,
+        "setup": strategy,
+        "signal_action": "BUY",
+        "direction": "bullish",
+        "signal_underlying": "NIFTY",
+        "option_underlying": "NIFTY",
+        "trading_symbol": "NIFTY26O3025000CE",
+        "expiry": "30-Oct-2026",
+        "strike": 25000.0,
+        "kind": "CE",
+        "lots": 1,
+        "lot_size": 65,
+        "entry_premium": 50.0,
+        "initial_stop_premium": 40.0,
+        "stop_premium": 40.0,
+    }
+
+
+def test_underlying_stop_cooldown_is_scoped_per_strategy(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, underlying_stop_loss_cooldown_seconds=900),
+    )
+    now = datetime(2026, 10, 14, 10, 0, tzinfo=IST)
+
+    record = runtime._close_one(
+        options, "OPT_stop", _stop_position("orb"), 39.0, "stop-loss", now=now)
+
+    assert record["strategy"] == "orb"
+    assert runtime._underlying_stop_loss_cooldown_elapsed(
+        "NIFTY", now + timedelta(seconds=31), "orb") is False
+    # A stop on ORB must not block a different strategy on the same index.
+    assert runtime._underlying_stop_loss_cooldown_elapsed(
+        "NIFTY", now + timedelta(seconds=31), "mean_reversion") is True
+    assert runtime._underlying_stop_loss_cooldown_elapsed(
+        "NIFTY", now + timedelta(seconds=901), "orb") is True
+
+
+def test_order_and_close_records_carry_strategy_and_setup(tmp_path):
+    options = _OptionsDouble()
+    trader = _Trader(options, tmp_path)
+    runtime = OptionsIntradayRuntime(
+        trader,
+        _cfg(tmp_path, chain_provider=lambda *args, **kwargs:
+             _chain(bid=39.0, ask=44.0,
+                    quote_timestamp="2026-10-14T04:34:00+00:00")),
+    )
+    candidate = _candidate()
+    candidate["strategy"] = "mean_reversion"
+    candidate["setup"] = "mean_reversion"
+    candidate["metadata"] = {"setup": "mean_reversion"}
+
+    runtime.execute_plan(_plan(candidate), options, now=NOW)
+
+    position = next(iter(runtime._state["positions"].values()))
+    assert position["strategy"] == "mean_reversion"
+    assert position["setup"] == "mean_reversion"
+    orders = [payload for event, payload in trader.events if event == "order"]
+    assert orders and orders[0]["strategy"] == "mean_reversion"
+
+    closed = runtime.tick(now=datetime(2026, 10, 14, 10, 5, tzinfo=IST))
+    assert closed[0]["strategy"] == "mean_reversion"
+    assert closed[0]["setup"] == "mean_reversion"
 
 
 def test_hard_flat_does_not_mark_accepted_close_as_flat(tmp_path):
@@ -928,6 +1143,7 @@ def test_stale_refresh_never_falls_back_to_discovery_snapshot(tmp_path, monkeypa
 
 def test_stock_scan_preserves_bank_correlation_limit(tmp_path, monkeypatch):
     runtime, options, _, _ = _live_runtime(tmp_path, monkeypatch, ("HDFCBANK", "SBIN"))
+    runtime.mode_cfg["max_correlated_positions"] = 1
     placed = runtime.scan_and_execute(now=datetime(2026, 10, 14, 9, 35, tzinfo=IST))
     assert len(placed) == 1
     assert len(options.open_calls) == 1

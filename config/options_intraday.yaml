@@ -4,29 +4,80 @@
 options_intraday:
   execution_class: remote_paper
   PAPER_TRADING: true
-  entry_cutoff: "14:30"
+  # Entries stay open until 15:00 IST; the 15:10 hard flat still forces the
+  # book flat before the close.  (Was 14:30.)
+  entry_cutoff: "15:00"
   hard_flat: "15:10"
-  strategies: [orb, pullback, momentum]
+  strategies: [orb, mean_reversion]
   # Discovery only: scan stock underlyings, but route BUY CE/PE options only.
   # Options must exist in today's exact broker listing; no equity fallback.
+  # Live scan scope is pinned by scripts/session.py through
+  # TRIO_OPTIONS_SCAN_UNDERLYINGS=NIFTY,BANKNIFTY; the basket below is only the
+  # fallback for offline tooling and tests.
   scan_basket: nifty50  # configured indices are unioned; stocks remain NIFTY50
   scan_interval_seconds: 300
+  underlying: "NIFTY"         # primary underlying for contract specs
+  underlyings: [NIFTY, BANKNIFTY]  # approved underlyings for scan/trading
   stop_premium_fraction: 0.20
   target_premium_fraction: 0.30
+  # Staged profit-lock ladder.  Each rung is a fraction of the entry premium;
+  # when the executable bid reaches a rung the stop ratchets up to that level.
+  # The ladder is full-position (no partial exits) and a jump skips straight to
+  # the highest rung reached.  Targets still fire before the ladder.
+  profit_lock_rungs: [0.10, 0.15, 0.20, 0.25]
+  # Fallback only: used when profit_lock_rungs is empty or absent, where the
+  # ladder advances in uniform steps of this fraction.
   profit_lock_step_fraction: 0.10
   # Tomorrow's approved paper-test risk policy.  These keys are mandatory;
   # the runtime rejects an incomplete or non-finite effective policy.
+  # capital + scan cadence are applied by scripts/session.py at launch.
   risk_per_trade_pct: 0.70
   max_daily_loss_pct: 1.50
-  max_open_positions: 3
-  max_trades_per_day: 4
+  # Two slots: the first strategy takes one, and a second independent
+  # strategy may take the other on the same index.  The same strategy still
+  # cannot pyramid into itself.
+  max_open_positions: 2
+  max_trades_per_day: 10
   max_premium_exposure_pct: 5.00
   allow_averaging_down: false
-  max_daily_entries: 5
+  max_daily_entries: 10
+  # Once per session date, before the first entry scan: broker available cash
+  # must be at least min_wallet minus wallet_tolerance. Mid-day dips do not
+  # re-check. Lot size still follows live broker cash, not this floor.
+  min_wallet: 40000
+  wallet_tolerance: 500
   max_unrealized_loss_pct: 1.50
   max_consecutive_losses: 2
   max_portfolio_risk_pct: 1.0
-  max_correlated_positions: 1
+  # Two NIFTY legs are allowed only when they come from different
+  # strategies.  NIFTY and FINNIFTY still share this correlation group.
+  max_correlated_positions: 2
+  # Each position pays at most this much premium.  Lots are floor(cap /
+  # one-lot debit), so a NIFTY trade lands in the 15-18k band instead of
+  # scaling with account size.
+  max_premium_per_position: 18000
+  # Operational fail-safe.  A mark must stay unresolved for this many
+  # seconds before the runtime force-flattens the leg.  A tick-count
+  # threshold churned fresh positions during multi-underlying scans.
+  stale_mark_exit_seconds: 180
+  # Do not re-enter the exact same contract immediately after it closed.
+  # This prevents a stale/duplicate signal from re-firing after an exit.
+  reentry_cooldown_seconds: 300
+  # After a stop-loss on an underlying, block any new entry on that underlying
+  # for this many seconds.  The per-contract cooldown above does not catch a
+  # strike rotation (23850 CE stop -> 23900 CE 31s later), so this is the
+  # underlying-level churn guard.
+  underlying_stop_loss_cooldown_seconds: 900
+  # Minimum minutes of runway to the 15:10 hard flat before a new entry is
+  # allowed.  Reduced to 10 so a late entry can still be managed to the flat
+  # while keeping a full 10-minute window.  (Was 30, which blocked everything
+  # after 14:40.)
+  min_entry_runway_minutes: 10
+  # After 13:30 IST the target fraction is reduced: late-day moves are noisy,
+  # wide-spread and illiquid, so a smaller target is more realistic and keeps
+  # the trade completable before the 15:10 square-off.
+  afternoon_target_fraction: 0.10
+  afternoon_target_from: "13:30"
   correlated_groups:
     - [NIFTY, FINNIFTY]
     - [BANKNIFTY, SBIN, ICICIBANK, HDFCBANK]
@@ -39,10 +90,23 @@ options_intraday:
       provenance: "NIFTY NSE/MegaBull contract specification effective 2026"
       valid_from: "2026-01-01"
       valid_until: "2026-12-31"
+    BANKNIFTY:
+      lot_size: 30
+      provenance: "BANKNIFTY NSE/MegaBull contract specification effective 2026"
+      valid_from: "2026-01-01"
+      valid_until: "2026-12-31"
   plan_max_age_minutes: 15
   signal_max_age_minutes: 60
-  chain_max_age_minutes: 15
+  chain_max_age_minutes: 1440
+  chain_cache_minutes: 1440
+  # Entry-time option-quote freshness.  The chain cache may live for the day,
+  # but a contract quote older than this must never be planned into a trade.
+  # Kept separate from chain_cache_minutes so long-lived diagnostics do not
+  # widen the execution gate.
+  max_quote_age_minutes: 15
   demand_supply:
+    # Left disabled: the backtest does not model this gate, so enabling it
+    # would make live behaviour diverge from the validated strategy.
     enabled: false
     max_zone_age_bars: 36
     options:

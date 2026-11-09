@@ -11,9 +11,10 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import logging
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -21,12 +22,45 @@ from src.utils import get_logger, load_config, retry_with_backoff, utc_now
 
 logger = get_logger("data_fetcher")
 
+# 5m bars only change once per bar, so an intra-scan refetch is pure waste and
+# keeps the provider's rate limiter warm.  Keyed by the last *completed* bar so
+# a forming candle is never frozen mid-print.
+_CANDLE_CACHE: Dict[Tuple[str, str], Tuple[int, pd.DataFrame, datetime]] = {}
+_CANDLE_CACHE_LOCK = threading.Lock()
+_BAR_SECONDS = {"1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+                "1h": 3600, "90m": 5400, "1d": 86400}
+_CANDLE_FALLBACK_MAX_SECONDS = 900
+
+
+def _completed_bar_index(now: datetime, seconds: int) -> int:
+    """Epoch second marking the start of the most recent completed bar."""
+    epoch = int(now.timestamp())
+    return epoch - (epoch % seconds) - seconds
+
+
+def _trim_forming_bar(frame: pd.DataFrame, fetched_at: datetime,
+                      seconds: int) -> pd.DataFrame:
+    """Drop the still-forming candle before it is cached."""
+    if frame is None or frame.empty:
+        return frame
+    try:
+        last_ts = frame.index[-1]
+        if not isinstance(last_ts, datetime):
+            last_ts = pd.Timestamp(last_ts).to_pydatetime()
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        if last_ts + timedelta(seconds=seconds) > fetched_at:
+            return frame.iloc[:-1].copy()
+    except Exception:
+        return frame
+    return frame.copy()
+
 
 def _fetch_zerodha(symbol: str, timeframe: str, period: str) -> pd.DataFrame:
     """Fetch read-only candles from Zerodha and normalize to TRIO OHLCV."""
-    from src.zerodha_market_data import ZerodhaMarketData
+    from src.zerodha_market_data import get_shared_adapter
 
-    adapter = ZerodhaMarketData.from_env()
+    adapter = get_shared_adapter()
     rows = adapter.historical_symbol(symbol, timeframe, period)
     if not rows:
         raise ValueError(f"No Zerodha candles returned for {symbol}")
@@ -47,6 +81,44 @@ def _fetch_zerodha(symbol: str, timeframe: str, period: str) -> pd.DataFrame:
             frame[column] = 0.0 if column == "Volume" else pd.NA
     frame = frame[required].copy()
     frame.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    return frame
+
+
+def _fetch_zerodha_cached(symbol: str, timeframe: str,
+                          period: str) -> pd.DataFrame:
+    """Return completed-bar candles, reusing the cache within a bar.
+
+    On a provider failure, serve the last good frame when it is still within
+    the runtime's candle-freshness window; otherwise fail closed.
+    """
+    key = (str(symbol).strip().upper(), str(timeframe).lower())
+    seconds = _BAR_SECONDS.get(key[1])
+    now = datetime.now(timezone.utc)
+    with _CANDLE_CACHE_LOCK:
+        entry = _CANDLE_CACHE.get(key)
+    if seconds is None:
+        return _fetch_zerodha(symbol, timeframe, period)
+    if entry is not None:
+        bar_index, cached_frame, cached_at = entry
+        if bar_index == _completed_bar_index(now, seconds):
+            return cached_frame.copy()
+
+    try:
+        frame = _fetch_zerodha(symbol, timeframe, period)
+    except Exception as exc:
+        if entry is not None:
+            age = (now - entry[2]).total_seconds()
+            if age <= _CANDLE_FALLBACK_MAX_SECONDS:
+                logger.warning(
+                    "Zerodha candles failed for %s (%s); serving cached frame "
+                    "%.0fs old", symbol, exc, age)
+                return entry[1].copy()
+        raise
+
+    completed = _trim_forming_bar(frame, now, seconds)
+    with _CANDLE_CACHE_LOCK:
+        _CANDLE_CACHE[key] = (
+            _completed_bar_index(now, seconds), completed, now)
     return frame
 
 # ---------------------------------------------------------------------------
@@ -198,7 +270,7 @@ def fetch_market_data(
               or df_cfg.get("source", "zerodha"))
 
     if source == "zerodha":
-        df = _fetch_zerodha(symbol, timeframe, period)
+        df = _fetch_zerodha_cached(symbol, timeframe, period)
     elif source == "yfinance":
         df = _fetch_yfinance(symbol, timeframe, period)
     else:

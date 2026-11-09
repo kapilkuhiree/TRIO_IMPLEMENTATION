@@ -327,8 +327,14 @@ def _save_equity_snapshot() -> None:
         pass
 
 
-def update_pnl(pnl: float) -> None:
-    """Update the daily PnL (+ consecutive-loss/win + drawdown watermark)."""
+def update_pnl(pnl: float, *, counts_as_loss: bool = True) -> None:
+    """Update the daily PnL (+ consecutive-loss/win + drawdown watermark).
+
+    ``counts_as_loss`` is False for operational exits (for example a
+    fail-safe stale-mark flatten).  Those still move realized P&L, but they
+    must not trip the consecutive-loss circuit breaker: the strategy did not
+    make the decision, the data plumbing did.
+    """
     _risk_state.daily_pnl += pnl
     # watermark for drawdown (peak of today's realized equity)
     if _risk_state.daily_pnl > _risk_state.high_watermark:
@@ -344,8 +350,9 @@ def update_pnl(pnl: float) -> None:
     except Exception:
         pass
     if pnl < 0:
-        _risk_state.consecutive_losses += 1
-        _risk_state.consecutive_wins = 0
+        if counts_as_loss:
+            _risk_state.consecutive_losses += 1
+            _risk_state.consecutive_wins = 0
     elif pnl > 0:
         _risk_state.consecutive_wins += 1
         _risk_state.consecutive_losses = 0

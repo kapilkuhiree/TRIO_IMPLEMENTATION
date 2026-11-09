@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import os
 import re
 import time
 from typing import Any
@@ -27,6 +28,9 @@ import yaml
 
 from candidate_pipeline import CandidatePipeline
 from src import options_intraday_plan as planner
+from src.utils import get_logger
+
+logger = get_logger("options_live_scan")
 
 
 UNIVERSE_PATH = Path(__file__).resolve().parent.parent / "config" / "instrument_universe.yaml"
@@ -76,7 +80,12 @@ def _universe(cfg: dict) -> list[dict]:
     mode = cfg.get("options_intraday", {}) or {}
     configured = _configured_instruments(cfg)
     known = {_symbol(row.get("symbol")): row for row in configured}
-    if mode.get("scan_underlyings") is not None:
+    # The launcher pins the live scan scope in the environment (not the YAML
+    # overlay) so the offline suite keeps its wider basket default.
+    env_universe = os.environ.get("TRIO_OPTIONS_SCAN_UNDERLYINGS", "").strip()
+    if env_universe:
+        requested = _items(env_universe)
+    elif mode.get("scan_underlyings") is not None:
         requested = _items(mode["scan_underlyings"])
     else:
         from src.screener import BASKETS
@@ -121,6 +130,88 @@ def fetch_multiple(symbols, timeframe="5m", period="5d"):
     """Late-bound batch candle hook; injectable without changing global state."""
     from src.data_fetcher import fetch_multiple as fetch
     return fetch(symbols, timeframe=timeframe, period=period)
+
+def _session_vwap(candles) -> float | None:
+    """Volume-weighted average price for the latest trading session."""
+    if not candles:
+        return None
+
+    def _date_of(row):
+        raw = row.get("timestamp")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+        except (TypeError, ValueError):
+            return None
+
+    dates = [_date_of(row) for row in candles]
+    known = [d for d in dates if d is not None]
+    if not known:
+        return None
+    last_date = max(known)
+
+    pv = 0.0
+    volume = 0.0
+    for row in candles:
+        if _date_of(row) != last_date:
+            continue
+        try:
+            high = float(row.get("high"))
+            low = float(row.get("low"))
+            close = float(row.get("close"))
+            vol = float(row.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if close <= 0:
+            continue
+        typical = (high + low + close) / 3.0
+        if vol <= 0:
+            # Index feeds (^NSEI/^NSEBANK) report Volume=0 on yfinance.
+            # Fall back to an equal-weighted typical price so VWAP remains
+            # defined instead of rejecting every candidate.
+            pv += typical
+            volume += 1.0
+        else:
+            pv += typical * vol
+            volume += vol
+    if volume <= 0:
+        return None
+    return pv / volume
+
+
+def _signal_option_type(signal: Any) -> str:
+    """Resolve CE/PE from either a signal object or a planner candidate dict."""
+    if isinstance(signal, Mapping):
+        kind = str(signal.get("option_type") or "").upper()
+        if kind in {"CE", "PE"}:
+            return kind
+        direction = str(signal.get("direction") or "").strip().lower()
+        if direction in {"bullish", "bearish"}:
+            return "CE" if direction == "bullish" else "PE"
+        legs = (signal.get("option_legs") or {}).get("legs") or [{}]
+        kind = str((legs[0] or {}).get("kind") or "").upper()
+        return kind if kind in {"CE", "PE"} else ""
+    return str(getattr(signal, "option_type", "") or "").upper()
+
+
+def _vwap_allows(signal: Any, candles: List[Dict[str, Any]], symbol: str) -> Tuple[bool, str]:
+    """Trend filter: CE only above VWAP, PE only below VWAP."""
+    vwap = _session_vwap(candles)
+    if vwap is None:
+        return False, "vwap_unavailable"
+
+    # Get last close
+    last_close = float(candles[-1].get("close") or 0.0)
+    if last_close <= 0:
+        return False, "vwap_last_close_unavailable"
+
+    option_type = _signal_option_type(signal)
+    if option_type == "CE" and last_close < vwap:
+        return False, f"vwap_counter_trend(close={last_close:.2f}<vwap={vwap:.2f})"
+    if option_type == "PE" and last_close > vwap:
+        return False, f"vwap_counter_trend(close={last_close:.2f}>vwap={vwap:.2f})"
+    return True, ""
 
 
 def option_instruments():
@@ -178,6 +269,23 @@ def _expiry(value: Any) -> date | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError:
         return None
+
+
+def listing_contracts(rows: Any, underlyings: Any,
+                      now: Optional[datetime] = None) -> Dict[Tuple[Any, ...], Dict[str, Any]]:
+    """Public wrapper: vendor option rows -> approved index-option metadata.
+
+    Uses the same normalisation as :func:`build_live_options_scan`, so a
+    read-only listing check cannot drift from the execution path.  Rows may be
+    Zerodha snake_case or MegaBull camelCase (including display-name-only
+    rows); anything unusable is simply absent from the result.
+    """
+    current = now or datetime.now(planner.IST)
+    wanted = [str(item).upper() for item in (underlyings or ())]
+    universe = [{"symbol": symbol, "instrument_type": "index"}
+                for symbol in wanted]
+    diagnostic: Dict[str, Any] = {}
+    return _metadata(rows, universe, current, diagnostic)
 
 
 def _metadata(rows: Any, universe: list[dict], now: datetime, diagnostic: dict) -> dict:
@@ -349,7 +457,8 @@ def _enrich_chain(chain: Any, symbol: str, contracts: dict) -> tuple[dict, Count
         raise ValueError("chain_underlying_mismatch")
     retrieval = {**((chain.get("diagnostics") or {}).get("retrieval") or {}),
                  **(chain.get("retrieval") or {})}
-    if retrieval.get("served_from_cache") or retrieval.get("success") is False:
+    if (retrieval.get("served_from_cache") and not retrieval.get("cache_fallback")) or retrieval.get("success") is False:
+        logger.warning(f"CHAIN REJECTED: underlying={symbol} reason=chain_not_fresh_provider_response retrieval={retrieval}")
         raise ValueError("chain_not_fresh_provider_response")
     if str(chain.get("exchange") or "NSE").upper() != "NSE":
         raise ValueError("chain_exchange_mismatch")
@@ -554,6 +663,12 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
             diagnostics["fetch_errors"] += 1
             reject(symbol, "chain", "chain_unavailable")
             continue
+        chain_provider = chain.get("provider") or chain.get("source")
+        if chain_provider:
+            state["chain_provider"] = chain_provider
+            retrieval = chain.get("retrieval") or {}
+            if retrieval.get("fallback_reason"):
+                state["chain_fallback_reason"] = retrieval["fallback_reason"]
         try:
             enriched, rejected_quotes = _enrich_chain(chain, symbol, contracts)
             state["rejected_quotes"] = dict(rejected_quotes)
@@ -564,6 +679,19 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
             continue
         state["planner"] = deepcopy(plan.get("option_chain_diagnostic") or {})
         candidates = plan.get("option_candidates", []) or []
+        
+        # --- VWAP trend filter ---
+        kept_candidates = []
+        for candidate in candidates:
+            allowed, why = _vwap_allows(candidate, candles, symbol)
+            if allowed:
+                kept_candidates.append(candidate)
+            else:
+                logger.warning(f"CONTRACT REJECTED (VWAP Filter): underlying={symbol} reason={why}")
+                reject(symbol, "contract", why)
+        candidates = kept_candidates
+        # -------------------------
+
         accepted = 0
         for candidate in candidates:
             try:
@@ -572,14 +700,16 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
                 if score is None:
                     raise ValueError("invalid_rank_score")
             except (TypeError, ValueError) as exc:
+                logger.warning(f"CONTRACT REJECTED (Validation): underlying={symbol} reason={exc}")
                 reject(symbol, "contract", exc)
                 continue
             ranked.append((score, key, symbol, deepcopy(candidate)))
             accepted += 1
         if not accepted:
             diagnostics["contract_rejection"] += 1
-            reject(symbol, "contract", state["planner"].get("failure_reason", "no_eligible_candidate"),
-                   state["planner"])
+            reason = state["planner"].get("failure_reason", "no_eligible_candidate")
+            logger.warning(f"CONTRACT REJECTED (Planner/Selection): underlying={symbol} reason={reason} diagnostics={state['planner']}")
+            reject(symbol, "contract", reason, state["planner"])
             continue
         plans[symbol] = deepcopy(plan)
 

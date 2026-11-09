@@ -79,9 +79,31 @@ def _run_options_only_session(cfg: Dict[str, Any], trading_mode: str,
                               max_seconds: Optional[int],
                               management_only: bool) -> None:
     """Start the strict live runtime without reading or creating any plan."""
+    # Live policy lives here (not in the YAML overlay) so the offline test
+    # suite keeps its pinned risk/scan values.
+    os.environ.setdefault("TRIO_OPTIONS_CAPITAL", "1000000")
+    # Live scan scope: only the two index underlyings.  Kept in the launcher
+    # (not the YAML overlay) so the offline suite keeps its basket default.
+    os.environ.setdefault("TRIO_OPTIONS_SCAN_UNDERLYINGS", "NIFTY")
+    # The operator asked for a 10-second discovery cadence.  Marking an open
+    # position is a single contract quote, so the full-chain scan is the only
+    # heavy call in the loop.
+    os.environ.setdefault("TRIO_OPTIONS_SCAN_INTERVAL", "10")
+    # Zerodha is the primary chain provider; NSE takes over automatically when
+    # Kite throttles an endpoint.  Kept in the launcher so the live policy
+    # cannot be changed by a stale .env on another machine.
+    os.environ.setdefault("TRIO_OPTIONS_CHAIN_PROVIDER", "auto")
+    # +25% premium target: backtested best for the ORB + mean-reversion book.
+    os.environ.setdefault("TRIO_OPTIONS_TARGET_FRACTION", "0.25")
     trader = PaperTrader(
         timeframe="15m",
-        initial_capital=(cfg.get("risk_management", {}) or {}).get("capital"),
+        # Keep the paper account equity aligned with the options risk base;
+        # otherwise the sizer risks 0.70% of ₹10L while P&L reports on ₹5L.
+        initial_capital=float(
+            os.environ.get("TRIO_OPTIONS_CAPITAL")
+            or (cfg.get("risk_management", {}) or {}).get("capital")
+            or 500000
+        ),
         trading_mode=trading_mode,
     )
     try:

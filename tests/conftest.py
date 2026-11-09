@@ -32,8 +32,10 @@ def _reset_offline_environment():
     os.environ["TRIO_REMOTE_REQUIRED"] = "0"
     os.environ["TRIO_TEST_MODE"] = "1"
     os.environ["TRIO_LIVE"] = "0"
+    os.environ["TRIO_OPTIONS_LIVE"] = "0"
     os.environ["PYTHON_DOTENV_DISABLED"] = "1"
     os.environ.pop("TRIO_TRADING_MODE", None)
+    os.environ.pop("TRIO_LIVE_SESSION_DATE", None)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -50,6 +52,7 @@ def _restore_offline_broker_environment(monkeypatch):
     monkeypatch.setenv("TRIO_REMOTE_REQUIRED", "0")
     monkeypatch.setenv("TRIO_TEST_MODE", "1")
     monkeypatch.setenv("TRIO_LIVE", "0")
+    monkeypatch.setenv("TRIO_OPTIONS_LIVE", "0")
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
     try:
         yield

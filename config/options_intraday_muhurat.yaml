@@ -1,0 +1,100 @@
+# ============================================================================
+# TRIO — Diwali Muhurat 2026 live overlay (ONE-OFF: 2026-11-08 only)
+# Author: Kapil Kuhire <kapilkuhire89@gmail.com>
+#
+# Loaded only by scripts/muhurat_live.py together with TRIO_OPTIONS_LIVE=1.
+# It is a complete mode section, not a patch, so normal paper sessions never
+# read it.  Differences from config/options_intraday.yaml are commented.
+#
+# Live path requirements enforced by validate_options_mode_environment():
+#   TRIO_OPTIONS_LIVE=1, TRIO_BROKER_PROVIDER=zerodha,
+#   execution_class=live, live_session_date == today IST.
+# ============================================================================
+
+options_intraday:
+  execution_class: live                 # was remote_paper
+  PAPER_TRADING: false                  # was true; live requires false
+  live_session_date: "2026-11-08"       # hard date lock for this session
+  broker_provider: "zerodha"
+
+  # Muhurat F&O window: 14:20 open, 15:40 close.  Entries stop 15:05 and the
+  # book is flat at 15:15, leaving a 25-minute buffer before the exchange
+  # close.  The matching special session lives in config/market.yaml.
+  entry_cutoff: "15:05"
+  hard_flat: "15:15"
+  min_entry_runway_minutes: 10
+
+  # ORB is intentionally disabled on Sunday: its opening range is 09:15-09:30
+  # and cannot be formed from a 14:20 open.  Normal days keep both strategies.
+  strategies: [mean_reversion]
+
+  scan_basket: nifty50
+  scan_underlyings: [NIFTY, BANKNIFTY]
+  scan_interval_seconds: 10
+  underlying: "NIFTY"
+  underlyings: [NIFTY, BANKNIFTY]
+
+  stop_premium_fraction: 0.20
+  target_premium_fraction: 0.30
+  # The ladder is retained, but the normal afternoon rule (10% target after
+  # 13:30) fires first during this entirely-afternoon session.  That matches
+  # the behaviour the bot already runs late in a normal day.
+  profit_lock_rungs: [0.10, 0.15, 0.20, 0.25]
+  profit_lock_step_fraction: 0.10
+  afternoon_target_fraction: 0.10
+  afternoon_target_from: "13:30"
+
+  # Notional risk capital used for sizing, exactly like the paper session.
+  # The real cash floor is min_wallet below; available cash is checked again
+  # by the broker-bound sizing bound immediately before every order.
+  capital: 300000
+  risk_per_trade_pct: 1.50
+  max_daily_loss_pct: 1.50
+  max_premium_exposure_pct: 10.00     # 30,000 of notional capital
+  max_open_positions: 1               # one position at a time
+  max_trades_per_day: 3
+  max_daily_entries: 3
+  allow_averaging_down: false
+  max_correlated_positions: 1
+  max_premium_per_position: 20000
+
+  min_wallet: 40000
+  wallet_tolerance: 500
+  max_unrealized_loss_pct: 1.50
+  max_consecutive_losses: 2
+  max_portfolio_risk_pct: 1.0
+
+  stale_mark_exit_seconds: 180
+  reentry_cooldown_seconds: 300
+  underlying_stop_loss_cooldown_seconds: 900
+
+  correlated_groups:
+    - [NIFTY, FINNIFTY]
+    - [BANKNIFTY, SBIN, ICICIBANK, HDFCBANK]
+    - [RELIANCE, TCS, INFY]
+
+  # Contract identity is revalidated against the live Kite NFO dump before
+  # every order; these values must match the broker listing.
+  contract_specs:
+    NIFTY:
+      lot_size: 65
+      provenance: "NIFTY NSE contract specification effective 2026"
+      valid_from: "2026-01-01"
+      valid_until: "2026-12-31"
+    BANKNIFTY:
+      lot_size: 30
+      provenance: "BANKNIFTY NSE contract specification effective 2026"
+      valid_from: "2026-01-01"
+      valid_until: "2026-12-31"
+
+  plan_max_age_minutes: 15
+  signal_max_age_minutes: 60
+  chain_max_age_minutes: 15
+  chain_cache_minutes: 5
+  max_quote_age_minutes: 15
+
+  demand_supply:
+    enabled: false
+    max_zone_age_bars: 36
+    options:
+      max_zone_age_bars: 36

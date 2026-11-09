@@ -258,12 +258,14 @@ class CandidatePipeline:
         from strategies.momentum_continuation_strategy import (
             MomentumContinuationStrategy,
         )
+        from strategies.mean_reversion_strategy import MeanReversionStrategy
 
         key = str(strategy_name or "").strip().lower()
         strategy_types = {
             "orb": OrbStrategy,
             "pullback": TrendPullbackStrategy,
             "momentum": MomentumContinuationStrategy,
+            "mean_reversion": MeanReversionStrategy,
         }
         strategy_type = strategy_types.get(key)
         if strategy_type is None or not candles:
@@ -274,13 +276,17 @@ class CandidatePipeline:
         if index < 0 or index >= len(candles):
             return []
 
-        strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
-        signal = strategy.evaluate_signal(
-            candles,
-            index,
-            specs,
-            underlying_symbol=underlying_symbol,
-        )
+        if key == "mean_reversion":
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(candles, index)
+        else:
+            strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
 
         if isinstance(signal, dict):
             signal_dict = signal
@@ -313,6 +319,7 @@ class CandidatePipeline:
                 "orb": "ORB",
                 "pullback": "Pullback",
                 "momentum": "Momentum",
+                "mean_reversion": "MeanReversion",
             }[key],
             direction=cls._trade_direction(signal_dict),
             option_type=option_type,

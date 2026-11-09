@@ -64,9 +64,36 @@ _REQUIRED_RISK_KEYS = (
     "PAPER_TRADING",
 )
 
+_TRUTHY = {"1", "true", "yes", "on", "y"}
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in _TRUTHY
+
+
+def options_live_requested() -> bool:
+    """True only when the operator explicitly opted into live options.
+
+    Deliberately environment-only: a config file can never turn live trading
+    on by itself.  The live path is additionally date-locked in
+    :func:`validate_options_mode_environment`.
+    """
+    return _truthy(os.environ.get("TRIO_OPTIONS_LIVE"))
+
+
+def live_session_date(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Declared one-off live session date (``YYYY-MM-DD``)."""
+    mode = (cfg or {}).get("options_intraday", {}) or {}
+    return str(mode.get("live_session_date") or
+               os.environ.get("TRIO_LIVE_SESSION_DATE") or "").strip()
+
 
 def validate_options_intraday_risk_config(
     mode_cfg: Optional[Dict[str, Any]],
+    *,
+    live: bool = False,
 ) -> Tuple[bool, str]:
     """Validate the complete effective remote-paper risk policy.
 
@@ -97,7 +124,13 @@ def validate_options_intraday_risk_config(
         return False, "options_intraday risk key is invalid: allow_averaging_down"
     if mode_cfg.get("allow_averaging_down"):
         return False, "options_intraday allow_averaging_down must be false"
-    if mode_cfg.get("PAPER_TRADING") is not True:
+    paper_flag = mode_cfg.get("PAPER_TRADING")
+    if live:
+        # Only the live branch is stricter: a missing or truthy flag must not
+        # be able to reach a real broker.
+        if paper_flag is not False:
+            return False, "live options requires PAPER_TRADING=false"
+    elif not paper_flag:
         return False, "options_intraday requires PAPER_TRADING=true"
 
     stop_fraction = _finite(mode_cfg.get("stop_premium_fraction"))
@@ -191,7 +224,8 @@ def load_options_intraday_config(
 
     mode_cfg = _deep_merge(_DEFAULTS, overlay)
     mode_cfg = _deep_merge(mode_cfg, result.get("options_intraday", {}) or {})
-    valid, reason = validate_options_intraday_risk_config(mode_cfg)
+    valid, reason = validate_options_intraday_risk_config(
+        mode_cfg, live=options_live_requested())
     if not valid:
         raise ValueError(reason)
     result["options_intraday"] = mode_cfg
@@ -349,6 +383,32 @@ def _configured_underlyings(settings: Dict[str, Any]) -> Iterable[str]:
     return {configured}
 
 
+def _configured_lot_size(cfg: Dict[str, Any], settings: Dict[str, Any],
+                         underlying: str) -> Optional[int]:
+    """Resolve the lot size that a listed contract must match.
+
+    ``contract_specs`` may be a per-underlying mapping (NIFTY 65, BANKNIFTY
+    30) or one flat spec for a single-underlying deployment.  The old code
+    compared every underlying against the global ``options.lot_size`` (65),
+    which silently rejected BANKNIFTY candidates even though the planner had
+    selected the correct 30-lot contract.
+    """
+    mode_cfg = cfg.get("options_intraday", {}) or {}
+    specs = mode_cfg.get("contract_specs")
+    if isinstance(specs, dict):
+        entry = specs.get(str(underlying).upper())
+        if not isinstance(entry, dict) and "lot_size" in specs:
+            entry = specs
+        if isinstance(entry, dict):
+            value = _finite(entry.get("lot_size"))
+            if value is not None and value > 0 and value.is_integer():
+                return int(value)
+    value = _finite(settings.get("lot_size", 65))
+    if value is None or value <= 0 or not value.is_integer():
+        return None
+    return int(value)
+
+
 def validate_option_candidate(
     candidate: Dict[str, Any],
     plan: Optional[Dict[str, Any]] = None,
@@ -420,8 +480,8 @@ def validate_option_candidate(
     lot_size = option.get("lot_size", candidate.get("lot_size"))
     if isinstance(lot_size, bool) or not isinstance(lot_size, int) or lot_size <= 0:
         return False, "missing or invalid contract lot size"
-    configured_lot = _finite(settings.get("lot_size", 65))
-    if configured_lot is None or lot_size != int(configured_lot):
+    configured_lot = _configured_lot_size(dict(cfg), settings, underlying)
+    if configured_lot is None or lot_size != configured_lot:
         return False, "contract lot size mismatch"
 
     chain = (plan or {}).get("option_chain")
@@ -525,30 +585,53 @@ def is_live_execution(cfg: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def validate_options_mode_environment(cfg: Dict[str, Any]) -> Tuple[bool, str]:
-    """Require MegaBull remote paper and reject every live/local fallback."""
-    if is_live_execution(cfg):
-        return False, "options_intraday rejects live execution"
+    """Validate the remote-paper policy or the explicit, date-locked live path."""
+    mode_cfg = cfg.get("options_intraday", {}) or {}
+    if not mode_cfg:
+        mode_cfg = cfg
+    live = options_live_requested()
     provider = str(os.environ.get("TRIO_BROKER_PROVIDER") or
                    (cfg.get("broker", {}) or {}).get("provider", "")).strip().lower()
+
+    shadow = os.environ.get("TRIO_ALLOW_LOCAL_OPTION_SHADOW")
+    if shadow is not None and _truthy(shadow):
+        return False, "options_intraday forbids local option shadowing"
+    if (cfg.get("execution", {}) or {}).get("allow_local_option_shadow") is True:
+        return False, "options_intraday forbids local option shadowing"
+
+    valid_risk, risk_reason = validate_options_intraday_risk_config(
+        mode_cfg, live=live)
+    if not valid_risk:
+        return False, risk_reason
+
+    if live:
+        # One-off, operator-declared live session.  Every condition here must
+        # hold; a stale flag, wrong broker or wrong date is a hard refusal.
+        if provider != "zerodha":
+            return False, "live options requires TRIO_BROKER_PROVIDER=zerodha"
+        if str(mode_cfg.get("execution_class", "")).strip().lower() != "live":
+            return False, "live options requires execution_class=live"
+        if _truthy(os.environ.get("PAPER_TRADING")):
+            return False, "live options requires PAPER_TRADING=false"
+        expected = live_session_date(cfg)
+        from src.market_clock import IST as _IST
+        today = datetime.now(_IST).date().isoformat()
+        if not expected or expected != today:
+            return False, "live options is restricted to its declared session date"
+        return True, ""
+
+    if is_live_execution(cfg):
+        return False, "options_intraday rejects live execution"
     if provider != "megabull":
         return False, "options_intraday requires TRIO_BROKER_PROVIDER=megabull"
     remote = os.environ.get("TRIO_REMOTE_REQUIRED")
     remote_required = (str(remote).strip().lower() in {"1", "true", "yes", "on", "y"}
                        if remote is not None else
-                       bool((cfg.get("execution", {}) or {}).get(
-                           "remote_paper_required", False)))
+                       (bool((cfg.get("execution", {}) or {}).get("remote_paper_required", False)) or
+                        str(cfg.get("execution_class", "")) == "remote_paper" or
+                        str(cfg.get("options_intraday", {}).get("execution_class", "")) == "remote_paper"))
     if not remote_required:
         return False, "options_intraday requires remote paper execution"
-    shadow = os.environ.get("TRIO_ALLOW_LOCAL_OPTION_SHADOW")
-    if shadow is not None and str(shadow).strip().lower() in {
-            "1", "true", "yes", "on", "y"}:
-        return False, "options_intraday forbids local option shadowing"
-    if (cfg.get("execution", {}) or {}).get("allow_local_option_shadow") is True:
-        return False, "options_intraday forbids local option shadowing"
-    mode_cfg = cfg.get("options_intraday", {}) or {}
-    valid_risk, risk_reason = validate_options_intraday_risk_config(mode_cfg)
-    if not valid_risk:
-        return False, risk_reason
     paper_env = os.environ.get("PAPER_TRADING")
     paper_env_enabled = {
         "1", "true", "yes", "on", "y"
@@ -571,7 +654,8 @@ __all__ = [
     "COMBINED", "DEFAULT_TRADING_MODE", "NOT_READY_FOR_OPTIONS_PNL",
     "OPTIONS_INTRADAY",
     "combined_mode_enabled",
-    "is_live_execution", "load_options_intraday_config",
+    "is_live_execution", "live_session_date",
+    "load_options_intraday_config", "options_live_requested",
     "options_intraday_config", "options_intraday_enabled",
     "parse_exchange_timestamp",
     "parse_timestamp", "resolve_trading_mode", "strict_options_enabled",

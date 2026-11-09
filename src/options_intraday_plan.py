@@ -18,13 +18,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from candidate_pipeline import CandidatePipeline, OptionsCandidate
 from contract_selector import select_option_contract
 from src.demand_supply import confirm_demand_supply, demand_supply_enabled
+from src.utils import get_logger
+
+logger = get_logger("options_intraday_plan")
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
 UTC = timezone.utc
 BAR_SIZE = timedelta(minutes=5)
 DEFAULT_STRATEGIES = ("orb", "pullback", "momentum")
-ALLOWED_STRATEGIES = set(DEFAULT_STRATEGIES)
+# mean_reversion was added to the live planner after backtesting showed the
+# momentum branch loses in every window; it is opt-in via the mode config.
+ALLOWED_STRATEGIES = set(DEFAULT_STRATEGIES) | {"mean_reversion"}
 NSE_OPEN = time(9, 15)
 NSE_LAST_BAR_START = time(15, 10)
 
@@ -874,6 +879,9 @@ def build_intraday_plan(
         plan_diag["failure_reason"] = "no_strategy_signal"
         plan["option_chain_diagnostic"] = plan_diag
         return plan
+
+    # LOGGING ADDED HERE: Log if candidates exist but are rejected
+    logger.warning(f"PLANNER: {len(candidates)} candidates generated, checking eligibility")
 
     selected: List[Tuple[OptionsCandidate, Dict[str, Any], float]] = []
     rejected = []

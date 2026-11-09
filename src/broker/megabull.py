@@ -329,6 +329,19 @@ class MegaBullBroker(BaseBroker):
                 if resp.status_code == 401:
                     self._auth_failed = True
                     raise PermissionError("MegaBull 401: bad/expired api-key")
+                if resp.status_code >= 400:
+                    # Keep the requests.HTTPError contract, but append the
+                    # broker body: an empty "402 Client Error" is impossible
+                    # to act on.
+                    body = (getattr(resp, "text", "") or "")[:500]
+                    try:
+                        resp.raise_for_status()
+                    except requests.HTTPError as exc:
+                        raise requests.HTTPError(
+                            f"{exc} | {body}", response=resp) from exc
+                    raise requests.HTTPError(
+                        f"MegaBull {resp.status_code} | {body}",
+                        response=resp)
                 resp.raise_for_status()
                 return resp.json()
             except PermissionError:
@@ -349,6 +362,19 @@ class MegaBullBroker(BaseBroker):
                 if resp.status_code == 401:
                     self._auth_failed = True
                     raise PermissionError("MegaBull 401: bad/expired api-key")
+                if resp.status_code >= 400:
+                    # Keep the requests.HTTPError contract, but append the
+                    # broker body: an empty "402 Client Error" is impossible
+                    # to act on.
+                    body = (getattr(resp, "text", "") or "")[:500]
+                    try:
+                        resp.raise_for_status()
+                    except requests.HTTPError as exc:
+                        raise requests.HTTPError(
+                            f"{exc} | {body}", response=resp) from exc
+                    raise requests.HTTPError(
+                        f"MegaBull {resp.status_code} | {body}",
+                        response=resp)
                 resp.raise_for_status()
                 return resp.json()
             except PermissionError:

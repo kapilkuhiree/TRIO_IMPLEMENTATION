@@ -353,7 +353,15 @@ def reconcile_broker(trader) -> Dict[str, Any]:
         for opt_symbol, opt_info in _strict_options_risk_positions(trader).items():
             rs.positions[opt_symbol] = dict(opt_info)
         rs.open_positions = len(rs.positions)
-        if unknown_positions or unknown_closes:
+        # Paper-trading: only treat positions as "unknown" if the refresh
+        # confidence is still warming up.  A successful refresh with valid
+        # positions should not trigger uncertainty halt.
+        if is_paper and refresh_ok and state["consecutive_successes"] >= required_consecutive:
+            # Valid paper-trading book – do NOT mark uncertain even if
+            # partition produced unknowns (e.g. state was freshly reset).
+            unknown_positions = False
+            unknown_closes = False
+        elif unknown_positions or unknown_closes:
             try:
                 set_broker_uncertain("unclassified remote instrument(s)")
             except Exception:

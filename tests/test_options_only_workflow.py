@@ -25,6 +25,31 @@ def test_options_overlay_defaults_to_nifty50_scan():
     assert overlay["options_intraday"]["scan_basket"] == "nifty50"
 
 
+def test_options_overlay_declares_staged_profit_lock_ladder():
+    overlay = yaml.safe_load(
+        (ROOT / "config" / "options_intraday.yaml").read_text(encoding="utf-8")
+    )["options_intraday"]
+    assert overlay["profit_lock_rungs"] == [0.10, 0.15, 0.20, 0.25]
+    # Uniform step remains as the documented fallback.
+    assert overlay["profit_lock_step_fraction"] == 0.10
+
+
+def test_options_overlay_allows_two_independent_strategy_slots():
+    """Two slots, each capped at the 15-18k premium band.
+
+    The same strategy still cannot pyramid into itself, but a second
+    strategy on NIFTY must have a free slot and a raised correlation cap.
+    """
+    overlay = yaml.safe_load(
+        (ROOT / "config" / "options_intraday.yaml").read_text(encoding="utf-8")
+    )["options_intraday"]
+
+    assert overlay["allow_averaging_down"] is False
+    assert overlay["max_correlated_positions"] == 2
+    assert overlay["max_open_positions"] == 2
+    assert overlay["max_premium_per_position"] == 18000
+
+
 def test_scheduled_workflows_are_options_only():
     premarket_text = (ROOT / ".github" / "workflows" / "premarket.yml").read_text(encoding="utf-8")
     assert "TRIO_TRADING_MODE: options_intraday" in premarket_text

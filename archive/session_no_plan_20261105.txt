@@ -1,0 +1,16 @@
+﻿python : [2026-11-05 10:42:52] INFO     trio.broker.megabull.megabull — MegaBull broker initialized 
+(base=https://api.megabull.in)
+At line:1 char:302
++ ... tch {} } }; python scripts/session.py --trading-mode options_intraday ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([2026-11-05 10:...pi.megabull.in):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[2026-11-05 10:42:53] INFO     trio.broker.megabull.megabull — MegaBull broker initialized 
+(base=https://api.megabull.in)
+[2026-11-05 10:42:53] INFO     trio.paper_trader.paper_trader — Broker provider: MegaBull (remote paper fills).
+[2026-11-05 10:42:53] INFO     trio.paper_trader.paper_trader — PaperTrader initialized: 15 symbols, timeframe=15m, 
+capital=1000000.00, mode=options_intraday
+[2026-11-05 10:42:53] WARNING  trio.alerts.alerts — Telegram credentials not set (kind=options)
+[2026-11-05 10:42:53] INFO     trio.broker.megabull_options.megabull_options — MegaBull options broker initialized 
+(lot=65)

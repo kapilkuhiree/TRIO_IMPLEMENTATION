@@ -229,6 +229,14 @@ class OrbStrategy:
             # Check for CONFIRMED breakout (close above OR high)
             # No random outcome generation - signal is deterministic based on price action
             if current_close > orb_high:
+                # --- VWAP Trend Filter ---
+                from src.options_live_scan import _session_vwap
+                vwap = _session_vwap(candles_5min[:index + 1])
+                if vwap and current_close < vwap:
+                    result.reasoning = f"ORB breakout rejected: close {current_close:.2f} < VWAP {vwap:.2f}"
+                    return result
+                # -------------------------
+
                 # Confirmed bullish breakout
                 result.allowed = True
                 result.variant = "bullish"
@@ -250,6 +258,14 @@ class OrbStrategy:
             # Check for CONFIRMED breakdown (close below OR low)
             # No random outcome generation - signal is deterministic based on price action
             if current_close < orb_low:
+                # --- VWAP Trend Filter ---
+                from src.options_live_scan import _session_vwap
+                vwap = _session_vwap(candles_5min[:index + 1])
+                if vwap and current_close > vwap:
+                    result.reasoning = f"ORB breakdown rejected: close {current_close:.2f} > VWAP {vwap:.2f}"
+                    return result
+                # -------------------------
+
                 # Confirmed bearish breakdown
                 result.allowed = True
                 result.variant = "bearish"
