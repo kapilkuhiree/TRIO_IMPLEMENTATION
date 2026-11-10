@@ -37,6 +37,27 @@ def _underlyings(values: Iterable[str]) -> List[str]:
     return result
 
 
+def _strike_range(value: str):
+    """Parse ``UNDERLYING=MIN:MAX`` for ``--strike-range``."""
+    try:
+        name, bounds = str(value).split("=", 1)
+        low, high = bounds.split(":", 1)
+        low_value = float(low) if low.strip() else None
+        high_value = float(high) if high.strip() else None
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "expected UNDERLYING=MIN:MAX, e.g. NIFTY=22000:23000") from exc
+    name = name.strip().upper()
+    if not name:
+        raise argparse.ArgumentTypeError("underlying name is required")
+    if (low_value is not None and low_value <= 0) or (
+            high_value is not None and high_value <= 0):
+        raise argparse.ArgumentTypeError("strike bounds must be positive")
+    if low_value is not None and high_value is not None and low_value > high_value:
+        raise argparse.ArgumentTypeError("strike min cannot exceed max")
+    return name, (low_value, high_value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read-only Zerodha NFO CE/PE history and quote-depth capture")
@@ -56,8 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Capture one cycle and stop")
     parser.add_argument("--max-contracts", type=int, default=None,
                         help="Optional active-contract sample limit")
-    parser.add_argument("--strike-min", type=float, default=None)
-    parser.add_argument("--strike-max", type=float, default=None)
+    parser.add_argument("--strike-min", type=float, default=None,
+                        help="Global strike floor for underlyings without --strike-range")
+    parser.add_argument("--strike-max", type=float, default=None,
+                        help="Global strike ceiling for underlyings without --strike-range")
+    parser.add_argument("--strike-range", action="append", default=[],
+                        type=_strike_range, metavar="UNDERLYING=MIN:MAX",
+                        help="Per-underlying strike window; repeat per underlying "
+                             "(e.g. --strike-range NIFTY=22000:23000 "
+                             "--strike-range BANKNIFTY=54000:56000). "
+                             "Overrides the global floor/ceiling for that name.")
     parser.add_argument("--quote-batch-size", type=int, default=200)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--backoff-seconds", type=float, default=1.0)
@@ -79,7 +108,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings = CaptureSettings(
             underlyings=tuple(names), interval=args.interval, period=args.period,
             max_contracts=args.max_contracts, strike_min=args.strike_min,
-            strike_max=args.strike_max, quote_batch_size=args.quote_batch_size,
+            strike_max=args.strike_max, strike_ranges=dict(args.strike_range or []),
+            quote_batch_size=args.quote_batch_size,
             collect_candles=not args.no_candles, collect_quotes=not args.no_quotes,
             max_retries=args.max_retries, backoff_seconds=args.backoff_seconds,
             rate_limit_seconds=args.rate_limit_seconds,

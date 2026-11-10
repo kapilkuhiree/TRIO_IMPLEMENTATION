@@ -24,6 +24,9 @@ def _cfg(symbols=("NIFTY",)):
     return {
         "options_intraday": {
             "scan_underlyings": list(symbols), "strategies": ["orb"],
+            # Fixtures here use a single confirmed close; the shipped overlay
+            # raises this to 2 and is covered separately.
+            "orb_confirm_closes": 1,
             "min_oi": 2000, "max_spread_pct": 3.0,
             "max_daily_loss_pct": 0.7, "risk_per_trade_pct": 0.25,
             "max_open_positions": 2,
@@ -96,8 +99,10 @@ def signal_boundary(monkeypatch):
     """Control signals while retaining real identity/completion validation."""
     calls = []
 
-    def evaluate(candles, strategy, *, underlying_symbol, contract_specs, index):
-        calls.append((underlying_symbol, deepcopy(candles), deepcopy(contract_specs)))
+    def evaluate(candles, strategy, *, underlying_symbol, contract_specs, index,
+                 orb_confirm_closes=1):
+        calls.append((underlying_symbol, deepcopy(candles), deepcopy(contract_specs),
+                      orb_confirm_closes))
         assert index == len(candles) - 1
         assert all(row["underlying_symbol"] == underlying_symbol for row in candles)
         assert all(datetime.fromisoformat(row["timestamp"]) + timedelta(minutes=5) <= NOW
@@ -533,3 +538,119 @@ def test_slow_scan_checks_quotes_at_observation_time_not_frozen_start(monkeypatc
     assert result["diagnostics"]["selected"] == 1
     candidate = result["snapshots"][0]["option_candidates"][0]
     assert candidate["option_diagnostic"]["quote_age_seconds"] == 60
+
+
+def _strategy_candidate(symbol, strategy, score, *, kind="CE", strike=100):
+    return {
+        **_candidate(symbol, score, strike=strike, kind=kind),
+        "strategy": strategy,
+        "direction": "bullish" if kind == "CE" else "bearish",
+    }
+
+
+def _shadow_cfg(symbols, *, shadow=("mean_reversion",), strategies=("orb",)):
+    cfg = _cfg(symbols)
+    cfg["options_intraday"]["strategies"] = list(strategies)
+    if shadow is not None:
+        cfg["options_intraday"]["shadow_strategies"] = list(shadow)
+    return cfg
+
+
+def test_shadow_off_is_byte_identical_to_today(monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [_strategy_candidate(symbol, "orb", 100)],
+                "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    inputs = dict(instrument_rows=[_metadata()],
+                  market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+                  chain_provider=lambda *args, **kwargs: _chain("NIFTY"))
+    without_key = scan.build_live_options_scan(_cfg(["NIFTY"]), now=NOW, **inputs)
+    empty_shadow = scan.build_live_options_scan(
+        _shadow_cfg(["NIFTY"], shadow=[]), now=NOW, **inputs)
+    assert without_key == empty_shadow
+    assert without_key["shadow"] == []
+    assert without_key["diagnostics"]["shadow_signals"] == 0
+
+
+def test_shadow_signal_is_logged_but_never_enters_tradable_pool(monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, "orb", 100),
+            _strategy_candidate(symbol, "mean_reversion", 200),
+        ], "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    cfg = _shadow_cfg(["NIFTY"], strategies=("orb", "mean_reversion"))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW, instrument_rows=[_metadata()],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=lambda *args, **kwargs: _chain("NIFTY"))
+
+    tradable = [candidate for snapshot in result["snapshots"]
+                for candidate in snapshot["option_candidates"]]
+    assert [candidate["strategy"] for candidate in tradable] == ["orb"]
+    assert result["diagnostics"]["selected"] == 1
+    assert len(result["shadow"]) == 1
+    shadow = result["shadow"][0]
+    assert shadow["strategy"] == "mean_reversion"
+    assert shadow["kind"] == "CE" and shadow["strike"] == 100
+    assert shadow["collides_with_tradable"] is True
+    assert shadow["vwap_would_block"] is False
+    assert result["diagnostics"]["shadow_signals"] == 1
+    assert result["diagnostics"]["shadow_contract_collisions"] == 1
+
+
+def test_shadow_only_signal_reports_no_contract_rejection_and_no_snapshot(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, "mean_reversion", 100, kind="PE"),
+        ], "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    cfg = _shadow_cfg(["NIFTY"], strategies=("mean_reversion",))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW,
+        instrument_rows=[_metadata(), _metadata(kind="PE")],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=lambda *args, **kwargs: _chain("NIFTY"))
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["contract_rejection"] == 0
+    assert len(result["shadow"]) == 1
+    shadow = result["shadow"][0]
+    assert shadow["option_type"] == "PE"
+    # Breakout close above VWAP is counter-trend for a PE; recorded, not acted on.
+    assert shadow["vwap_would_block"] is True
+    assert shadow["vwap_reason"].startswith("vwap_counter_trend")
+    assert result["diagnostics"]["shadow_vwap_blocked"] == 1
+    assert result["diagnostics"]["shadow_contract_collisions"] == 0
+
+
+def test_orb_confirmation_count_defaults_to_one_and_comes_from_config(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [_strategy_candidate(symbol, "orb", 100)],
+                "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    inputs = dict(
+        instrument_rows=[_metadata()],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=lambda *args, **kwargs: _chain("NIFTY"),
+    )
+
+    scan.build_live_options_scan(_cfg(["NIFTY"]), now=NOW, **inputs)
+    assert signal_boundary[0][3] == 1
+
+    signal_boundary.clear()
+    cfg = _cfg(["NIFTY"])
+    cfg["options_intraday"]["orb_confirm_closes"] = 2
+    scan.build_live_options_scan(cfg, now=NOW, **inputs)
+    assert signal_boundary[0][3] == 2

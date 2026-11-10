@@ -155,6 +155,17 @@ def _strategy_scope(strategy: Any) -> str:
     return str(strategy or "").strip().lower() or "default"
 
 
+def _config_key(value: Any) -> str:
+    """Normalize a config/strategy name for tolerant matching.
+
+    Candidate strategy names reach the runtime lowercased from the planner
+    (``meanreversion``, ``orb-retest``) while config keys are written with
+    underscores (``mean_reversion``, ``orb_retest``).  Stripping everything
+    but letters and digits makes both forms match.
+    """
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
 # Exit reasons that must never count as a losing trade.  A ratchet/trailing
 # stop that closes above the entry premium is a locked-in profit, not a
 # stop-loss, so it must not increment consecutive losses or arm the
@@ -269,6 +280,12 @@ class OptionsIntradayRuntime:
         # every new session date in _roll_daily_state.  Keyed by
         # (strategy, underlying) so strategies never block each other.
         self._underlying_stop_times: Dict[Tuple[str, str], datetime] = {}
+        # Any-exit cooldown state.  Kept separate from the stop-loss map so a
+        # profitable trailing/target exit never arms the loss-streak guard.
+        # Used by the loss-only re-entry cooldown so a winner never blocks the
+        # next valid setup.
+        self._underlying_exit_times: Dict[Tuple[str, str], datetime] = {}
+        self._underlying_last_exit_loss: Dict[Tuple[str, str], bool] = {}
         self._chain_provider = self.mode_cfg.get("chain_provider")
         self._bar_provider = self.mode_cfg.get("completed_bar_provider")
         self._roll_daily_state(_now_ist(None).date().isoformat())
@@ -354,6 +371,8 @@ class OptionsIntradayRuntime:
             self._state["wallet_floor_checked_on"] = ""
             # A new session must not inherit yesterday's churn guard.
             self._underlying_stop_times = {}
+            self._underlying_exit_times = {}
+            self._underlying_last_exit_loss = {}
             # A new session must never inherit yesterday's mark flags; a stale
             # "unresolved" bit would otherwise leave a live leg unmanaged.
             for position in (self._state.get("positions", {}) or {}).values():
@@ -1203,6 +1222,51 @@ class OptionsIntradayRuntime:
         if underlying and not self._underlying_stop_loss_cooldown_elapsed(
                 underlying, _now_ist(now), strategy):
             return 0, 0.0, "options underlying stop-loss cooldown is active"
+        # Any-exit cooldown: block new entries on this underlying+strategy for a
+        # configurable period after an exit.  When
+        # ``reentry_cooldown_loss_only`` is set, only a genuine losing exit
+        # arms the cooldown; targets and trailing-stop profits do not.
+        reentry_cooldown = None
+        per_strategy_cooldowns = self.mode_cfg.get("reentry_cooldown_by_strategy")
+        if isinstance(per_strategy_cooldowns, dict):
+            scope_key = _config_key(strategy)
+            for key, value in per_strategy_cooldowns.items():
+                if _config_key(key) == scope_key:
+                    reentry_cooldown = _finite_number(value, 0.0)
+                    break
+        if reentry_cooldown is None:
+            reentry_cooldown = _finite_number(
+                self.mode_cfg.get("reentry_cooldown_after_exit_seconds"), 0.0)
+        if reentry_cooldown > 0:
+            key = (_strategy_scope(strategy), _normalize_symbol(underlying))
+            stamp = self._underlying_exit_times.get(key)
+            loss_only = bool(self.mode_cfg.get("reentry_cooldown_loss_only", False))
+            last_was_loss = self._underlying_last_exit_loss.get(key, True)
+            if stamp is not None and (not loss_only or last_was_loss):
+                try:
+                    elapsed = (_now_ist(now).astimezone(timezone.utc) -
+                               stamp.astimezone(timezone.utc)).total_seconds()
+                    if elapsed >= 0 and elapsed < reentry_cooldown:
+                        return 0, 0.0, "options underlying reentry cooldown is active"
+                except (AttributeError, ValueError):
+                    pass
+        # Earliest-entry gate: the diagnostic showed the first 15-45 minutes
+        # are the weakest ORB bucket.  A per-strategy clock floor keeps the
+        # filter off mean-reversion, whose morning signals are not the problem.
+        earliest = None
+        per_strategy = self.mode_cfg.get("earliest_entry_time_by_strategy")
+        if isinstance(per_strategy, dict):
+            scope_key = _config_key(strategy)
+            for key, value in per_strategy.items():
+                if _config_key(key) == scope_key:
+                    earliest = _minutes(value)
+                    break
+        if earliest is None:
+            earliest = _minutes(self.mode_cfg.get("earliest_entry_time"))
+        if earliest is not None:
+            clock = _now_ist(now)
+            if clock.hour * 60 + clock.minute < earliest:
+                return 0, 0.0, "options earliest-entry time not reached"
         # Time-runway guard: a long option needs time for the premium to move
         # toward the target before the 15:10 hard flat.  Entries with too little
         # runway are rejected instead of left to time out at square-off.
@@ -1333,6 +1397,18 @@ class OptionsIntradayRuntime:
                     "(%.2f%%) | P&L %.2f | reason %s | %s",
                     label, lots, lot_size, lots * lot_size, entry, exit_bid, pct,
                     pnl, record.get("reason", ""), record.get("position_id", ""))
+        elif event == "shadow_signal":
+            logger.info(
+                "SHADOW %s %s %s %s%s | ask %.2f | vwap_block %s (%s) | %s",
+                record.get("strategy", ""), record.get("underlying", ""),
+                record.get("expiry", ""),
+                _finite_number(record.get("strike"), 0.0) or 0.0,
+                record.get("kind", ""),
+                _finite_number(record.get("ask"), 0.0) or 0.0,
+                bool(record.get("vwap_would_block")),
+                record.get("vwap_reason", ""),
+                ("collides with tradable contract"
+                 if record.get("collides_with_tradable") else "no collision"))
         else:
             logger.info("options_intraday %s %s", event, record.get("position_id", ""))
         logger_method = getattr(self.trader, "_log_event", None)
@@ -1341,6 +1417,13 @@ class OptionsIntradayRuntime:
                 logger_method(event, dict(record))
             except Exception:
                 pass
+
+    def _log_shadow_signals(self, records: List[Dict[str, Any]]) -> None:
+        """Write log-only shadow signals; never creates intents or risk state."""
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            self._record_event("shadow_signal", dict(record))
 
     def _intent(self, key: str, candidate: Dict[str, Any], payload: Dict[str, Any],
                 lots: int, risk_amount: float,
@@ -1353,6 +1436,7 @@ class OptionsIntradayRuntime:
             "created_at": _iso(datetime.now(timezone.utc)),
             "signal_underlying": candidate.get("signal_underlying", ""),
             "option_underlying": option.get("underlying", ""),
+            "strategy": self._candidate_strategy(candidate),
             "expiry": option.get("expiry", ""),
             "strike": _finite_number(leg.get("strike"), 0.0),
             "kind": str(leg.get("kind", "")).upper(),
@@ -1446,10 +1530,13 @@ class OptionsIntradayRuntime:
         found = self._read_only_scan(self.cfg, clock, listings)
         self.last_scan_diagnostics = deepcopy(found["diagnostics"])
         self.last_scan_diagnostics.update(submitted=0, entry_rejections=[])
+        shadow_records = found.get("shadow") or []
+        self.last_scan_diagnostics["shadow_signals"] = len(shadow_records)
+        self._log_shadow_signals(shadow_records)
         logger.info("Options scan: %s", {key: self.last_scan_diagnostics.get(key, 0)
                     for key in ("requested", "data_ok", "no_signal", "not_listed",
-                                "contract_rejection", "fetch_errors", "selected")})
-        self._record_event("options_scan", self.last_scan_diagnostics)
+                                "contract_rejection", "fetch_errors", "selected",
+                                "shadow_signals")})
         universe = _universe(self.cfg)
         instruments = {item["symbol"]: item for item in universe}
         contracts = _metadata(rows, universe, clock(), {})
@@ -1489,6 +1576,12 @@ class OptionsIntradayRuntime:
                             {"underlying": symbol, "reason": "reentry_cooldown"})
                         continue
                 else:
+                    held_by = str(intent.get("strategy") or "").strip().lower()
+                    same = held_by and held_by == self._candidate_strategy(original)
+                    self.last_scan_diagnostics["entry_rejections"].append(
+                        {"underlying": symbol,
+                         "reason": ("contract_intent_exists" if same
+                                    else "contract_held_by_other_strategy")})
                     continue
             if symbol not in refreshed:
                 # Manage after the broad pass and between per-symbol refreshes.
@@ -1528,6 +1621,7 @@ class OptionsIntradayRuntime:
                 self.last_scan_diagnostics["entry_rejections"].append(
                     {"underlying": symbol, "reason": str(exc)})
         self.last_scan_diagnostics["submitted"] = len(placed)
+        self._record_event("options_scan", self.last_scan_diagnostics)
         return placed
 
     def execute_plan(self, plan: Optional[Dict[str, Any]], opt_broker: Any = None,
@@ -1574,6 +1668,18 @@ class OptionsIntradayRuntime:
                     if not self._reentry_cooldown_elapsed(existing_intent, current):
                         continue
                 else:
+                    held_by = str(existing_intent.get("strategy") or "").strip().lower()
+                    same = held_by and held_by == self._candidate_strategy(candidate)
+                    self._record_event("skip", {
+                        "asset": "options",
+                        "reason": ("contract_intent_exists" if same
+                                   else "contract_held_by_other_strategy"),
+                        "strategy": self._candidate_strategy(candidate),
+                        "setup": str(candidate.get("setup") or ""),
+                        "signal_underlying": candidate.get("signal_underlying", ""),
+                        "option_underlying": option.get("underlying", ""),
+                        "execution_class": self.execution_class,
+                    })
                     continue
             trading_symbol, contract = self._validate_instrument(
                 candidate, option, leg, broker)
@@ -1583,8 +1689,30 @@ class OptionsIntradayRuntime:
             lots, risk_amount, risk_reason = self._risk_preflight(
                 candidate, option, leg, broker, now=current)
             if lots <= 0:
-                self._record_event("skip", {"asset": "options", "reason": risk_reason,
-                                             "execution_class": self.execution_class})
+                # Attribute the skip to its source sleeve.  Without this the
+                # forward report can only count reasons globally, not answer
+                # "how often did the 10:00 ORB gate block ORB?".
+                candidate_meta = candidate.get("metadata", {}) or {}
+                skip_strategy = str(
+                    candidate.get("strategy")
+                    or candidate_meta.get("strategy")
+                    or ""
+                ).strip().lower()
+                skip_setup = str(
+                    candidate.get("setup")
+                    or candidate.get("setup_name")
+                    or candidate_meta.get("setup")
+                    or ""
+                ).strip()
+                self._record_event("skip", {
+                    "asset": "options",
+                    "reason": risk_reason,
+                    "strategy": skip_strategy,
+                    "setup": skip_setup,
+                    "signal_underlying": candidate.get("signal_underlying", ""),
+                    "option_underlying": option.get("underlying", ""),
+                    "execution_class": self.execution_class,
+                })
                 continue
             ask_premium = _finite_number(leg.get("ask"), 0.0)
             premium_exposure = self._full_debit(
@@ -2141,13 +2269,23 @@ class OptionsIntradayRuntime:
             # rapid re-entry on a different strike of the same underlying.  Only
             # a genuine stop-loss counts: an EOD square-off or stale-data close
             # is not a signal that the underlying is dangerous.
-            if reason == "stop-loss":
+            # Record after any exit type (stop-loss, trailing-stop, target) so
+            # the any-exit cooldown can block rapid re-entry on a different strike.
+            # Only EOD square-off is excluded (not a signal of danger).
+            if reason in ("stop-loss", "trailing-stop", "target"):
                 stamp_underlying = str(position.get("option_underlying", "")).upper()
                 if stamp_underlying:
                     stamp_scope = _strategy_scope(position.get("strategy"))
-                    self._underlying_stop_times[
-                        (stamp_scope, _normalize_symbol(stamp_underlying))
-                    ] = _now_ist(now)
+                    stamp_key = (
+                        stamp_scope, _normalize_symbol(stamp_underlying))
+                    # The legacy stop-loss map (and its 900s guard) must stay
+                    # keyed on genuine stop-losses only; a profitable trailing
+                    # exit is not evidence that the underlying is dangerous.
+                    if reason == "stop-loss":
+                        self._underlying_stop_times[stamp_key] = _now_ist(now)
+                    # The any-exit/loss-only cooldown is tracked separately.
+                    self._underlying_exit_times[stamp_key] = _now_ist(now)
+                    self._underlying_last_exit_loss[stamp_key] = _counts_as_loss(reason)
             lots = int(_finite_number(position.get("lots"), 0.0))
             lot_size = int(_finite_number(position.get("lot_size"), 0.0))
             entry = _finite_number(position.get("entry_premium"), 0.0)

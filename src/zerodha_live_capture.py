@@ -86,6 +86,10 @@ class CaptureSettings:
     max_contracts: Optional[int] = None
     strike_min: Optional[float] = None
     strike_max: Optional[float] = None
+    # Per-underlying override, e.g. {"NIFTY": (22000, 23000),
+    # "BANKNIFTY": (54000, 56000)}.  Underlyings without an entry fall back
+    # to ``strike_min``/``strike_max``.
+    strike_ranges: Optional[Mapping[str, Tuple[Optional[float], Optional[float]]]] = None
     quote_batch_size: int = 200
     collect_candles: bool = True
     collect_quotes: bool = True
@@ -102,6 +106,24 @@ class CaptureSettings:
             raise ValueError("max_contracts must be positive")
         if self.strike_min is not None and self.strike_max is not None and self.strike_min > self.strike_max:
             raise ValueError("strike_min cannot exceed strike_max")
+        normalized_ranges: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        for key, bounds in (self.strike_ranges or {}).items():
+            name = str(key).strip().upper()
+            if not name:
+                raise ValueError("strike_ranges keys must be underlying names")
+            try:
+                low_raw, high_raw = bounds
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"strike_ranges[{name}] must be a (min, max) pair") from exc
+            low = None if low_raw is None else float(low_raw)
+            high = None if high_raw is None else float(high_raw)
+            if (low is not None and low <= 0) or (high is not None and high <= 0):
+                raise ValueError(f"strike_ranges[{name}] must be positive")
+            if low is not None and high is not None and low > high:
+                raise ValueError(f"strike_ranges[{name}] min cannot exceed max")
+            normalized_ranges[name] = (low, high)
+        object.__setattr__(self, "strike_ranges", normalized_ranges)
         if self.quote_batch_size < 1:
             raise ValueError("quote_batch_size must be positive")
         if self.max_retries < 1:
@@ -216,21 +238,39 @@ class ZerodhaLiveCapture:
     def _exact_contracts(rows: Sequence[Mapping[str, Any]], *, now: datetime,
                          underlyings: Sequence[str], strike_min: Optional[float],
                          strike_max: Optional[float],
-                         rejected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                         rejected: List[Dict[str, Any]],
+                         strike_ranges: Optional[Mapping[
+                             str, Tuple[Optional[float], Optional[float]]]] = None
+                         ) -> List[Dict[str, Any]]:
         """Keep only identity-complete active CE/PE NFO rows.
 
         The shared discovery API applies expiry, exchange, strike, and option
         type filters.  This second check makes the capture contract explicit:
         the token, symbol, underlying, expiry, strike, side, and lot metadata
         must all be present before a row can be archived or queried.
+
+        ``strike_ranges`` overrides the global ``strike_min``/``strike_max``
+        per underlying.  Discovery runs once with the union window, then the
+        rows are filtered to each underlying's own range so NIFTY (~23k) and
+        BANKNIFTY (~55k) can be captured in the same process.
         """
+        ranges = {str(key).strip().upper(): tuple(bounds)
+                  for key, bounds in (strike_ranges or {}).items()}
+        lows = [bounds[0] for bounds in ranges.values() if bounds[0] is not None]
+        highs = [bounds[1] for bounds in ranges.values() if bounds[1] is not None]
+        if strike_min is not None:
+            lows.append(strike_min)
+        if strike_max is not None:
+            highs.append(strike_max)
+        effective_min = min(lows) if lows else None
+        effective_max = max(highs) if highs else None
         discovered = discover_active_option_instruments(
             type("_RowsAdapter", (), {"instruments": lambda self, exchange: list(rows)})(),
             underlyings=underlyings,
             as_of=now,
             option_types=("CE", "PE"),
-            strike_min=strike_min,
-            strike_max=strike_max,
+            strike_min=effective_min,
+            strike_max=effective_max,
             rejections=rejected,
         )
         output: List[Dict[str, Any]] = []
@@ -248,6 +288,15 @@ class ZerodhaLiveCapture:
                     "reason": "incomplete_contract_metadata",
                     "raw": dict(raw),
                 })
+                continue
+            underlying = str(identity["underlying"]).upper()
+            low, high = ranges.get(underlying, (strike_min, strike_max))
+            strike = float(identity["strike"])
+            if low is not None and strike < float(low):
+                rejected.append({"reason": "below_strike_filter", "raw": dict(raw)})
+                continue
+            if high is not None and strike > float(high):
+                rejected.append({"reason": "above_strike_filter", "raw": dict(raw)})
                 continue
             output.append(dict(raw))
         output.sort(key=lambda row: (
@@ -452,6 +501,7 @@ class ZerodhaLiveCapture:
                     list(rows), now=current, underlyings=settings.underlyings,
                     strike_min=settings.strike_min, strike_max=settings.strike_max,
                     rejected=discovery_rejections,
+                    strike_ranges=settings.strike_ranges,
                 )
                 partial_selection = bool(
                     settings.max_contracts is not None

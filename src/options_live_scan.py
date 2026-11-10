@@ -214,6 +214,70 @@ def _vwap_allows(signal: Any, candles: List[Dict[str, Any]], symbol: str) -> Tup
     return True, ""
 
 
+def _shadow_strategy_names(mode: Mapping[str, Any]) -> set:
+    """Return the log-only sleeves declared in ``shadow_strategies``."""
+    raw = mode.get("shadow_strategies") or []
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    names = set()
+    for item in raw:
+        name = str(item).strip().lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def _candidate_strategy_name(candidate: Mapping[str, Any]) -> str:
+    return str(candidate.get("strategy") or candidate.get("setup") or "").strip().lower()
+
+
+def _shadow_record(candidate: Mapping[str, Any], symbol: str,
+                   candles: List[Dict[str, Any]], observed_at: str,
+                   contracts: Dict[Tuple[Any, ...], Dict[str, Any]]) -> Dict[str, Any]:
+    """Describe one shadow-only signal without touching the tradable pool.
+
+    The VWAP check is evaluated separately here so ORB's call site and the
+    ``_vwap_allows`` implementation remain byte-identical.  ``_contract_key``
+    is stored privately so collision flags can be filled in after the global
+    dedupe has run.
+    """
+    option = candidate.get("option_legs") or {}
+    leg = (option.get("legs") or [{}])[0] or {}
+    allowed, why = _vwap_allows(candidate, candles, symbol)
+    vwap = _session_vwap(candles)
+    last_close = float(candles[-1].get("close") or 0.0) if candles else 0.0
+    try:
+        contract_key = _contract_key(dict(candidate), symbol, contracts)
+    except (TypeError, ValueError):
+        contract_key = None
+    record = {
+        "observed_at": observed_at,
+        "signal_timestamp": candidate.get("signal_timestamp"),
+        "underlying": symbol,
+        "strategy": _candidate_strategy_name(candidate),
+        "direction": str(candidate.get("direction") or "").strip().lower(),
+        "option_type": _signal_option_type(candidate),
+        "expiry": option.get("expiry") or leg.get("expiry"),
+        "strike": planner._finite(leg.get("strike")),
+        "kind": str(leg.get("kind") or "").upper(),
+        "trading_symbol": leg.get("trading_symbol"),
+        "bid": planner._finite(leg.get("bid")),
+        "ask": planner._finite(leg.get("ask")),
+        "rank_score": planner._finite(candidate.get("rank_score")),
+        "underlying_entry": planner._finite(candidate.get("entry_price")),
+        "underlying_stop_loss": planner._finite(candidate.get("stop_loss")),
+        "underlying_target": planner._finite(candidate.get("target")),
+        "close": last_close,
+        "vwap": vwap,
+        "vwap_allows": allowed,
+        "vwap_reason": why,
+        "vwap_would_block": not allowed,
+        "collides_with_tradable": False,
+        "_contract_key": contract_key,
+    }
+    return record
+
+
 def option_instruments():
     """Read-only current MegaBull metadata hook with retries."""
     from src.broker.megabull import MegaBullBroker, load_dotenv_key
@@ -561,7 +625,8 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
     diagnostics = {key: 0 for key in ("requested", "data_ok", "no_signal", "not_listed",
                                        "contract_rejection", "fetch_errors", "selected")}
     diagnostics.update(requested=len(universe), rejections=[], per_underlying={})
-    result = {"snapshots": [], "diagnostics": diagnostics, "approved_underlyings": []}
+    result = {"snapshots": [], "diagnostics": diagnostics, "approved_underlyings": [],
+              "shadow": []}
     if not universe:
         return result
 
@@ -594,6 +659,12 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
     result["approved_underlyings"] = [row["symbol"] for row in universe if row["symbol"] in approved]
     strategies = planner._strategies(effective)
     mode = effective.get("options_intraday", {}) or {}
+    shadow_strategies = _shadow_strategy_names(mode)
+    try:
+        orb_confirm_closes = max(1, int(mode.get("orb_confirm_closes") or 1))
+    except (TypeError, ValueError):
+        orb_confirm_closes = 1
+    shadow: List[Dict[str, Any]] = result["shadow"]
     max_age = planner._cfg_float(mode, ("max_candle_age_minutes", "data_max_age_minutes"), 15.0)
     provider = chain_provider if chain_provider is not None else fetch_chain
     if not callable(provider):
@@ -643,7 +714,7 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
             try:
                 generated = CandidatePipeline.evaluate_strategy_signals_pure(
                     candles, strategy, underlying_symbol=symbol, contract_specs=specs,
-                    index=len(candles) - 1,
+                    index=len(candles) - 1, orb_confirm_closes=orb_confirm_closes,
                 )
                 signals.extend(generated)
                 state["strategies"][strategy] = {"status": "signal" if generated else "no_signal"}
@@ -679,7 +750,27 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
             continue
         state["planner"] = deepcopy(plan.get("option_chain_diagnostic") or {})
         candidates = plan.get("option_candidates", []) or []
-        
+
+        # --- shadow sleeves: log-only, never tradable ---
+        tradable = []
+        shadow_count = 0
+        if shadow_strategies:
+            for candidate in candidates:
+                if _candidate_strategy_name(candidate) in shadow_strategies:
+                    shadow_count += 1
+                    shadow.append(_shadow_record(
+                        candidate, symbol, candles, asof().isoformat(), contracts))
+                else:
+                    tradable.append(candidate)
+            candidates = tradable
+        if shadow_count:
+            state["shadow_signals"] = shadow_count
+            if not candidates:
+                # Keep shadow-only signals out of the tradable diagnostics so
+                # they cannot look like an ORB contract rejection.
+                continue
+        # ------------------------------------------------
+
         # --- VWAP trend filter ---
         kept_candidates = []
         for candidate in candidates:
@@ -730,6 +821,15 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         plan.update(option_candidates=candidates, actionable=len(candidates))
         result["snapshots"].append(plan)
     diagnostics["selected"] = len(seen)
+    for record in shadow:
+        contract_key = record.pop("_contract_key", None)
+        record["collides_with_tradable"] = bool(
+            contract_key is not None and contract_key in seen)
+    diagnostics["shadow_signals"] = len(shadow)
+    diagnostics["shadow_vwap_blocked"] = sum(
+        1 for record in shadow if record.get("vwap_would_block"))
+    diagnostics["shadow_contract_collisions"] = sum(
+        1 for record in shadow if record.get("collides_with_tradable"))
     return result
 
 

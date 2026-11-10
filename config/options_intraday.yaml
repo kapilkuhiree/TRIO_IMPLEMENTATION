@@ -8,7 +8,17 @@ options_intraday:
   # book flat before the close.  (Was 14:30.)
   entry_cutoff: "15:00"
   hard_flat: "15:10"
-  strategies: [orb, mean_reversion]
+  strategies: [orb, orb_retest, mean_reversion]
+  # Log-only sleeves: generate signals for diagnostics but never enter the
+  # tradable pool (no rank/dedupe, no intent, no orders, no risk counters).
+  shadow_strategies: [mean_reversion]
+  # ORB needs two consecutive 5-minute closes beyond the opening range before
+  # it may enter.  ORB-Retest keeps its own 09:45 floor; plain ORB waits for
+  # 10:00 so the first two post-range closes are available.
+  orb_confirm_closes: 2
+  earliest_entry_time_by_strategy:
+    orb: "10:00"
+    orb_retest: "09:45"
   # Discovery only: scan stock underlyings, but route BUY CE/PE options only.
   # Options must exist in today's exact broker listing; no equity fallback.
   # Live scan scope is pinned by scripts/session.py through
@@ -63,11 +73,21 @@ options_intraday:
   # Do not re-enter the exact same contract immediately after it closed.
   # This prevents a stale/duplicate signal from re-firing after an exit.
   reentry_cooldown_seconds: 300
+  reentry_cooldown_after_exit_seconds: 300
+  # Loss-only per-strategy cooldowns.  A profitable exit does not block the
+  # next entry; ORB-Retest opts out entirely because re-testing the same level
+  # is the setup itself.
+  reentry_cooldown_loss_only: true
+  reentry_cooldown_by_strategy:
+    orb: 300
+    orb_retest: 0
+    mean_reversion: 300
   # After a stop-loss on an underlying, block any new entry on that underlying
   # for this many seconds.  The per-contract cooldown above does not catch a
   # strike rotation (23850 CE stop -> 23900 CE 31s later), so this is the
-  # underlying-level churn guard.
-  underlying_stop_loss_cooldown_seconds: 900
+  # underlying-level churn guard.  Disabled here in favour of the loss-only
+  # per-strategy cooldowns above.
+  underlying_stop_loss_cooldown_seconds: 0
   # Minimum minutes of runway to the 15:10 hard flat before a new entry is
   # allowed.  Reduced to 10 so a late entry can still be managed to the flat
   # while keeping a full 10-minute window.  (Was 30, which blocked everything

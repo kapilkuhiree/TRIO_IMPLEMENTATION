@@ -238,6 +238,7 @@ class CandidatePipeline:
         underlying_symbol: str = "NIFTY",
         contract_specs: Optional[Dict[str, Any]] = None,
         index: Optional[int] = None,
+        orb_confirm_closes: int = 1,
     ) -> List[OptionsCandidate]:
         """Evaluate a strategy without constructing a stateful pipeline.
 
@@ -254,6 +255,7 @@ class CandidatePipeline:
         No risk state, P&L, or trade lifecycle is touched here.
         """
         from strategies.orb_strategy import OrbStrategy
+        from strategies.orb_retest_strategy import OrbRetestStrategy
         from strategies.trend_pullback_strategy import TrendPullbackStrategy
         from strategies.momentum_continuation_strategy import (
             MomentumContinuationStrategy,
@@ -263,6 +265,7 @@ class CandidatePipeline:
         key = str(strategy_name or "").strip().lower()
         strategy_types = {
             "orb": OrbStrategy,
+            "orb_retest": OrbRetestStrategy,
             "pullback": TrendPullbackStrategy,
             "momentum": MomentumContinuationStrategy,
             "mean_reversion": MeanReversionStrategy,
@@ -279,6 +282,17 @@ class CandidatePipeline:
         if key == "mean_reversion":
             strategy = strategy_type()
             signal = strategy.evaluate_signal(candles, index)
+        elif key == "orb":
+            strategy = strategy_type(
+                lot_size=int(specs.get("lot_size") or 0),
+                orb_confirm_closes=max(1, int(orb_confirm_closes or 1)),
+            )
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
         else:
             strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
             signal = strategy.evaluate_signal(
@@ -317,6 +331,7 @@ class CandidatePipeline:
             underlying_symbol=underlying_symbol,
             strategy_name={
                 "orb": "ORB",
+                "orb_retest": "ORB-Retest",
                 "pullback": "Pullback",
                 "momentum": "Momentum",
                 "mean_reversion": "MeanReversion",

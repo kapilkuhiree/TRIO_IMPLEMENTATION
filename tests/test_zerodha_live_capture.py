@@ -3,6 +3,8 @@
 from datetime import date, datetime, timezone, timedelta
 import json
 
+import pytest
+
 from src.zerodha_live_capture import (
     CaptureSettings,
     CaptureSQLiteOptionArchive,
@@ -248,3 +250,55 @@ def test_loop_stops_on_keyboard_interrupt_and_has_no_order_boundary(tmp_path):
         assert ".place_order(" not in text
     finally:
         archive.close()
+
+
+def test_per_underlying_strike_ranges_isolate_each_index_window(tmp_path):
+    adapter = _FakeAdapter(_rows())
+    archive, capture = _capture(
+        tmp_path, adapter,
+        # Global window only applies to underlyings without an override.
+        strike_min=2000, strike_max=3000,
+        strike_ranges={
+            "NIFTY": (24900, 25100),
+            # 52000 is below this window on purpose.
+            "BANKNIFTY": (52500, 53500),
+        },
+    )
+    try:
+        report = capture.capture_once(as_of=NOW)
+        selected = {(row["underlying"], row["option_type"])
+                    for row in report["contracts"]}
+        assert ("NIFTY", "CE") in selected
+        assert ("NIFTY", "PE") in selected
+        assert not any(underlying == "BANKNIFTY"
+                       for underlying, _ in selected)
+        assert ("RELIANCE", "CE") in selected
+        assert ("RELIANCE", "PE") in selected
+        assert report["orders_placed"] == 0
+    finally:
+        archive.close()
+
+
+def test_capture_settings_validates_per_underlying_ranges():
+    with pytest.raises(ValueError):
+        CaptureSettings(strike_ranges={"NIFTY": (23000, 22000)})
+    with pytest.raises(ValueError):
+        CaptureSettings(strike_ranges={"NIFTY": (0, 100)})
+    with pytest.raises(ValueError):
+        CaptureSettings(strike_ranges={"": (22000, 23000)})
+
+
+def test_cli_parses_repeated_per_underlying_strike_ranges():
+    from scripts.zerodha_live_capture import build_parser
+
+    args = build_parser().parse_args([
+        "--strike-range", "NIFTY=22000:23000",
+        "--strike-range", "banknifty=54000:56000",
+    ])
+    assert args.strike_range == [
+        ("NIFTY", (22000.0, 23000.0)),
+        ("BANKNIFTY", (54000.0, 56000.0)),
+    ]
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--strike-range", "NIFTY=23000:22000"])

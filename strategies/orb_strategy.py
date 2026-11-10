@@ -1,4 +1,4 @@
-"""TRIO — Opening Range Breakout (ORB) Strategy Module
+"""TRIO â€” Opening Range Breakout (ORB) Strategy Module
 
 Strategy A: Opening-range breakout
 - Opening range from 9:15 to 9:30 AM IST.
@@ -7,12 +7,12 @@ Strategy A: Opening-range breakout
 - Bearish breakdown generates a PE candidate.
 - Optional ATR-based confirmation must be independently testable.
 
-KEEP IN RESEARCH MODE ONLY — Do not backtest without suitable historical data.
+KEEP IN RESEARCH MODE ONLY â€” Do not backtest without suitable historical data.
 """
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 import math
 from datetime import timezone
@@ -39,6 +39,7 @@ class OrSignalResult:
     reasoning: str = ""
     bar_index: int = -1        # Bar index when signal triggered
     underlying_symbol: str = "NIFTY"  # Underlying this signal applies to
+    consecutive_closes: int = 0  # Number of consecutive closes triggering signal
 
 
 # ---------------------------------------------------------------------------
@@ -66,13 +67,71 @@ class OrbStrategy:
     ENTRY_CUTOFF = dtime(14, 30)  # No entries after 2:30 PM IST
     SESSION_EXIT = dtime(15, 30)  # 3:30 PM IST end of day session
 
-    def __init__(self, lot_size: int = 65, fill_model: str = "bidask"):
+    def __init__(self, lot_size: int = 65, fill_model: str = "bidask",
+                 orb_confirm_closes: int = 1):
         self.lot_size = lot_size
         self.fill_model = fill_model  # "mid" | "bidask"
+        # Number of consecutive completed closes beyond the opening range
+        # required before a signal is released.  Derived from candle history
+        # rather than instance state: the live scan builds a fresh strategy
+        # object for every scan, while the backtest reuses one instance.
+        self.orb_confirm_closes = max(1, int(orb_confirm_closes or 1))
 
     # ------------------------------------------------------------------
     # Core signal logic
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_stamp(value: Any) -> Optional[datetime]:
+        """Parse a candle timestamp into IST, or ``None`` when malformed."""
+        try:
+            stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        return stamp.astimezone(timezone(timedelta(hours=5, minutes=30)))
+
+    @classmethod
+    def _consecutive_closes_beyond(
+        cls,
+        candles_5min: List[Dict[str, Any]],
+        index: int,
+        level: float,
+        *,
+        above: bool,
+        session_date: date,
+        underlying_symbol: str,
+        instrument_type: str,
+    ) -> int:
+        """Count trailing same-session closes strictly beyond ``level``.
+
+        The walk stops at the first close that is not beyond the level, at a
+        different session date, or at a candle from another instrument.  This
+        keeps "consecutive" literally consecutive regardless of how often the
+        strategy object is recreated.
+        """
+        count = 0
+        for position in range(index, -1, -1):
+            candle = candles_5min[position]
+            if (
+                candle.get("underlying_symbol") != underlying_symbol
+                or candle.get("exchange") != "NSE"
+                or candle.get("instrument_type") != instrument_type
+            ):
+                break
+            stamp = cls._session_stamp(candle.get("timestamp"))
+            if stamp is None or stamp.date() != session_date:
+                break
+            try:
+                close = float(candle.get("close"))
+            except (TypeError, ValueError):
+                break
+            beyond = close > level if above else close < level
+            if not beyond:
+                break
+            count += 1
+        return count
 
     def evaluate_signal(
         self,
@@ -105,6 +164,7 @@ class OrbStrategy:
         result = OrSignalResult()
         result.strategy = "orb"
         result.underlying_symbol = underlying_symbol
+        result.consecutive_closes = 0  # reset each evaluation
 
         try:
             # The first post-range candle starts at 09:30.  A signal at index
@@ -226,63 +286,105 @@ class OrbStrategy:
                     result.reasoning = "Malformed signal timestamp; entry rejected"
                     return result
 
-            # Check for CONFIRMED breakout (close above OR high)
-            # No random outcome generation - signal is deterministic based on price action
-            if current_close > orb_high:
-                # --- VWAP Trend Filter ---
-                from src.options_live_scan import _session_vwap
-                vwap = _session_vwap(candles_5min[:index + 1])
-                if vwap and current_close < vwap:
-                    result.reasoning = f"ORB breakout rejected: close {current_close:.2f} < VWAP {vwap:.2f}"
-                    return result
-                # -------------------------
-
-                # Confirmed bullish breakout
-                result.allowed = True
-                result.variant = "bullish"
-                result.signal_type = "breakout"
-                result.entry_price = current_close
-                result.trigger_price = orb_high
-                result.trigger_time = current_time or ""
-                result.expiry = contract_specs.get("expiry_preference", "weekly")
-                result.option_type = "CE"  # Bullish = CE buying
-                result.stop_loss = orb_low  # Stop below OR low
-                result.target = orb_high + (orb_high - orb_low)  # 1:1 risk-reward based on OR range
-                result.reasoning = (
-                    f"ORB bullish breakout: close {current_close:.2f} > OR high {orb_high:.2f} "
-                    f"(OR: {orb_low:.2f}-{orb_high:.2f}), underlying: {underlying_symbol}"
-                )
-                result.bar_index = index
-                return result
-
-            # Check for CONFIRMED breakdown (close below OR low)
-            # No random outcome generation - signal is deterministic based on price action
+            # --- ORB BEARISH BREAKDOWN (PE) ---
+            # Check for confirmed breakdown below OR low
             if current_close < orb_low:
-                # --- VWAP Trend Filter ---
+                # VWAP Trend Filter (remains on the trigger bar, as before)
                 from src.options_live_scan import _session_vwap
                 vwap = _session_vwap(candles_5min[:index + 1])
                 if vwap and current_close > vwap:
                     result.reasoning = f"ORB breakdown rejected: close {current_close:.2f} > VWAP {vwap:.2f}"
                     return result
-                # -------------------------
 
-                # Confirmed bearish breakdown
-                result.allowed = True
-                result.variant = "bearish"
-                result.signal_type = "breakdown"
-                result.entry_price = current_close
-                result.trigger_price = orb_low
-                result.trigger_time = current_time or ""
-                result.expiry = contract_specs.get("expiry_preference", "weekly")
-                result.option_type = "PE"  # Bearish = PE buying
-                result.stop_loss = orb_high  # Stop above OR high
-                result.target = orb_low - (orb_high - orb_low)  # 1:1 risk-reward based on OR range
-                result.reasoning = (
-                    f"ORB bearish breakdown: close {current_close:.2f} < OR low {orb_low:.2f} "
-                    f"(OR: {orb_low:.2f}-{orb_high:.2f}), underlying: {underlying_symbol}"
+                # --- N-CLOSE CONFIRMATION for bearish breakdown ---
+                # Require ``orb_confirm_closes`` consecutive completed 5m closes
+                # below OR low.  The count is recomputed from the candle prefix
+                # so a fresh strategy instance (live scan) and a reused one
+                # (backtest) agree exactly.
+                consecutive = self._consecutive_closes_beyond(
+                    candles_5min, index, orb_low, above=False,
+                    session_date=current_ts.date(),
+                    underlying_symbol=underlying_symbol,
+                    instrument_type=instrument_type,
                 )
-                result.bar_index = index
-                return result
+
+                if consecutive >= self.orb_confirm_closes:
+                    # Confirmed bearish breakdown after consecutive closes
+                    result.allowed = True
+                    result.variant = "bearish"
+                    result.signal_type = "breakdown"
+                    result.entry_price = current_close
+                    result.trigger_price = orb_low
+                    result.trigger_time = current_time or ""
+                    result.expiry = contract_specs.get("expiry_preference", "weekly")
+                    result.option_type = "PE"  # Bearish = PE buying
+                    result.stop_loss = orb_high  # Stop above OR high
+                    result.target = orb_low - (orb_high - orb_low)  # 1:1 risk-reward based on OR range
+                    result.reasoning = (
+                        f"ORB bearish breakdown: close {current_close:.2f} < OR low {orb_low:.2f} "
+                        f"(OR: {orb_low:.2f}-{orb_high:.2f}), consecutive closes below OR: "
+                        f"{consecutive}/{self.orb_confirm_closes}, "
+                        f"underlying: {underlying_symbol}"
+                    )
+                    result.bar_index = index
+                    result.consecutive_closes = consecutive
+                    return result
+                else:
+                    # Not enough consecutive closes yet - signal not allowed
+                    result.reasoning = (
+                        f"ORB breakdown rejected: only {consecutive} "
+                        f"consecutive close(s) below OR low (need {self.orb_confirm_closes})"
+                    )
+                    return result
+
+            # --- ORB BULLISH BREAKOUT (CE) ---
+            # Check for confirmed breakout above OR high
+            if current_close > orb_high:
+                # VWAP Trend Filter
+                from src.options_live_scan import _session_vwap
+                vwap = _session_vwap(candles_5min[:index + 1])
+                if vwap and current_close < vwap:
+                    result.reasoning = f"ORB breakout rejected: close {current_close:.2f} < VWAP {vwap:.2f}"
+                    return result
+
+                # --- N-CLOSE CONFIRMATION for bullish breakout ---
+                # Require ``orb_confirm_closes`` consecutive completed 5m closes
+                # above OR high.  Recomputed from candles for statelessness.
+                consecutive = self._consecutive_closes_beyond(
+                    candles_5min, index, orb_high, above=True,
+                    session_date=current_ts.date(),
+                    underlying_symbol=underlying_symbol,
+                    instrument_type=instrument_type,
+                )
+
+                if consecutive >= self.orb_confirm_closes:
+                    # Confirmed bullish breakout after consecutive closes
+                    result.allowed = True
+                    result.variant = "bullish"
+                    result.signal_type = "breakout"
+                    result.entry_price = current_close
+                    result.trigger_price = orb_high
+                    result.trigger_time = current_time or ""
+                    result.expiry = contract_specs.get("expiry_preference", "weekly")
+                    result.option_type = "CE"  # Bullish = CE buying
+                    result.stop_loss = orb_low  # Stop below OR low
+                    result.target = orb_high + (orb_high - orb_low)  # 1:1 risk-reward based on OR range
+                    result.reasoning = (
+                        f"ORB bullish breakout: close {current_close:.2f} > OR high {orb_high:.2f} "
+                        f"(OR: {orb_low:.2f}-{orb_high:.2f}), consecutive closes above OR: "
+                        f"{consecutive}/{self.orb_confirm_closes}, "
+                        f"underlying: {underlying_symbol}"
+                    )
+                    result.bar_index = index
+                    result.consecutive_closes = consecutive
+                    return result
+                else:
+                    # Not enough consecutive closes yet - signal not allowed
+                    result.reasoning = (
+                        f"ORB breakout rejected: only {consecutive} "
+                        f"consecutive close(s) above OR high (need {self.orb_confirm_closes})"
+                    )
+                    return result
 
         except (KeyError, ValueError, TypeError) as e:
             result.reasoning = f"ORB evaluation error: {e}"
@@ -315,8 +417,8 @@ def run_orb_backtest(
     3. Chronological processing of subsequent bars
     4. Stop/target check against each candle's high/low
     5. Conservative stop-first assumption if both triggered in same bar
-    6. Continued checking until exit or end of day
-    7. Explicit end-of-day exit rule
+    5. Continued checking until exit or end of day
+    6. Explicit end-of-day exit rule
 
     Args:
         csv_path: Path to CSV file with 5-min candles for the target underlying
@@ -335,7 +437,7 @@ def run_orb_backtest(
     )
 
     if not candles:
-        return {"error": "No candles imported - check CSV path and format"}
+        return {"error": "No candles imported - check CSV path and format."}
 
     # Filter to trading hours only
     # Candles already have IST timestamps from import, so we check the time component
@@ -362,7 +464,7 @@ def run_orb_backtest(
 
     candles = [c for c in candles if _is_trading_hour(c)]
 
-    strategy = OrbStrategy(lot_size=lot_size)
+    strategy = OrbStrategy(lot_size=lot_size, orb_confirm_closes=2)
 
     # Contract specs
     specs = {
@@ -540,7 +642,7 @@ def run_orb_backtest(
         # apply end-of-day outcome
         if position_open:
             # Force exit with whatever price is available - this means target/stop
-            # were never hit during the session
+            # were never triggered during the session
             exit_reason = "end_of_day_no_exit"
             exit_price = candles[-1].get("close", entry) if candles else entry
             exit_time = candles[-1].get("timestamp", "") if candles else ""
@@ -595,10 +697,17 @@ if __name__ == "__main__":
     print("  - No entries after 2:30 PM IST")
     print("  - Bullish = CE, Bearish = PE")
     print()
+    print("ORB confirmation parameter (orb_confirm_closes):")
+    print("  - 1 = single-close confirmation (current default behaviour)")
+    print("  - 2 = require 2 consecutive 5m closes below OR low (PE)")
+    print("    or above OR high (CE) before entry")
+    print("  - Higher values provide stronger filtering, reduce false breaks")
+    print("    at the cost of potentially missing early entries")
+    print()
     print("NO random number generation or assumed win probabilities:")
     print("  - OR high/low is determined from first 3 candles of the session")
     print("  - Breakout/breakdown confirmed by close price vs fixed OR range")
-    print("  - Outcomes reflect actual price movement from data")
+    print("  - Outcomes reflect actual price movement, not random assignment")
     print()
     print("MULTI-INSTRUMENT SUPPORT:")
     print("  - Strategy operates on the intended underlying's own candles")
@@ -606,11 +715,12 @@ if __name__ == "__main__":
     print("  - Candles must have 'underlying_symbol' and 'instrument_type' fields")
     print("  - Strategy skips candles from other underlyings")
     print()
-    print("RESEARCH REQUIREMENTS:")
-    print("  - 5-min candles with IST timestamps for the target underlying")
-    print("  - CSV format: timestamp,open,high,low,close,volume,exchange,underlying_symbol,instrument_type")
-    print("  - This module keeps positions in research mode only")
-    print("  - Trade outcomes determined from price data, not random numbers")
+    print("CONSECUTIVE CLOSE TRACKING:")
+    print("  - The strategy counts trailing closes below/above OR for")
+    print("    the orb_confirm_closes requirement")
+    print("  - The count resets when a close returns inside OR")
+    print("  - Counted from candle history, so it does not depend on")
+    print("    how often the strategy instance is recreated")
     print()
     print("TRADE LIFECYCLE:")
     print("  1. Signal generated at current bar close (data available at signal time)")

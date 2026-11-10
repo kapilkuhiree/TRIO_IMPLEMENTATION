@@ -132,6 +132,13 @@ def _cfg(tmp_path, **overrides):
         "max_premium_exposure_pct": 5.00,
         "allow_averaging_down": False,
         "max_portfolio_risk_pct": 1.0,
+        # Routing/lifecycle fixtures supply one post-range close.  The shipped
+        # overlay requires two consecutive closes and is covered separately.
+        "orb_confirm_closes": 1,
+        # These routing/lifecycle tests intentionally act at 09:35.  The live
+        # overlay's per-strategy ORB entry floor (10:00) is a separate policy
+        # covered by its own test, so opt out here.
+        "earliest_entry_time_by_strategy": None,
         "chain_provider": overrides.pop("chain_provider", None),
     }
     mode.update(overrides)
@@ -687,6 +694,103 @@ def test_profitable_trailing_exit_does_not_arm_loss_cooldown(tmp_path):
     assert reason != "options underlying stop-loss cooldown is active"
 
 
+def test_loss_only_reentry_cooldown_blocks_after_a_loss(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, reentry_cooldown_after_exit_seconds=300,
+             reentry_cooldown_loss_only=True,
+             reentry_cooldown_by_strategy={"orb": 300},
+             max_consecutive_losses=0),
+    )
+    runtime._underlying_exit_times[("orb", "NIFTY")] = datetime(
+        2026, 10, 14, 10, 0, tzinfo=IST)
+    runtime._underlying_last_exit_loss[("orb", "NIFTY")] = True
+
+    candidate = _candidate(strategy="orb")
+    option = candidate["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        candidate, option, option["legs"][0], options,
+        now=datetime(2026, 10, 14, 10, 2, tzinfo=IST))
+    assert lots == 0
+    assert reason == "options underlying reentry cooldown is active"
+
+    lots, _, reason = runtime._risk_preflight(
+        candidate, option, option["legs"][0], options,
+        now=datetime(2026, 10, 14, 10, 6, tzinfo=IST))
+    assert reason != "options underlying reentry cooldown is active"
+
+
+def test_loss_only_reentry_cooldown_ignores_a_winner(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, reentry_cooldown_after_exit_seconds=300,
+             reentry_cooldown_loss_only=True,
+             reentry_cooldown_by_strategy={"orb": 300},
+             max_consecutive_losses=0),
+    )
+    runtime._underlying_exit_times[("orb", "NIFTY")] = datetime(
+        2026, 10, 14, 10, 0, tzinfo=IST)
+    runtime._underlying_last_exit_loss[("orb", "NIFTY")] = False
+
+    candidate = _candidate(strategy="orb")
+    option = candidate["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        candidate, option, option["legs"][0], options,
+        now=datetime(2026, 10, 14, 10, 1, tzinfo=IST))
+    assert reason != "options underlying reentry cooldown is active"
+
+
+def test_earliest_entry_time_is_per_strategy(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path,
+             earliest_entry_time_by_strategy={"orb": "10:00",
+                                              "orb_retest": "09:45"},
+             max_consecutive_losses=0),
+    )
+    early = datetime(2026, 10, 14, 9, 50, tzinfo=IST)
+
+    orb = _candidate(strategy="orb")
+    orb_option = orb["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        orb, orb_option, orb_option["legs"][0], options, now=early)
+    assert lots == 0
+    assert reason == "options earliest-entry time not reached"
+
+    retest = _candidate(strategy="orb_retest")
+    retest_option = retest["option_legs"]
+    _, _, reason = runtime._risk_preflight(
+        retest, retest_option, retest_option["legs"][0], options, now=early)
+    assert reason != "options earliest-entry time not reached"
+
+
+def test_skip_event_records_the_blocking_strategy(tmp_path, monkeypatch):
+    """The forward report needs to attribute a gate skip to its sleeve."""
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    captured = []
+
+    def fake_record(event, record):
+        captured.append((event, dict(record)))
+
+    monkeypatch.setattr(runtime, "_record_event", fake_record)
+    monkeypatch.setattr(
+        runtime, "_risk_preflight",
+        lambda *args, **kwargs: (0, 0.0, "options earliest-entry time not reached"))
+
+    runtime.execute_plan(_plan(), options, now=NOW)
+
+    skips = [record for event, record in captured if event == "skip"]
+    assert skips, "a blocked candidate must emit a skip event"
+    assert skips[0]["strategy"] == "orb"
+    assert skips[0]["setup"] == "breakout"
+    assert skips[0]["option_underlying"] == "NIFTY"
+    assert skips[0]["reason"] == "options earliest-entry time not reached"
+
+
 def _stop_position(strategy="orb"):
     return {
         "position_id": "OPT_stop",
@@ -1149,3 +1253,44 @@ def test_stock_scan_preserves_bank_correlation_limit(tmp_path, monkeypatch):
     assert len(options.open_calls) == 1
     assert placed[0]["option_underlying"] in {"HDFCBANK", "SBIN"}
     assert runtime._state["daily_entries"] == 1
+
+
+def test_shadow_signals_are_logged_without_orders_intents_or_daily_entries(
+        tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    runtime, options, _, _ = _live_runtime(tmp_path, monkeypatch)
+    found = {
+        "snapshots": [],
+        "diagnostics": {
+            "requested": 2, "data_ok": 2, "no_signal": 2, "not_listed": 0,
+            "contract_rejection": 0, "fetch_errors": 0, "selected": 0,
+        },
+        "shadow": [{
+            "underlying": "NIFTY", "strategy": "mean_reversion",
+            "direction": "bullish", "option_type": "CE",
+            "expiry": "16-Oct-2026", "strike": 100.0, "kind": "CE",
+            "bid": 9.8, "ask": 10.0, "vwap_would_block": True,
+            "vwap_reason": "vwap_counter_trend(close=99.00<vwap=100.00)",
+            "collides_with_tradable": False,
+        }],
+    }
+    monkeypatch.setattr(
+        runtime, "_read_only_scan", lambda *args, **kwargs: deepcopy(found))
+
+    placed = runtime.scan_and_execute(now=datetime(2026, 10, 14, 9, 35, tzinfo=IST))
+
+    assert placed == []
+    assert options.open_calls == []
+    assert runtime._state.get("daily_entries", 0) == 0
+    assert not runtime._state.get("intents")
+    shadow_events = [payload for event, payload in runtime.trader.events
+                     if event == "shadow_signal"]
+    assert len(shadow_events) == 1
+    assert shadow_events[0]["strategy"] == "mean_reversion"
+    assert shadow_events[0]["vwap_would_block"] is True
+    assert runtime.last_scan_diagnostics["shadow_signals"] == 1
+    scan_events = [payload for event, payload in runtime.trader.events
+                   if event == "options_scan"]
+    assert scan_events and scan_events[-1]["submitted"] == 0
+    assert scan_events[-1]["shadow_signals"] == 1

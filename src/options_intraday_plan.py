@@ -29,7 +29,7 @@ BAR_SIZE = timedelta(minutes=5)
 DEFAULT_STRATEGIES = ("orb", "pullback", "momentum")
 # mean_reversion was added to the live planner after backtesting showed the
 # momentum branch loses in every window; it is opt-in via the mode config.
-ALLOWED_STRATEGIES = set(DEFAULT_STRATEGIES) | {"mean_reversion"}
+ALLOWED_STRATEGIES = set(DEFAULT_STRATEGIES) | {"mean_reversion", "orb_retest"}
 NSE_OPEN = time(9, 15)
 NSE_LAST_BAR_START = time(15, 10)
 
