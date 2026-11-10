@@ -52,15 +52,17 @@ Only **one executable session**, and MR had no signal on it. The 0/75 result is 
 
 ## 4. Model evidence (context only, not proof)
 
-From `orb_retest_v2_backtest.json` (59 sessions, ATM BS, flat 18% IV):
+From `orb_retest_v2_backtest.json` (60 sessions, 2026-08-13 .. 2026-11-09,
+ATM BS, flat 18% IV; regenerated after the stateless confirmation fix):
 
 | Sleeve | Trades | Win % | Net | PF | t-stat |
 |---|---|---|---|---|---|
-| ORB live | 202 | 48.0 | ₹54,735 | 1.22 | 1.24 |
-| MR | 68 | 54.4 | ₹31,647 | 1.49 | 1.37 |
-| ORB + MR | 225 | 55.1 | ₹1,63,018 | 1.71 | 3.53 |
+| ORB live | 188 | 46.8 | ₹42,861 | 1.19 | 1.02 |
+| MR | 69 | 55.1 | ₹37,111 | 1.57 | 1.57 |
+| ORB + C + Retest + MR (active book) | 209 | 57.4 | ₹1,58,713 | 1.80 | 3.67 |
 
-MR looks better than ORB, but its stand-alone t-stat is weak and real IV medians (14–16%) are below the model's 18%. Forward evidence is required.
+MR looks better than ORB stand-alone, but its t-stat is still weak and real IV
+medians (14–16%) are below the model's 18%. Forward evidence is required.
 
 ## 5. Decision — Stage 1 shadow first
 
@@ -158,7 +160,8 @@ strategy object per scan.
   forwarding test in `tests/test_options_live_scan.py`. Existing routing
   fixtures pin `orb_confirm_closes: 1` so they keep testing their own policy.
 
-Full suite after 5c: **790 passed**.
+Full suite after 5c: **790 passed**. `orb_retest_v2_backtest.json` was
+regenerated on the fixed semantics; section 4 carries the refreshed numbers.
 
 ## 6. Stages 2–3 (later, after shadow evidence)
 
