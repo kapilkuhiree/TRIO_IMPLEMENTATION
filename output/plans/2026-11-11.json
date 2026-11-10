@@ -1,6 +1,6 @@
 {
   "date": "2026-11-11",
-  "generated_at": "2026-11-09T20:17:57.887875+00:00",
+  "generated_at": "2026-11-10T17:49:25.725434+00:00",
   "trading_mode": "options_intraday",
   "asset": "options",
   "candidates": [],
@@ -47,7 +47,7 @@
     "source": {
       "source": "yfinance",
       "symbol": "^NSEI",
-      "fetched_at": "2026-11-09T20:17:58.747078+00:00"
+      "fetched_at": "2026-11-10T17:49:26.174769+00:00"
     }
   },
   "execution_ready": false,
