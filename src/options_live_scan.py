@@ -263,13 +263,19 @@ def _candidate_strategy_name(candidate: Mapping[str, Any]) -> str:
 
 def _shadow_record(candidate: Mapping[str, Any], symbol: str,
                    candles: List[Dict[str, Any]], observed_at: str,
-                   contracts: Dict[Tuple[Any, ...], Dict[str, Any]]) -> Dict[str, Any]:
+                   contracts: Dict[Tuple[Any, ...], Dict[str, Any]],
+                   *, chain_source: str = "live") -> Dict[str, Any]:
     """Describe one shadow-only signal without touching the tradable pool.
 
     The VWAP check is evaluated separately here so ORB's call site and the
     ``_vwap_allows`` implementation remain byte-identical.  ``_contract_key``
     is stored privately so collision flags can be filled in after the global
     dedupe has run.
+
+    ``chain_source`` is ``"cache"`` when a same-session cached chain supplied
+    contract identity after the live provider failed.  Such a record is still
+    log-only: the flag exists so replay/reporting can exclude the stale premium
+    from any fill or P&L adjudication.
     """
     option = candidate.get("option_legs") or {}
     leg = (option.get("legs") or [{}])[0] or {}
@@ -293,6 +299,8 @@ def _shadow_record(candidate: Mapping[str, Any], symbol: str,
         "trading_symbol": leg.get("trading_symbol"),
         "bid": planner._finite(leg.get("bid")),
         "ask": planner._finite(leg.get("ask")),
+        "quote_age_seconds": planner._finite(
+            (candidate.get("option_diagnostic") or {}).get("quote_age_seconds")),
         "rank_score": planner._finite(candidate.get("rank_score")),
         "underlying_entry": planner._finite(candidate.get("entry_price")),
         "underlying_stop_loss": planner._finite(candidate.get("stop_loss")),
@@ -303,6 +311,8 @@ def _shadow_record(candidate: Mapping[str, Any], symbol: str,
         "vwap_reason": why,
         "vwap_would_block": not allowed,
         "collides_with_tradable": False,
+        "chain_source": chain_source,
+        "chain_cached": chain_source == "cache",
         "_contract_key": contract_key,
     }
     return record
@@ -544,14 +554,57 @@ def _candles(data: Any, instrument: dict) -> Any:
     return raw
 
 
-def _enrich_chain(chain: Any, symbol: str, contracts: dict) -> tuple[dict, Counter]:
+def _chain_timestamp(chain: Mapping[str, Any]) -> datetime | None:
+    """Best-effort retrieval timestamp for a chain payload."""
+    candidates = [
+        chain.get("retrieved_at"),
+        (chain.get("diagnostics") or {}).get("retrieved_at"),
+        chain.get("quote_timestamp"),
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=planner.IST)
+        return parsed
+    return None
+
+
+def _same_session_chain(chain: Mapping[str, Any], symbol: str,
+                        current: datetime) -> bool:
+    """True only when a cached chain belongs to the current session.
+
+    A cached chain may supply contract identity (strike/expiry) to a shadow
+    record, but a payload from a previous day must never be used, even for a
+    log-only sleeve.  The symbol identity is checked when the payload carries
+    one; a missing timestamp is treated as untrusted.
+    """
+    if not isinstance(chain, Mapping):
+        return False
+    cached_symbol = str(chain.get("symbol") or "").strip().upper()
+    if cached_symbol and cached_symbol != str(symbol).strip().upper():
+        return False
+    stamp = _chain_timestamp(chain)
+    if stamp is None:
+        return False
+    return stamp.astimezone(planner.IST).date() == current.astimezone(planner.IST).date()
+
+
+def _enrich_chain(chain: Any, symbol: str, contracts: dict,
+                  *, allow_cached: bool = False) -> tuple[dict, Counter]:
     if not isinstance(chain, Mapping):
         raise ValueError("chain_unavailable_or_invalid")
     if _symbol(chain.get("symbol")) != symbol:
         raise ValueError("chain_underlying_mismatch")
     retrieval = {**((chain.get("diagnostics") or {}).get("retrieval") or {}),
                  **(chain.get("retrieval") or {})}
-    if (retrieval.get("served_from_cache") and not retrieval.get("cache_fallback")) or retrieval.get("success") is False:
+    cache_hit = bool(retrieval.get("served_from_cache")
+                     and not retrieval.get("cache_fallback"))
+    if retrieval.get("success") is False or (cache_hit and not allow_cached):
         logger.warning(f"CHAIN REJECTED: underlying={symbol} reason=chain_not_fresh_provider_response retrieval={retrieval}")
         raise ValueError("chain_not_fresh_provider_response")
     if str(chain.get("exchange") or "NSE").upper() != "NSE":
@@ -636,6 +689,13 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
     ``fetch_chain(symbol, use_cache=False)`` callable/object. Injected failures
     and missing symbols are terminal for that input: there is no fallback to
     a disk plan, another underlying, or another provider.
+
+    The one exception is log-only: when every signal on an underlying belongs
+    to a declared ``shadow_strategies`` sleeve and the live chain fails, the
+    provider is retried with ``use_cache=True``. A same-session cached chain
+    may supply strike/expiry identity for the shadow record, which is marked
+    ``chain_source="cache"``. It can never enter the tradable pool, and a
+    cache from a previous session is rejected.
 
     Diagnostic stage counts are per underlying, except ``selected`` (unique
     candidates) and ``fetch_errors`` (provider/missing-data errors). Rejections
@@ -736,6 +796,7 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         if step is not None:
             specs = {**specs, "strike_step": step, "strike_interval": step}
         signals = []
+        signaled_strategies = set()
         state["strategies"] = {}
         for strategy in strategies:
             if strategy == "pullback" and any(row.get("volume") is None for row in candles):
@@ -747,6 +808,8 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
                     index=len(candles) - 1, orb_confirm_closes=orb_confirm_closes,
                 )
                 signals.extend(generated)
+                if generated:
+                    signaled_strategies.add(_strategy_key(strategy))
                 state["strategies"][strategy] = {"status": "signal" if generated else "no_signal"}
             except Exception as exc:
                 state["strategies"][strategy] = {"status": "rejected", "reason": str(exc)}
@@ -754,26 +817,65 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         if not signals:
             diagnostics["no_signal"] += 1
             continue
+        # A cached chain may only ever support log-only sleeves.  Require every
+        # signal that fired on this underlying to be a declared shadow strategy
+        # before the cache fallback below is allowed to run.
+        signals_are_shadow_only = bool(shadow_strategies) and (
+            signaled_strategies <= shadow_strategies)
+        chain = None
+        chain_error = None
+        chain_source = "live"
         try:
             chain = provider(symbol, use_cache=False)
         except Exception as exc:
-            diagnostics["fetch_errors"] += 1
-            reject(symbol, "chain", exc)
-            continue
+            chain_error = exc
+        if chain is None and signals_are_shadow_only:
+            # Shadow records need contract identity (strike/expiry), not a
+            # tradable quote.  Retry the provider's cache path only after the
+            # live chain failed, and accept it only if it is same-session.
+            try:
+                cached = provider(symbol, use_cache=True)
+            except Exception as exc:
+                cached = None
+                chain_error = chain_error or exc
+            if cached is not None:
+                retrieval = cached.get("retrieval") or {}
+                is_cache = bool(retrieval.get("served_from_cache")
+                                or retrieval.get("cache_fallback"))
+                if is_cache and not _same_session_chain(cached, symbol, current):
+                    diagnostics["stale_chain_cache"] = (
+                        diagnostics.get("stale_chain_cache", 0) + 1)
+                    state["stale_chain_cache"] = True
+                else:
+                    chain = cached
+                    chain_source = "cache" if is_cache else "live"
         if chain is None:
             diagnostics["fetch_errors"] += 1
-            reject(symbol, "chain", "chain_unavailable")
+            reject(symbol, "chain", chain_error or "chain_unavailable")
             continue
+        state["chain_source"] = chain_source
         chain_provider = chain.get("provider") or chain.get("source")
         if chain_provider:
             state["chain_provider"] = chain_provider
             retrieval = chain.get("retrieval") or {}
             if retrieval.get("fallback_reason"):
                 state["chain_fallback_reason"] = retrieval["fallback_reason"]
+        plan_cfg = symbol_cfg
+        if chain_source == "cache":
+            # The cached payload supplies identity, not a tradable quote.
+            # Relax the planner's quote-age gate for this shadow-only call;
+            # every candidate is stripped before ranking below.
+            plan_cfg = deepcopy(symbol_cfg)
+            plan_mode = plan_cfg.setdefault("options_intraday", {})
+            plan_mode["max_quote_age_minutes"] = max(
+                planner._cfg_float(plan_mode, ("max_quote_age_minutes",), 15.0),
+                24 * 60.0,
+            )
         try:
-            enriched, rejected_quotes = _enrich_chain(chain, symbol, contracts)
+            enriched, rejected_quotes = _enrich_chain(
+                chain, symbol, contracts, allow_cached=chain_source == "cache")
             state["rejected_quotes"] = dict(rejected_quotes)
-            plan = planner.build_intraday_plan(symbol_cfg, now=asof(), candles=candles, chain=enriched)
+            plan = planner.build_intraday_plan(plan_cfg, now=asof(), candles=candles, chain=enriched)
         except Exception as exc:
             diagnostics["contract_rejection"] += 1
             reject(symbol, "contract", exc)
@@ -789,10 +891,18 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
                 if _candidate_strategy_key(candidate) in shadow_strategies:
                     shadow_count += 1
                     shadow.append(_shadow_record(
-                        candidate, symbol, candles, asof().isoformat(), contracts))
+                        candidate, symbol, candles, asof().isoformat(), contracts,
+                        chain_source=chain_source))
                 else:
                     tradable.append(candidate)
             candidates = tradable
+        if chain_source == "cache" and candidates:
+            # Defensive: a cached chain must never reach the ranked pool, even
+            # if the planner returned a candidate outside the shadow set.
+            diagnostics["cached_chain_tradable_rejected"] = (
+                diagnostics.get("cached_chain_tradable_rejected", 0) + len(candidates))
+            reject(symbol, "chain", "cached_chain_tradable_rejected")
+            continue
         if shadow_count:
             state["shadow_signals"] = shadow_count
             if not candidates:
@@ -860,6 +970,8 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         1 for record in shadow if record.get("vwap_would_block"))
     diagnostics["shadow_contract_collisions"] = sum(
         1 for record in shadow if record.get("collides_with_tradable"))
+    diagnostics["shadow_cached_chains"] = sum(
+        1 for record in shadow if record.get("chain_cached"))
     return result
 
 

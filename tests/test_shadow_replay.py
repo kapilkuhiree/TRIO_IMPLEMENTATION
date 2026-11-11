@@ -1,5 +1,7 @@
 """Offline tests for the shadow-signal replay report."""
 
+from pathlib import Path
+
 from scripts.shadow_replay import (
     build_report,
     build_shadow_trades,
@@ -62,6 +64,22 @@ def test_build_shadow_trades_strategy_filter():
     trades, _ = build_shadow_trades(records, strategies=["mean_reversion"])
     assert len(trades) == 1
     assert trades[0]["strategy"] == "mean_reversion"
+
+
+def test_cached_identity_is_reported_but_pnl_still_comes_from_archive_quotes():
+    records = [
+        {**_shadow("2026-11-11T10:00:05+05:30"),
+         "chain_source": "cache", "chain_cached": True},
+        _shadow("2026-11-11T10:05:05+05:30"),
+    ]
+    trades, _ = build_shadow_trades(records)
+    assert [trade["chain_cached"] for trade in trades] == [True, False]
+
+    report = build_report(
+        [], trades=trades, raw=2, start=None, end=None,
+        archive_path=Path("archive.db"), log_path=Path("trade_log.jsonl"))
+    assert report["shadow"]["cached_identity"] == 1
+    assert "1 cached-identity" in format_report(report)
 
 
 def _pair(strategy, day, net, *, status="matched", reason=None):

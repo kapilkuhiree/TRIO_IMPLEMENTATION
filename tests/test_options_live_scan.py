@@ -673,6 +673,175 @@ def test_real_smc_signal_is_shadow_logged_and_never_tradable():
         "smc_liquidity"]["status"] == "signal"
 
 
+def _cached_chain(symbol="NIFTY", *, retrieved_at=None,
+                  timestamp="2026-10-14T09:34:00+05:30",
+                  cache_fallback=True):
+    chain = _chain(symbol, timestamp=timestamp)
+    chain["retrieved_at"] = retrieved_at or NOW.isoformat()
+    chain["retrieval"] = {
+        "served_from_cache": True,
+        "cache_fallback": cache_fallback,
+        "provider": "nse",
+    }
+    return chain
+
+
+def test_shadow_only_uses_same_session_cache_when_live_chain_fails(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, "mean_reversion", 100, kind="PE"),
+        ], "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    calls = []
+
+    def provider(symbol, *, use_cache):
+        calls.append(use_cache)
+        return None if not use_cache else _cached_chain(symbol, cache_fallback=False)
+
+    cfg = _shadow_cfg(["NIFTY"], strategies=("mean_reversion",))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW,
+        instrument_rows=[_metadata(), _metadata(kind="PE")],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=provider)
+
+    assert calls == [False, True]
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["fetch_errors"] == 0
+    assert result["diagnostics"]["shadow_signals"] == 1
+    assert result["diagnostics"]["shadow_cached_chains"] == 1
+    shadow = result["shadow"][0]
+    assert shadow["strategy"] == "mean_reversion"
+    assert shadow["chain_source"] == "cache"
+    assert shadow["chain_cached"] is True
+
+
+def test_tradable_candidate_never_falls_back_to_cached_chain(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [_strategy_candidate(symbol, "orb", 100)],
+                "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+    calls = []
+
+    def provider(symbol, *, use_cache):
+        calls.append(use_cache)
+        return None if not use_cache else _cached_chain(symbol)
+
+    cfg = _shadow_cfg(["NIFTY"], shadow=("mean_reversion",), strategies=("orb",))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW, instrument_rows=[_metadata()],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=provider)
+
+    # The cache retry is shadow-only; a tradable signal must never trigger it.
+    assert calls == [False]
+    assert result["snapshots"] == []
+    assert result["shadow"] == []
+    assert result["diagnostics"]["fetch_errors"] == 1
+    assert any(entry.get("stage") == "chain" and entry.get("reason") == "chain_unavailable"
+               for entry in result["diagnostics"]["rejections"])
+
+
+def test_stale_cached_chain_is_rejected_even_for_shadow(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, "mean_reversion", 100, kind="PE"),
+        ], "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+
+    def provider(symbol, *, use_cache):
+        if not use_cache:
+            return None
+        return _cached_chain(symbol, retrieved_at="2026-10-13T15:00:00+05:30")
+
+    cfg = _shadow_cfg(["NIFTY"], strategies=("mean_reversion",))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW,
+        instrument_rows=[_metadata(), _metadata(kind="PE")],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=provider)
+
+    assert result["snapshots"] == []
+    assert result["shadow"] == []
+    assert result["diagnostics"]["shadow_signals"] == 0
+    assert result["diagnostics"]["stale_chain_cache"] == 1
+    assert result["diagnostics"]["fetch_errors"] == 1
+
+
+def test_cached_chain_cannot_promote_a_tradable_candidate(
+        monkeypatch, signal_boundary):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, "orb", 100),
+            _strategy_candidate(symbol, "mean_reversion", 200, kind="PE"),
+        ], "option_chain": chain}
+
+    monkeypatch.setattr(scan.planner, "build_intraday_plan", plan)
+
+    def provider(symbol, *, use_cache):
+        return None if not use_cache else _cached_chain(symbol)
+
+    cfg = _shadow_cfg(["NIFTY"], strategies=("mean_reversion",))
+    result = scan.build_live_options_scan(
+        cfg, now=NOW,
+        instrument_rows=[_metadata(), _metadata(kind="PE")],
+        market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+        chain_provider=provider)
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["cached_chain_tradable_rejected"] == 1
+    assert len(result["shadow"]) == 1
+    assert result["shadow"][0]["strategy"] == "mean_reversion"
+    assert result["shadow"][0]["chain_cached"] is True
+
+
+def test_real_smc_signal_uses_stale_same_session_cache_for_shadow_only():
+    """A cached chain supplies identity, not a fill, for the SMC sleeve.
+
+    The quote is deliberately older than the planner's live-quote gate.  The
+    shadow-only path relaxes that gate, marks the record ``chain_cached`` and
+    still produces zero tradable candidates.
+    """
+    now = datetime(2026, 10, 14, 10, 15, tzinfo=IST)
+    cfg = _cfg(["NIFTY"])
+    cfg["options_intraday"]["strategies"] = ["smc_liquidity"]
+    cfg["options_intraday"]["shadow_strategies"] = ["smc_liquidity"]
+
+    cached = _cached_chain("NIFTY", retrieved_at=now.isoformat(),
+                           timestamp="2026-10-14T09:20:00+05:30")
+    cached["underlying"] = 100.4
+
+    def provider(symbol, *, use_cache):
+        return None if not use_cache else cached
+
+    result = scan.build_live_options_scan(
+        cfg, now=now, instrument_rows=[_metadata()],
+        market_data={"NIFTY": _smc_setup_candles()},
+        chain_provider=provider)
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["shadow_signals"] == 1
+    assert result["diagnostics"]["shadow_cached_chains"] == 1
+    shadow = result["shadow"][0]
+    assert shadow["strategy"] == "smc_liquidity"
+    assert shadow["chain_source"] == "cache"
+    assert shadow["chain_cached"] is True
+    assert shadow["quote_age_seconds"] > 15 * 60
+
+
 def test_shadow_only_signal_reports_no_contract_rejection_and_no_snapshot(
         monkeypatch, signal_boundary):
     def plan(cfg, *, now, candles, chain):

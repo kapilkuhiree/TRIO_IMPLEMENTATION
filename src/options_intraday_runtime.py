@@ -1399,7 +1399,7 @@ class OptionsIntradayRuntime:
                     pnl, record.get("reason", ""), record.get("position_id", ""))
         elif event == "shadow_signal":
             logger.info(
-                "SHADOW %s %s %s %s%s | ask %.2f | vwap_block %s (%s) | %s",
+                "SHADOW %s %s %s %s%s | ask %.2f | vwap_block %s (%s) | %s | chain %s",
                 record.get("strategy", ""), record.get("underlying", ""),
                 record.get("expiry", ""),
                 _finite_number(record.get("strike"), 0.0) or 0.0,
@@ -1408,7 +1408,8 @@ class OptionsIntradayRuntime:
                 bool(record.get("vwap_would_block")),
                 record.get("vwap_reason", ""),
                 ("collides with tradable contract"
-                 if record.get("collides_with_tradable") else "no collision"))
+                 if record.get("collides_with_tradable") else "no collision"),
+                record.get("chain_source", "live"))
         else:
             logger.info("options_intraday %s %s", event, record.get("position_id", ""))
         logger_method = getattr(self.trader, "_log_event", None)
@@ -1536,7 +1537,7 @@ class OptionsIntradayRuntime:
         logger.info("Options scan: %s", {key: self.last_scan_diagnostics.get(key, 0)
                     for key in ("requested", "data_ok", "no_signal", "not_listed",
                                 "contract_rejection", "fetch_errors", "selected",
-                                "shadow_signals")})
+                                "shadow_signals", "shadow_cached_chains")})
         universe = _universe(self.cfg)
         instruments = {item["symbol"]: item for item in universe}
         contracts = _metadata(rows, universe, clock(), {})

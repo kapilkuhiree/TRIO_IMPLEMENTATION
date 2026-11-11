@@ -159,6 +159,8 @@ def build_shadow_trades(
             "lots": 1,
             "vwap_would_block": bool(record.get("vwap_would_block")),
             "collides_with_tradable": bool(record.get("collides_with_tradable")),
+            "chain_source": record.get("chain_source") or "live",
+            "chain_cached": bool(record.get("chain_cached")),
             "ask": _finite(record.get("ask")),
             "trading_symbol": record.get("trading_symbol"),
         })
@@ -266,6 +268,8 @@ def build_report(
             "replayed": len(pairs),
             "matched": len(hits),
             "match_rate": (len(hits) / len(pairs) * 100.0) if pairs else 0.0,
+            "cached_identity": sum(
+                1 for trade in trades if trade.get("chain_cached")),
             "hypothetical_net": net_stats,
             "hypothetical_gross": gross_stats,
             "miss_reasons": dict(Counter(pair.get("reason", "no_trade")
@@ -291,7 +295,8 @@ def format_report(report: Dict[str, Any]) -> str:
     lines.append(f"Signals  : {shadow['raw_events']} raw rows | "
                  f"{shadow['signals']} distinct | "
                  f"{shadow['matched']} matched executable quotes "
-                 f"({shadow['match_rate']:.1f}%)")
+                 f"({shadow['match_rate']:.1f}%) | "
+                 f"{shadow.get('cached_identity', 0)} cached-identity")
     lines.append("")
     net = shadow["hypothetical_net"]
     gross = shadow["hypothetical_gross"]
