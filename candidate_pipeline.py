@@ -261,6 +261,10 @@ class CandidatePipeline:
             MomentumContinuationStrategy,
         )
         from strategies.mean_reversion_strategy import MeanReversionStrategy
+        from strategies.opening_range_reversion_strategy import (
+            OpeningRangeReversionStrategy,
+        )
+        from strategies.smc_liquidity_strategy import SmcLiquidityStrategy
 
         key = str(strategy_name or "").strip().lower()
         strategy_types = {
@@ -269,6 +273,8 @@ class CandidatePipeline:
             "pullback": TrendPullbackStrategy,
             "momentum": MomentumContinuationStrategy,
             "mean_reversion": MeanReversionStrategy,
+            "opening_range_reversion": OpeningRangeReversionStrategy,
+            "smc_liquidity": SmcLiquidityStrategy,
         }
         strategy_type = strategy_types.get(key)
         if strategy_type is None or not candles:
@@ -282,6 +288,24 @@ class CandidatePipeline:
         if key == "mean_reversion":
             strategy = strategy_type()
             signal = strategy.evaluate_signal(candles, index)
+        elif key == "opening_range_reversion":
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
+        elif key == "smc_liquidity":
+            # SMC has no lot-size constructor argument; its signal boundary is
+            # the same (candles, index, specs, symbol) shape as ORRS.
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
         elif key == "orb":
             strategy = strategy_type(
                 lot_size=int(specs.get("lot_size") or 0),
@@ -335,6 +359,8 @@ class CandidatePipeline:
                 "pullback": "Pullback",
                 "momentum": "Momentum",
                 "mean_reversion": "MeanReversion",
+                "opening_range_reversion": "OpeningRangeReversion",
+                "smc_liquidity": "SMC-Liquidity",
             }[key],
             direction=cls._trade_direction(signal_dict),
             option_type=option_type,

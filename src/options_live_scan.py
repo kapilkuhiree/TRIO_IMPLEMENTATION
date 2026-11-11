@@ -214,6 +214,31 @@ def _vwap_allows(signal: Any, candles: List[Dict[str, Any]], symbol: str) -> Tup
     return True, ""
 
 
+def _strategy_key(value: Any) -> str:
+    """Normalise a strategy name for comparison.
+
+    Three spellings reach this module: the planner lowercases its display name
+    (``MeanReversion``), config keys use snake_case (``mean_reversion``), and
+    ORB-Retest arrives hyphenated (``orb-retest``).  Stripping everything but
+    letters and digits makes all three compare equal - the same rule the
+    intraday runtime already applies.
+    """
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+# Canonical snake_case names used in logs and reports, so a shadow record is
+# always labelled the way the config spells it.
+_CANONICAL_STRATEGY_NAMES = {
+    "orb": "orb",
+    "orbretest": "orb_retest",
+    "meanreversion": "mean_reversion",
+    "openingrangereversion": "opening_range_reversion",
+    "smcliquidity": "smc_liquidity",
+    "pullback": "pullback",
+    "momentum": "momentum",
+}
+
+
 def _shadow_strategy_names(mode: Mapping[str, Any]) -> set:
     """Return the log-only sleeves declared in ``shadow_strategies``."""
     raw = mode.get("shadow_strategies") or []
@@ -221,14 +246,19 @@ def _shadow_strategy_names(mode: Mapping[str, Any]) -> set:
         raw = raw.split(",")
     names = set()
     for item in raw:
-        name = str(item).strip().lower()
+        name = _strategy_key(item)
         if name:
             names.add(name)
     return names
 
 
+def _candidate_strategy_key(candidate: Mapping[str, Any]) -> str:
+    return _strategy_key(candidate.get("strategy") or candidate.get("setup") or "")
+
+
 def _candidate_strategy_name(candidate: Mapping[str, Any]) -> str:
-    return str(candidate.get("strategy") or candidate.get("setup") or "").strip().lower()
+    key = _candidate_strategy_key(candidate)
+    return _CANONICAL_STRATEGY_NAMES.get(key, key)
 
 
 def _shadow_record(candidate: Mapping[str, Any], symbol: str,
@@ -756,7 +786,7 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         shadow_count = 0
         if shadow_strategies:
             for candidate in candidates:
-                if _candidate_strategy_name(candidate) in shadow_strategies:
+                if _candidate_strategy_key(candidate) in shadow_strategies:
                     shadow_count += 1
                     shadow.append(_shadow_record(
                         candidate, symbol, candles, asof().isoformat(), contracts))

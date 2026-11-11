@@ -8,10 +8,14 @@ options_intraday:
   # book flat before the close.  (Was 14:30.)
   entry_cutoff: "15:00"
   hard_flat: "15:10"
-  strategies: [orb, orb_retest, mean_reversion]
+  strategies: [orb, orb_retest, mean_reversion, opening_range_reversion, smc_liquidity]
   # Log-only sleeves: generate signals for diagnostics but never enter the
   # tradable pool (no rank/dedupe, no intent, no orders, no risk counters).
-  shadow_strategies: [mean_reversion]
+  # opening_range_reversion (ORRS) is shadow-only until it has >=20 forward
+  # sessions; its validated exits need a time stop that the runtime lacks.
+  # smc_liquidity (SMC) is shadow-only while its forward sample is collected;
+  # its validated exit is a structural stop/target, not the ORB premium ladder.
+  shadow_strategies: [mean_reversion, opening_range_reversion, smc_liquidity]
   # ORB needs two consecutive 5-minute closes beyond the opening range before
   # it may enter.  ORB-Retest keeps its own 09:45 floor; plain ORB waits for
   # 10:00 so the first two post-range closes are available.
@@ -19,6 +23,12 @@ options_intraday:
   earliest_entry_time_by_strategy:
     orb: "10:00"
     orb_retest: "09:45"
+    # ORRS needs the 09:15-09:30 range plus a completed bar to close back
+    # inside it, so the earliest possible entry is the 09:35 bar open.
+    opening_range_reversion: "09:35"
+    # SMC enforces 09:45 internally too; the key is here so the runtime gate
+    # and the strategy agree if the sleeve is ever promoted.
+    smc_liquidity: "09:45"
   # Discovery only: scan stock underlyings, but route BUY CE/PE options only.
   # Options must exist in today's exact broker listing; no equity fallback.
   # Live scan scope is pinned by scripts/session.py through

@@ -603,6 +603,76 @@ def test_shadow_signal_is_logged_but_never_enters_tradable_pool(monkeypatch, sig
     assert result["diagnostics"]["shadow_contract_collisions"] == 1
 
 
+def _smc_setup_candles():
+    """A real sweep -> displacement -> MSS -> FVG retrace session.
+
+    Dated so the retrace bar (10:10) is the latest completed bar at the scan
+    clock used by the end-to-end test.  Volume is zero on purpose: NSE index
+    candles carry no volume and SMC must not depend on it.
+    """
+    def bar(ts, open_, high, low, close):
+        return {"timestamp": ts.isoformat(), "open": open_, "high": high,
+                "low": low, "close": close, "volume": 0.0,
+                "underlying_symbol": "NIFTY", "instrument_type": "index",
+                "exchange": "NSE"}
+
+    candles = []
+    day1 = datetime(2026, 10, 13, 9, 15, tzinfo=IST)
+    for k in range(72):          # 09:15 .. 15:10, the full prior session
+        candles.append(bar(day1 + timedelta(minutes=5 * k), 100, 101, 99, 100))
+
+    day2 = datetime(2026, 10, 14, 9, 15, tzinfo=IST)
+    steps = [
+        (100.0, 100.3, 99.8, 100.1), (100.1, 100.5, 100.0, 100.3),
+        (100.3, 100.7, 100.2, 100.5), (100.5, 100.9, 100.4, 100.7),
+        (100.7, 101.1, 100.6, 100.9), (100.9, 101.3, 100.8, 101.1),
+        (101.0, 102.0, 100.9, 101.6), (101.6, 101.7, 100.6, 100.9),
+        (100.1, 100.2, 99.6, 100.0), (100.0, 100.1, 98.8, 99.9),
+        (100.6, 103.8, 100.5, 103.5), (103.4, 103.6, 100.3, 101.0),
+    ]
+    for k, (open_, high, low, close) in enumerate(steps):
+        candles.append(bar(day2 + timedelta(minutes=5 * k),
+                           open_, high, low, close))
+    return candles
+
+
+def test_real_smc_signal_is_shadow_logged_and_never_tradable():
+    """No mocks below the scan boundary: real candles, real planner, real strip.
+
+    This is the wiring proof for the forward run.  A hand-written candidate
+    would not catch a display-name mismatch between the planner
+    (``SMC-Liquidity``), the config key (``smc_liquidity``) and the shadow
+    matcher, which is exactly the failure mode that silently kept MR tradable.
+    """
+    now = datetime(2026, 10, 14, 10, 15, tzinfo=IST)
+    cfg = _cfg(["NIFTY"])
+    cfg["options_intraday"]["strategies"] = ["smc_liquidity"]
+    cfg["options_intraday"]["shadow_strategies"] = ["smc_liquidity"]
+
+    chain = _chain("NIFTY", timestamp="2026-10-14T10:14:00+05:30")
+    chain["underlying"] = 100.4
+    chain["retrieved_at"] = now.isoformat()
+
+    result = scan.build_live_options_scan(
+        cfg, now=now, instrument_rows=[_metadata()],
+        market_data={"NIFTY": _smc_setup_candles()},
+        chain_provider=lambda *args, **kwargs: chain)
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["shadow_signals"] == 1
+    assert len(result["shadow"]) == 1
+
+    shadow = result["shadow"][0]
+    assert shadow["strategy"] == "smc_liquidity"
+    assert shadow["option_type"] == "CE"
+    assert shadow["strike"] == 100
+    assert shadow["underlying"] == "NIFTY"
+    # SMC's structural exit is not ORB's premium ladder; the replay must say so.
+    assert result["diagnostics"]["per_underlying"]["NIFTY"]["strategies"][
+        "smc_liquidity"]["status"] == "signal"
+
+
 def test_shadow_only_signal_reports_no_contract_rejection_and_no_snapshot(
         monkeypatch, signal_boundary):
     def plan(cfg, *, now, candles, chain):

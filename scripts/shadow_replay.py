@@ -41,6 +41,26 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SLOT_SECONDS = 300
 DEFAULT_LOG = ROOT / "output" / "trade_log.jsonl"
 
+# Sleeves whose validated exit profile is not modelled by the shared replay
+# policy yet.  Grading them here would silently apply ORB's staged ladder and
+# produce a number that does not describe the strategy that was backtested.
+UNADJUDICATED_SLEEVES = {
+    "opening_range_reversion": (
+        "ORRS exits on a 45-minute clock with a +22%/-32% premium band; this "
+        "replay applies ORB's staged ladder, so its P&L is not comparable."
+    ),
+    "smc_liquidity": (
+        "SMC's validated exit is a structural stop/target on the underlying "
+        "(sweep extreme +/- ATR, RR target); this replay applies ORB's "
+        "premium ladder, so its P&L is indicative only.  Grade SMC with the "
+        "structural exit against the archived quotes."
+    ),
+}
+
+
+def _sleeve_key(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
 
 def parse_ts(value: Any) -> Optional[datetime]:
     """Parse a ledger timestamp and normalise it to IST."""
@@ -355,6 +375,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     archive = args.archive or default_archive_path()
+    wanted = {_sleeve_key(item) for item in args.strategies}
+    for name, reason in UNADJUDICATED_SLEEVES.items():
+        if _sleeve_key(name) in wanted:
+            print(
+                f"WARNING: {name} is not adjudicable with this replay policy.\n"
+                f"  {reason}",
+                file=sys.stderr,
+            )
     records = load_records(args.log, include_test=args.include_test)
     trades, raw = build_shadow_trades(
         records, start=args.start, end=args.end, strategies=args.strategies)

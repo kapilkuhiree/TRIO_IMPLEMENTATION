@@ -115,7 +115,10 @@ def test_live_mode_keeps_the_weekday_book(monkeypatch):
     assert effective["execution_class"] == "live"
     assert effective["PAPER_TRADING"] is False
     assert effective["live_session_date"] == SESSION_DATE
-    assert effective["strategies"] == ["orb", "orb_retest", "mean_reversion"]
+    assert effective["strategies"] == [
+        "orb", "orb_retest", "mean_reversion", "opening_range_reversion",
+        "smc_liquidity",
+    ]
     assert effective["max_open_positions"] == 2
     assert effective["max_premium_per_position"] == 18000
     assert effective["min_wallet"] == 40000
@@ -134,7 +137,10 @@ def test_without_live_flag_normal_paper_mode_is_unchanged(monkeypatch):
            "broker": {"provider": "megabull"}}
     ok, reason = validate_options_mode_environment(cfg)
     assert ok, reason
-    assert mode["strategies"] == ["orb", "orb_retest", "mean_reversion"]
+    assert mode["strategies"] == [
+        "orb", "orb_retest", "mean_reversion", "opening_range_reversion",
+        "smc_liquidity",
+    ]
     assert mode["max_open_positions"] == 2
     assert mode["PAPER_TRADING"] is True
 
@@ -149,9 +155,14 @@ def test_without_live_flag_zerodha_paper_is_rejected(monkeypatch):
     assert "megabull" in reason
 
 
-def test_shipped_paper_config_shadows_only_mean_reversion():
+def test_shipped_paper_config_shadows_only_the_research_sleeves():
     """Stage 1 must never put ORB or ORB-Retest into the log-only path."""
     mode = _yaml_mode(PAPER)
-    assert mode["shadow_strategies"] == ["mean_reversion"]
+    assert mode["shadow_strategies"] == [
+        "mean_reversion", "opening_range_reversion", "smc_liquidity",
+    ]
     assert "orb" not in mode["shadow_strategies"]
     assert "orb_retest" not in mode["shadow_strategies"]
+    assert "smc_liquidity" in mode["strategies"]
+    assert mode["earliest_entry_time_by_strategy"]["opening_range_reversion"] == "09:35"
+    assert mode["earliest_entry_time_by_strategy"]["smc_liquidity"] == "09:45"

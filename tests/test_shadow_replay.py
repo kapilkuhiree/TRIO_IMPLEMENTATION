@@ -136,3 +136,44 @@ def test_main_handles_an_empty_ledger_without_an_archive(tmp_path):
     assert main([
         "--log", str(log), "--archive", str(archive),
     ]) == 0
+
+
+def test_orrs_is_flagged_as_not_adjudicable(tmp_path, capsys):
+    """A 45-minute-clock sleeve must not be graded with ORB's ladder policy."""
+    log = tmp_path / "trade_log.jsonl"
+    log.write_text("", encoding="utf-8")
+    archive = tmp_path / "missing.sqlite3"
+
+    assert main([
+        "--log", str(log), "--archive", str(archive),
+        "--strategies", "opening_range_reversion",
+    ]) == 0
+
+    captured = capsys.readouterr()
+    assert "WARNING: opening_range_reversion" in captured.err
+    assert "45-minute clock" in captured.err
+
+
+def test_mean_reversion_is_not_flagged(tmp_path, capsys):
+    log = tmp_path / "trade_log.jsonl"
+    log.write_text("", encoding="utf-8")
+    archive = tmp_path / "missing.sqlite3"
+
+    assert main(["--log", str(log), "--archive", str(archive)]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_smc_is_flagged_as_not_adjudicable(tmp_path, capsys):
+    """SMC exits structurally on the underlying, not on ORB's premium ladder."""
+    log = tmp_path / "trade_log.jsonl"
+    log.write_text("", encoding="utf-8")
+    archive = tmp_path / "missing.sqlite3"
+
+    assert main([
+        "--log", str(log), "--archive", str(archive),
+        "--strategies", "smc_liquidity",
+    ]) == 0
+
+    captured = capsys.readouterr()
+    assert "WARNING: smc_liquidity" in captured.err
+    assert "structural stop/target" in captured.err

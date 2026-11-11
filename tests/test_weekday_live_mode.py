@@ -48,7 +48,10 @@ def test_weekday_overlay_uses_normal_book(runner):
     assert mode["execution_class"] == "live"
     assert mode["PAPER_TRADING"] is False
     assert mode["live_session_date"] == today
-    assert mode["strategies"] == ["orb", "orb_retest", "mean_reversion"]
+    assert mode["strategies"] == [
+        "orb", "orb_retest", "mean_reversion", "opening_range_reversion",
+        "smc_liquidity",
+    ]
     assert mode["max_open_positions"] == 2
     assert mode["max_premium_per_position"] == 18000
     assert mode["scan_underlyings"] == ["NIFTY"]
@@ -58,7 +61,10 @@ def test_default_overlay_is_the_weekday_book(runner):
     today = datetime.now(IST).date().isoformat()
     cfg = runner._effective_config(_args())
     mode = cfg["options_intraday"]
-    assert mode["strategies"] == ["orb", "orb_retest", "mean_reversion"]
+    assert mode["strategies"] == [
+        "orb", "orb_retest", "mean_reversion", "opening_range_reversion",
+        "smc_liquidity",
+    ]
     assert mode["max_open_positions"] == 2
     assert mode["max_premium_per_position"] == 18000
     assert mode["live_session_date"] == today
