@@ -288,6 +288,15 @@ class OptionsIntradayRuntime:
         self._underlying_last_exit_loss: Dict[Tuple[str, str], bool] = {}
         self._chain_provider = self.mode_cfg.get("chain_provider")
         self._bar_provider = self.mode_cfg.get("completed_bar_provider")
+        # Shadow-only LLM judge.  Optional, non-blocking, never on the order
+        # path: it queues a snapshot per unique signal and the verdict is
+        # written to the trade log for later evaluation.  None == disabled.
+        self._llm_judge = None
+        try:
+            from src.llm_judge import build_shadow_judge
+            self._llm_judge = build_shadow_judge(self.mode_cfg, logger)
+        except Exception as exc:  # a broken judge must never block trading
+            logger.warning("llm_judge unavailable: %s", exc)
         self._roll_daily_state(_now_ist(None).date().isoformat())
 
     # ------------------------------------------------------------------
@@ -1029,6 +1038,28 @@ class OptionsIntradayRuntime:
                      item.get("status") in {"pending", "uncertain"})
         return count
 
+    def _slots_used(self) -> Dict[str, int]:
+        """Occupied entry slots grouped by strategy.
+
+        Diagnostic only: the entry gates still decide every trade.  With five
+        promoted sleeves this makes the per-sleeve allocation visible in the
+        ``Options scan:`` log line instead of inferred from closed trades.
+        """
+        counts: Dict[str, int] = {}
+        for item in (self._state.get("positions", {}) or {}).values():
+            if not isinstance(item, dict):
+                continue
+            key = _strategy_scope(item.get("strategy"))
+            counts[key] = counts.get(key, 0) + 1
+        for item in (self._state.get("intents", {}) or {}).values():
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") not in {"pending", "uncertain"}:
+                continue
+            key = _strategy_scope(item.get("strategy"))
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def _underlying_has_active_entry(self, underlying: str,
                                      strategy: Optional[str] = None) -> bool:
         """Return True when this strategy already has an entry on the index.
@@ -1410,6 +1441,18 @@ class OptionsIntradayRuntime:
                 ("collides with tradable contract"
                  if record.get("collides_with_tradable") else "no collision"),
                 record.get("chain_source", "live"))
+        elif event == "llm_verdict":
+            verdict = record.get("verdict") or {}
+            logger.info(
+                "LLM %s %s %s | bias %s conf %.2f | %s | %sms | %s | %s",
+                record.get("strategy", ""), record.get("underlying", ""),
+                str(record.get("bar_ts", ""))[11:16],
+                verdict.get("bias", record.get("status", "-")),
+                _finite_number(verdict.get("confidence"), 0.0) or 0.0,
+                verdict.get("reason_code", record.get("error", "")),
+                record.get("latency_ms", "-"),
+                record.get("model", ""),
+                record.get("key_id", ""))
         else:
             logger.info("options_intraday %s %s", event, record.get("position_id", ""))
         logger_method = getattr(self.trader, "_log_event", None)
@@ -1425,6 +1468,42 @@ class OptionsIntradayRuntime:
             if not isinstance(record, dict):
                 continue
             self._record_event("shadow_signal", dict(record))
+
+    # -- shadow LLM judge (log-only) ------------------------------------
+    def _submit_judge(self, candidates: List[Dict[str, Any]]) -> None:
+        """Queue judge snapshots for the candidates a scan produced.
+
+        Failures are swallowed: the judge is observational and must never be
+        able to change whether an order is placed.
+        """
+        judge = getattr(self, "_llm_judge", None)
+        if judge is None:
+            return
+        for candidate in candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            snapshot = candidate.get("judge_snapshot")
+            if not isinstance(snapshot, dict) or not snapshot:
+                continue
+            try:
+                judge.submit(snapshot)
+            except Exception:
+                pass
+
+    def _drain_judge(self) -> None:
+        """Persist any completed verdicts, then forget them."""
+        judge = getattr(self, "_llm_judge", None)
+        if judge is None:
+            return
+        try:
+            records = judge.poll()
+        except Exception:
+            return
+        for record in records or []:
+            try:
+                self._record_event("llm_verdict", dict(record))
+            except Exception:
+                pass
 
     def _intent(self, key: str, candidate: Dict[str, Any], payload: Dict[str, Any],
                 lots: int, risk_amount: float,
@@ -1531,19 +1610,25 @@ class OptionsIntradayRuntime:
         found = self._read_only_scan(self.cfg, clock, listings)
         self.last_scan_diagnostics = deepcopy(found["diagnostics"])
         self.last_scan_diagnostics.update(submitted=0, entry_rejections=[])
+        self.last_scan_diagnostics["slots_used"] = self._slots_used()
         shadow_records = found.get("shadow") or []
         self.last_scan_diagnostics["shadow_signals"] = len(shadow_records)
         self._log_shadow_signals(shadow_records)
         logger.info("Options scan: %s", {key: self.last_scan_diagnostics.get(key, 0)
                     for key in ("requested", "data_ok", "no_signal", "not_listed",
                                 "contract_rejection", "fetch_errors", "selected",
-                                "shadow_signals", "shadow_cached_chains")})
+                                "shadow_signals", "shadow_cached_chains",
+                                "slots_used")})
         universe = _universe(self.cfg)
         instruments = {item["symbol"]: item for item in universe}
         contracts = _metadata(rows, universe, clock(), {})
         pool = [(candidate, snapshot) for snapshot in found["snapshots"]
                 for candidate in snapshot.get("option_candidates", [])]
         pool.sort(key=lambda item: item[0].get("rank", math.inf))
+        # Shadow judge: enqueue one snapshot per unique signal before any entry
+        # gate runs.  This records the LLM's opinion on what the scanner saw,
+        # including candidates that the gates reject.
+        self._submit_judge([candidate for candidate, _ in pool])
         refreshed: Dict[str, Any] = {}
         placed: List[Dict[str, Any]] = []
         for original, snapshot in pool:
@@ -2318,6 +2403,7 @@ class OptionsIntradayRuntime:
                 , "lots": lots
                 , "lot_size": lot_size
                 , "entry_premium": entry
+                , "entry_ts": position.get("opened_at")
                 , "exit_bid": bid
                 , "pnl": round(float(pnl_value), 2)
                 , "closed_at": close_at
@@ -2477,10 +2563,21 @@ class OptionsIntradayRuntime:
 
     def tick(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Manage owned contracts and attempt hard-flat at the configured clock."""
+        self._drain_judge()
         return self._tick(now, force_flat=False)
 
     def finalize(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Attempt to flatten every owned option, raising if any stays open."""
+        self._drain_judge()
+        judge = getattr(self, "_llm_judge", None)
+        if judge is not None:
+            try:
+                judge.close()
+            except Exception:
+                pass
+            # A verdict that completed while ``close`` was joining the worker
+            # is still in memory; persist it before the process exits.
+            self._drain_judge()
         if not (self._state.get("positions", {}) or {}):
             # Still reconcile an attached book so unrelated remote holdings are
             # never silently ignored at shutdown.

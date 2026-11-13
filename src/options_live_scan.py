@@ -22,7 +22,7 @@ from pathlib import Path
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -126,8 +126,16 @@ def resolve_scan_universe(cfg: dict) -> list[str]:
     return [row["symbol"] for row in _universe(cfg or {})]
 
 
-def fetch_multiple(symbols, timeframe="5m", period="5d"):
-    """Late-bound batch candle hook; injectable without changing global state."""
+def fetch_multiple(symbols, timeframe="5m", period="10d"):
+    """Late-bound batch candle hook; injectable without changing global state.
+
+    Ten calendar days, not five: the mean-reversion sleeve needs
+    ``HISTORY_BARS = 200`` completed 5m bars, and a 5-day window yields only
+    ~165 on a normal week (75 per session x 2.2 sessions after the forming bar
+    is dropped).  At 5d every MR candidate was silently starved and the
+    ``shadow_signals`` count stayed at zero.  10d yields ~500 bars, which is
+    still small enough to keep the batch request quick.
+    """
     from src.data_fetcher import fetch_multiple as fetch
     return fetch(symbols, timeframe=timeframe, period=period)
 
@@ -252,6 +260,34 @@ def _shadow_strategy_names(mode: Mapping[str, Any]) -> set:
     return names
 
 
+def _vwap_filter_scope(mode: Mapping[str, Any]) -> Optional[set]:
+    """Return the sleeves the VWAP trend filter applies to, or ``None``.
+
+    ``None`` is the historical behaviour: the filter runs on every tradable
+    sleeve.  It is returned whenever ``vwap_filter_strategies`` is absent,
+    empty, or unusable, so a malformed value can never silently disable the
+    filter.  A non-empty list narrows the filter to exactly those sleeves;
+    every other sleeve passes through with the reason
+    ``vwap_filter_scoped_out``.
+    """
+    raw = mode.get("vwap_filter_strategies")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return None
+    names = {_strategy_key(item) for item in raw}
+    names.discard("")
+    return names or None
+
+
+def _vwap_scoped_out(mode: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+    """True when this candidate's sleeve is exempt from the VWAP filter."""
+    scope = _vwap_filter_scope(mode)
+    return scope is not None and _candidate_strategy_key(candidate) not in scope
+
+
 def _candidate_strategy_key(candidate: Mapping[str, Any]) -> str:
     return _strategy_key(candidate.get("strategy") or candidate.get("setup") or "")
 
@@ -316,6 +352,102 @@ def _shadow_record(candidate: Mapping[str, Any], symbol: str,
         "_contract_key": contract_key,
     }
     return record
+
+
+# Tradable sleeves that the shadow LLM judge is allowed to observe.  Shadow
+# sleeves are excluded on purpose: they never place orders, so an LLM opinion
+# on them has no entry decision to attach to.
+_JUDGE_STRATEGIES = {"orb", "orb_retest"}
+
+
+def _judge_snapshot(candidate: Mapping[str, Any], symbol: str,
+                    candles: List[Dict[str, Any]],
+                    *, max_bars: int = 16) -> Dict[str, Any]:
+    """Build the compact, read-only payload sent to the shadow LLM judge.
+
+    Pure data: no I/O, no mutation of ``candidate`` or ``candles``.  Returns an
+    empty dict when the candidate is not on a judged sleeve, so callers can
+    always attach the result unconditionally.
+    """
+    strategy = _candidate_strategy_name(candidate)
+    if strategy not in _JUDGE_STRATEGIES or not candles:
+        return {}
+
+    def _stamp(row: Mapping[str, Any]) -> str:
+        return str(row.get("timestamp") or "")
+
+    last_date = _stamp(candles[-1])[:10]
+    session = [row for row in candles if _stamp(row)[:10] == last_date]
+    if len(session) < 4:
+        return {}
+
+    orb_rows = [row for row in session
+                if _stamp(row)[11:16] in {"09:15", "09:20", "09:25"}]
+    if len(orb_rows) < 3:
+        return {}
+
+    try:
+        orb_high = max(float(row.get("high")) for row in orb_rows)
+        orb_low = min(float(row.get("low")) for row in orb_rows)
+        spot = float(session[-1].get("close"))
+    except (TypeError, ValueError):
+        return {}
+    if spot <= 0 or orb_high <= orb_low:
+        return {}
+
+    tail = session[-15:]
+    ranges: List[float] = []
+    for previous, current in zip(tail, tail[1:]):
+        try:
+            high = float(current.get("high"))
+            low = float(current.get("low"))
+            prev_close = float(previous.get("close"))
+        except (TypeError, ValueError):
+            continue
+        ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    atr = sum(ranges) / len(ranges) if ranges else 0.0
+
+    direction = str(candidate.get("direction") or "").strip().lower()
+    if direction in {"bullish", "long"}:
+        trigger = orb_high
+        extension = (spot - orb_high) / atr if atr > 0 else 0.0
+    elif direction in {"bearish", "short"}:
+        trigger = orb_low
+        extension = (orb_low - spot) / atr if atr > 0 else 0.0
+    else:
+        trigger = None
+        extension = 0.0
+
+    option = candidate.get("option_legs") or {}
+    leg = (option.get("legs") or [{}])[0] or {}
+    bars = []
+    for row in session[-max(1, int(max_bars)):]:
+        bars.append({
+            "t": _stamp(row)[11:16],
+            "o": planner._finite(row.get("open")),
+            "h": planner._finite(row.get("high")),
+            "l": planner._finite(row.get("low")),
+            "c": planner._finite(row.get("close")),
+            "v": planner._finite(row.get("volume")),
+        })
+
+    return {
+        "underlying": symbol,
+        "strategy": strategy,
+        "direction": direction,
+        "option_type": _signal_option_type(candidate),
+        "bar_ts": _stamp(session[-1]),
+        "signal_timestamp": candidate.get("signal_timestamp"),
+        "trigger": round(trigger, 2) if isinstance(trigger, float) else trigger,
+        "spot": round(spot, 2),
+        "vwap": (round(vwap, 2) if (vwap := _session_vwap(session)) else None),
+        "atr": round(atr, 2),
+        "extension_atr": round(extension, 2),
+        "orb_high": round(orb_high, 2),
+        "orb_low": round(orb_low, 2),
+        "premium": planner._finite(leg.get("ask")),
+        "bars": bars,
+    }
 
 
 def option_instruments():
@@ -728,8 +860,8 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
 
     symbols = [row["market_symbol"] for row in universe]
     try:
-        data = (fetch_multiple(symbols, timeframe="5m", period="5d") if market_data is None
-                else market_data(symbols, timeframe="5m", period="5d") if callable(market_data)
+        data = (fetch_multiple(symbols, timeframe="5m", period="10d") if market_data is None
+                else market_data(symbols, timeframe="5m", period="10d") if callable(market_data)
                 else market_data)
         if not isinstance(data, Mapping):
             raise ValueError("market_data_not_a_symbol_mapping")
@@ -914,6 +1046,14 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
         # --- VWAP trend filter ---
         kept_candidates = []
         for candidate in candidates:
+            if _vwap_scoped_out(mode, candidate):
+                # Paper-only scoping: this sleeve's own entry rules already
+                # encode trend, so the shared VWAP gate is skipped for it.
+                # The shadow record above still computes ``vwap_allows`` so
+                # historical comparisons stay intact.
+                candidate["vwap_filter"] = "vwap_filter_scoped_out"
+                kept_candidates.append(candidate)
+                continue
             allowed, why = _vwap_allows(candidate, candles, symbol)
             if allowed:
                 kept_candidates.append(candidate)
@@ -934,7 +1074,10 @@ def build_live_options_scan(cfg, now=None, instrument_rows=None, market_data=Non
                 logger.warning(f"CONTRACT REJECTED (Validation): underlying={symbol} reason={exc}")
                 reject(symbol, "contract", exc)
                 continue
-            ranked.append((score, key, symbol, deepcopy(candidate)))
+            ranked.append((score, key, symbol, {
+                **deepcopy(candidate),
+                "judge_snapshot": _judge_snapshot(candidate, symbol, candles),
+            }))
             accepted += 1
         if not accepted:
             diagnostics["contract_rejection"] += 1

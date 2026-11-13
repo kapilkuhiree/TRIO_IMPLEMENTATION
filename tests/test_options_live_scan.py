@@ -156,7 +156,7 @@ def test_all_100_stocks_are_fetched_in_one_short_5m_batch_even_if_not_listed(mon
     symbols, timeframe, period = calls[0]
     assert len(symbols) == 104
     assert len([symbol for symbol in symbols if scan._symbol(symbol) not in scan.INDEX_MARKET_SYMBOLS]) == 100
-    assert timeframe == "5m" and period == "5d"
+    assert timeframe == "5m" and period == "10d"
     assert result["diagnostics"]["requested"] == 104
     assert result["diagnostics"]["data_ok"] == 104
     assert result["diagnostics"]["not_listed"] == 104
@@ -893,3 +893,122 @@ def test_orb_confirmation_count_defaults_to_one_and_comes_from_config(
     cfg["options_intraday"]["orb_confirm_closes"] = 2
     scan.build_live_options_scan(cfg, now=NOW, **inputs)
     assert signal_boundary[0][3] == 2
+
+
+def test_candle_cache_is_keyed_by_period_not_just_symbol_and_timeframe(monkeypatch):
+    """A 5d fetch must never satisfy a 10d request.
+
+    The options scan needs 10d so the MR shadow sleeve gets its 200-bar
+    history; other callers still ask for 5d.  Sharing one cache entry starved
+    every MR candidate for a whole session.
+    """
+    frames = {"5d": pd.DataFrame({"Open": [1.0]}), "10d": pd.DataFrame({"Open": [2.0]})}
+    calls = []
+
+    def fake_fetch(symbol, timeframe, period):
+        calls.append(period)
+        return frames[period].copy()
+
+    monkeypatch.setattr(data_fetcher, "_fetch_zerodha", fake_fetch)
+    monkeypatch.setattr(data_fetcher, "_completed_bar_index", lambda now, seconds: 42)
+    monkeypatch.setattr(data_fetcher, "_CANDLE_CACHE", {})
+
+    short = data_fetcher._fetch_zerodha_cached("NIFTY", "5m", "5d")
+    long = data_fetcher._fetch_zerodha_cached("NIFTY", "5m", "10d")
+    short_again = data_fetcher._fetch_zerodha_cached("NIFTY", "5m", "5d")
+
+    assert calls == ["5d", "10d"]
+    assert short["Open"].iloc[0] == 1.0
+    assert long["Open"].iloc[0] == 2.0
+    assert short_again["Open"].iloc[0] == 1.0
+
+
+def _vwap_scope_cfg(strategies, *, scope=None, shadow=()):
+    cfg = _cfg(["NIFTY"])
+    cfg["options_intraday"]["strategies"] = list(strategies)
+    cfg["options_intraday"]["shadow_strategies"] = list(shadow)
+    if scope is not None:
+        cfg["options_intraday"]["vwap_filter_strategies"] = list(scope)
+    return cfg
+
+
+def _counter_trend_plan(strategy, *, kind="PE", score=100):
+    def plan(cfg, *, now, candles, chain):
+        symbol = cfg["options_intraday"]["underlying"]
+        return {"option_candidates": [
+            _strategy_candidate(symbol, strategy, score, kind=kind),
+        ], "option_chain": chain}
+    return plan
+
+
+def _pe_inputs(kind="PE"):
+    return dict(instrument_rows=[_metadata(), _metadata(kind=kind)],
+                market_data={"NIFTY": _candles("NIFTY", breakout=True)},
+                chain_provider=lambda *args, **kwargs: _chain("NIFTY"))
+
+
+def test_vwap_filter_scoped_out_still_allows_a_promoted_sleeve(
+        monkeypatch, signal_boundary):
+    """Close 102 is above VWAP, so a PE is counter-trend and would be blocked."""
+    monkeypatch.setattr(scan.planner, "build_intraday_plan",
+                        _counter_trend_plan("mean_reversion"))
+    cfg = _vwap_scope_cfg(["mean_reversion"], scope=["orb", "orb_retest"])
+
+    result = scan.build_live_options_scan(cfg, now=NOW, **_pe_inputs())
+
+    tradable = [candidate for snapshot in result["snapshots"]
+                for candidate in snapshot["option_candidates"]]
+    assert [candidate["strategy"] for candidate in tradable] == ["mean_reversion"]
+    assert tradable[0]["vwap_filter"] == "vwap_filter_scoped_out"
+    assert result["diagnostics"]["selected"] == 1
+    # Promoted out of shadow: no log-only row for the same signal.
+    assert result["shadow"] == []
+    assert result["diagnostics"]["shadow_signals"] == 0
+
+
+def test_vwap_filter_still_blocks_orb_when_scoped(monkeypatch, signal_boundary):
+    monkeypatch.setattr(scan.planner, "build_intraday_plan",
+                        _counter_trend_plan("orb"))
+    cfg = _vwap_scope_cfg(["orb"], scope=["orb", "orb_retest"])
+
+    result = scan.build_live_options_scan(cfg, now=NOW, **_pe_inputs())
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["selected"] == 0
+    assert result["diagnostics"]["contract_rejection"] == 1
+
+
+def test_vwap_filter_without_the_key_still_filters_every_sleeve(
+        monkeypatch, signal_boundary):
+    """Absent scope preserves today's behaviour byte-for-byte."""
+    monkeypatch.setattr(scan.planner, "build_intraday_plan",
+                        _counter_trend_plan("mean_reversion"))
+    cfg = _vwap_scope_cfg(["mean_reversion"])
+
+    result = scan.build_live_options_scan(cfg, now=NOW, **_pe_inputs())
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["contract_rejection"] == 1
+
+
+def test_vwap_empty_scope_fails_closed_and_filters_every_sleeve(
+        monkeypatch, signal_boundary):
+    monkeypatch.setattr(scan.planner, "build_intraday_plan",
+                        _counter_trend_plan("mean_reversion"))
+    cfg = _vwap_scope_cfg(["mean_reversion"], scope=[])
+
+    result = scan.build_live_options_scan(cfg, now=NOW, **_pe_inputs())
+
+    assert result["snapshots"] == []
+    assert result["diagnostics"]["contract_rejection"] == 1
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None),
+    ([], None),
+    ("", None),
+    (["orb"], {"orb"}),
+    ("orb,orb_retest", {"orb", "orbretest"}),
+])
+def test_vwap_filter_scope_helper_normalises_names(raw, expected):
+    assert scan._vwap_filter_scope({"vwap_filter_strategies": raw}) == expected

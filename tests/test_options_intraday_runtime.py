@@ -533,9 +533,14 @@ def test_tick_closes_at_fresh_bid_stop_first_and_updates_production_risk(tmp_pat
     runtime = OptionsIntradayRuntime(
         trader, _cfg(tmp_path, chain_provider=lambda *args, **kwargs: exit_chain))
     runtime.execute_plan(_plan(), options, now=NOW)
+    opened_at = runtime._state["positions"][
+        "OPT_long-call_30-Oct-2026_25000x0"]["opened_at"]
     closed = runtime.tick(now=datetime(2026, 10, 14, 10, 5, tzinfo=IST))
     assert len(closed) == 1
     assert closed[0]["reason"] == "stop-loss"
+    # The live audit reads the closed leg from the state file; keep the entry
+    # timestamp with it so a restart cannot lose it.
+    assert closed[0]["entry_ts"] == opened_at
     assert options.close_calls == [("OPT_long-call_30-Oct-2026_25000x0", 39.0, "stop-loss")]
     assert get_risk_state().open_positions == 0
     assert get_risk_state().daily_pnl == -100.0
@@ -1294,3 +1299,215 @@ def test_shadow_signals_are_logged_without_orders_intents_or_daily_entries(
                    if event == "options_scan"]
     assert scan_events and scan_events[-1]["submitted"] == 0
     assert scan_events[-1]["shadow_signals"] == 1
+
+
+class _FakeJudge:
+    """Minimal stand-in for ShadowJudge; records what it was asked to do."""
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.submitted = []
+        self.closed = False
+
+    def submit(self, snapshot):
+        self.submitted.append(snapshot)
+        return True
+
+    def poll(self):
+        drained, self.records = list(self.records), []
+        return drained
+
+    def close(self, timeout=3.0):
+        self.closed = True
+
+
+def test_judge_snapshots_are_submitted_but_never_touch_the_order_path(tmp_path):
+    options = _OptionsDouble()
+    trader = _Trader(options, tmp_path)
+    runtime = OptionsIntradayRuntime(trader, _cfg(tmp_path))
+    runtime._llm_judge = _FakeJudge([])
+
+    snapshot = {"underlying": "NIFTY", "strategy": "orb",
+                "direction": "bearish", "bar_ts": "2026-11-11T13:50:00+05:30"}
+    runtime._submit_judge([
+        {"judge_snapshot": snapshot, "rank": 1},
+        {"rank": 2},                       # no snapshot: shadow sleeve
+        {"judge_snapshot": {}, "rank": 3},  # builder declined
+        "not-a-dict",
+    ])
+
+    assert runtime._llm_judge.submitted == [snapshot]
+    # Nothing about the judge may create state, intents or orders.
+    assert runtime._state.get("intents") == {}
+    assert runtime._state.get("positions") == {}
+    assert options.open_calls == []
+
+
+def test_completed_judge_verdicts_are_logged_as_llm_verdict_events(tmp_path):
+    options = _OptionsDouble()
+    trader = _Trader(options, tmp_path)
+    runtime = OptionsIntradayRuntime(trader, _cfg(tmp_path))
+    runtime._llm_judge = _FakeJudge([
+        {"underlying": "NIFTY", "strategy": "orb", "status": "ok",
+         "bar_ts": "2026-11-11T13:50:00+05:30",
+         "verdict": {"bias": "short", "confidence": 0.8, "agrees": True}},
+    ])
+
+    runtime._drain_judge()
+
+    logged = [payload for event, payload in trader.events if event == "llm_verdict"]
+    assert len(logged) == 1
+    assert logged[0]["verdict"]["bias"] == "short"
+    # Drain is idempotent: a verdict is written exactly once.
+    runtime._drain_judge()
+    assert len([p for e, p in trader.events if e == "llm_verdict"]) == 1
+
+
+def test_judge_failures_never_block_tick_or_finalize(tmp_path):
+    class ExplodingJudge(_FakeJudge):
+        def submit(self, snapshot):
+            raise RuntimeError("judge exploded")
+
+        def poll(self):
+            raise RuntimeError("judge exploded")
+
+        def close(self, timeout=3.0):
+            raise RuntimeError("judge exploded")
+
+    runtime = OptionsIntradayRuntime(_Trader(_OptionsDouble(), tmp_path), _cfg(tmp_path))
+    runtime._llm_judge = ExplodingJudge([])
+
+    runtime._submit_judge([{"judge_snapshot": {"underlying": "NIFTY"}}])
+    runtime._drain_judge()
+    runtime._drain_judge()  # no raise, no state change
+
+_PAPER_ALL_SLEEVES = (
+    "orb", "orb_retest", "mean_reversion",
+    "opening_range_reversion", "smc_liquidity",
+)
+
+_PAPER_ALL_OVERRIDES = {
+    "shadow_strategies": [],
+    "max_open_positions": 5,
+    "max_correlated_positions": 5,
+    "max_premium_exposure_pct": 9.00,
+    "max_consecutive_losses": 5,
+    "vwap_filter_strategies": ["orb", "orb_retest"],
+    "max_premium_per_position": 18000,
+}
+
+
+def _paper_all_cfg(tmp_path):
+    return _cfg(tmp_path, **_PAPER_ALL_OVERRIDES)
+
+
+def _open_position(strategy, cycle, *, strike=25000.0):
+    return {
+        "option_underlying": "NIFTY",
+        "strategy": strategy,
+        "entry_premium": 50.0,
+        "last_bid": 50.0,
+        "last_bid_at_ms": cycle,
+        "mark_status": "fresh",
+        "lots": 1,
+        "lot_size": 65,
+        "ask_premium": 50.0,
+        "premium_exposure": 3250.0,
+        "strike": strike,
+    }
+
+
+def test_paper_all_five_sleeves_each_get_one_slot(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _paper_all_cfg(tmp_path))
+    cycle = int(NOW.timestamp() * 1000)
+    runtime._state["mark_cycle_ms"] = cycle
+
+    # Every sleeve passes its own preflight while the other four already hold
+    # a NIFTY position: five independent slots, not two.
+    for index, sleeve in enumerate(_PAPER_ALL_SLEEVES):
+        candidate = _candidate(strategy=sleeve)
+        option = candidate["option_legs"]
+        lots, _, reason = runtime._risk_preflight(
+            candidate, option, option["legs"][0], options, now=NOW)
+        assert lots > 0, f"{sleeve} was blocked: {reason}"
+        runtime._state["positions"][f"pos-{index}"] = _open_position(sleeve, cycle)
+
+    assert runtime._active_position_count() == 5
+    assert runtime._slots_used() == {sleeve: 1 for sleeve in _PAPER_ALL_SLEEVES}
+
+    # With all five slots taken, the sixth entry is refused by the slot cap.
+    candidate = _candidate(strategy="orb")
+    option = candidate["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        candidate, option, option["legs"][0], options, now=NOW)
+    assert lots == 0
+    assert reason == "options max-open-position limit reached"
+
+
+def test_paper_all_same_sleeve_cannot_pyramid_but_other_sleeves_can(tmp_path):
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _paper_all_cfg(tmp_path))
+    cycle = int(NOW.timestamp() * 1000)
+    runtime._state["mark_cycle_ms"] = cycle
+    runtime._state["positions"]["orb-1"] = _open_position("orb", cycle)
+
+    repeated = _candidate(strategy="orb")
+    option = repeated["option_legs"]
+    lots, _, reason = runtime._risk_preflight(
+        repeated, option, option["legs"][0], options, now=NOW)
+    assert lots == 0
+    assert "same-strategy" in reason
+
+    for sleeve in _PAPER_ALL_SLEEVES[1:]:
+        candidate = _candidate(strategy=sleeve)
+        option = candidate["option_legs"]
+        lots, _, reason = runtime._risk_preflight(
+            candidate, option, option["legs"][0], options, now=NOW)
+        assert lots > 0, f"{sleeve} was blocked by ORB's position: {reason}"
+
+
+def test_paper_all_contract_collision_keeps_the_slot_free(tmp_path):
+    options = _OptionsDouble()
+    trader = _Trader(options, tmp_path)
+    runtime = OptionsIntradayRuntime(trader, _paper_all_cfg(tmp_path))
+    first = _candidate(strategy="orb")
+    second = _candidate(strategy="mean_reversion")
+    plan = _plan(first)
+    plan["option_candidates"] = [first, second]
+
+    placed = runtime.execute_plan(plan, options, now=NOW)
+
+    # The second sleeve picks the exact contract the first one holds: it is
+    # skipped, and the position count stays at one so another contract can
+    # still use a slot.
+    assert [item["strategy"] for item in placed] == ["orb"]
+    assert runtime._active_position_count() == 1
+    reasons = [payload["reason"] for event, payload in trader.events
+               if event == "skip"]
+    assert reasons == ["contract_held_by_other_strategy"]
+
+
+def test_slots_used_counts_open_and_pending_by_strategy(tmp_path):
+    runtime = OptionsIntradayRuntime(
+        _Trader(_OptionsDouble(), tmp_path), _paper_all_cfg(tmp_path))
+    cycle = int(NOW.timestamp() * 1000)
+    runtime._state["positions"]["p1"] = _open_position("orb", cycle)
+    runtime._state["positions"]["p2"] = _open_position("mean_reversion", cycle)
+    runtime._state["intents"]["i1"] = {
+        "status": "pending", "strategy": "smc_liquidity"}
+    runtime._state["intents"]["i2"] = {
+        "status": "closed", "strategy": "opening_range_reversion"}
+
+    assert runtime._slots_used() == {"orb": 1, "mean_reversion": 1,
+                                     "smc_liquidity": 1}
+
+
+def test_paper_all_yaml_policy_unchanged_by_default(tmp_path):
+    """Off by default: the shipped two-slot policy is still what the YAML says."""
+    from src.options_intraday import options_intraday_config
+
+    effective = options_intraday_config(_cfg(tmp_path))
+
+    assert effective["max_open_positions"] == 2
+    assert "vwap_filter_strategies" not in effective or not effective["vwap_filter_strategies"]

@@ -41,6 +41,92 @@ logger = get_logger("session")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# Paper-only promotion of every configured sleeve.  Off by default: without
+# this env var the launcher behaves exactly as before, and the YAML overlay
+# keeps its conservative two-slot policy.  Live can never inherit the values
+# below because the switch refuses to run outside remote paper.
+PAPER_ALL_STRATEGIES_ENV = "TRIO_PAPER_ALL_STRATEGIES"
+
+_TRUTHY = {"1", "true", "yes", "on", "y"}
+
+
+def _paper_all_requested() -> bool:
+    return str(os.environ.get(PAPER_ALL_STRATEGIES_ENV, "")).strip().lower() in _TRUTHY
+
+
+def _paper_all_overrides() -> Dict[str, Any]:
+    """Effective remote-paper policy when every sleeve is promoted.
+
+    One slot per sleeve: five independent strategies may each hold one
+    position.  The per-position premium ceiling (Rs18,000) and the 1.50%
+    daily loss cap are deliberately *not* overridden, so every trade stays at
+    one lot and the daily budget is unchanged.
+    """
+    return {
+        # Promote mean_reversion / ORRS / SMC out of log-only mode.
+        "shadow_strategies": [],
+        "max_open_positions": 5,
+        "max_correlated_positions": 5,
+        # 5 x Rs18,000 of premium on the Rs10,00,000 risk base.
+        "max_premium_exposure_pct": 9.00,
+        "max_consecutive_losses": 5,
+        # The shared trend filter stays on the sleeves that were validated
+        # with it; the promoted sleeves keep their own trend logic.
+        "vwap_filter_strategies": ["orb", "orb_retest"],
+    }
+
+
+def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
+    """Apply the paper-only five-sleeve policy to ``cfg`` in place.
+
+    Returns True when the overrides were applied.  Raises
+    ``OptionsIntradayPolicyError`` when the switch is set outside remote
+    paper, which is a fail-closed refusal rather than a silent downgrade.
+
+    The safety check reads the *effective* options section (base config merged
+    with the ``config/options_intraday.yaml`` overlay), because that is where
+    ``execution_class`` and ``PAPER_TRADING`` actually live.  The overrides are
+    written into ``cfg["options_intraday"]``, which is merged last by
+    :func:`load_options_intraday_config` and therefore wins over the file.
+    """
+    if not _paper_all_requested():
+        return False
+    from src.options_intraday import options_intraday_config
+    from src.options_intraday_runtime import OptionsIntradayPolicyError
+
+    if not isinstance(cfg, dict):
+        raise OptionsIntradayPolicyError(
+            f"{PAPER_ALL_STRATEGIES_ENV} requires a complete options config")
+    if str(os.environ.get("TRIO_OPTIONS_LIVE", "")).strip().lower() in _TRUTHY:
+        raise OptionsIntradayPolicyError(
+            f"{PAPER_ALL_STRATEGIES_ENV} refuses to start with TRIO_OPTIONS_LIVE set")
+    try:
+        effective = options_intraday_config(cfg)
+    except ValueError as exc:
+        raise OptionsIntradayPolicyError(
+            f"{PAPER_ALL_STRATEGIES_ENV} requires remote_paper mode with a "
+            f"valid options policy: {exc}") from exc
+    paper_flag = effective.get("PAPER_TRADING")
+    paper = (paper_flag is True or
+             str(paper_flag).strip().lower() in _TRUTHY)
+    execution_class = str(effective.get("execution_class") or "").strip().lower()
+    if execution_class != "remote_paper" or not paper:
+        raise OptionsIntradayPolicyError(
+            f"{PAPER_ALL_STRATEGIES_ENV} requires execution_class=remote_paper "
+            f"and PAPER_TRADING=true (got execution_class={execution_class or '?'}, "
+            f"PAPER_TRADING={paper_flag!r})")
+
+    section = cfg.get("options_intraday")
+    if not isinstance(section, dict):
+        section = {}
+        cfg["options_intraday"] = section
+    overrides = _paper_all_overrides()
+    section.update(overrides)
+    logger.warning(
+        "Paper-all sleeves enabled (%s=1): %s", PAPER_ALL_STRATEGIES_ENV,
+        {key: section.get(key) for key in overrides})
+    return True
+
 
 def _refresh_strict_options_subplan(plan: Optional[Dict[str, Any]],
                                     cfg: Dict[str, Any],
@@ -79,6 +165,15 @@ def _run_options_only_session(cfg: Dict[str, Any], trading_mode: str,
                               max_seconds: Optional[int],
                               management_only: bool) -> None:
     """Start the strict live runtime without reading or creating any plan."""
+    # Paper-only five-sleeve policy.  Applied before the runtime is built and
+    # before any broker is acquired, so a misconfigured switch fails closed
+    # instead of placing a live order.  ``load_config`` caches one dict per
+    # process, so this mutation is what PaperTrader re-reads when it builds the
+    # runtime; the second call covers a caller that supplied a private copy.
+    _apply_paper_all_strategies(cfg)
+    cached_cfg = load_config()
+    if cached_cfg is not cfg:
+        _apply_paper_all_strategies(cached_cfg)
     # Live policy lives here (not in the YAML overlay) so the offline test
     # suite keeps its pinned risk/scan values.
     os.environ.setdefault("TRIO_OPTIONS_CAPITAL", "1000000")
