@@ -344,19 +344,25 @@ def main() -> int:
 
     # ---------------- IV sensitivity --------------------------------------
     print(f"\nIV SENSITIVITY (NIFTY, both sleeves, all sessions)")
-    print("-" * 62)
-    print(f"{'IV':<8}{'cap10 14:30':>18}{'cutoff+cap14':>18}{'delta':>14}")
-    print("-" * 62)
+    print("-" * 78)
+    print(f"{'IV':<8}{'cap10 14:30':>16}{'cap14 14:30':>16}"
+          f"{'cutoff+cap14':>16}{'c14 delta':>14}")
+    print("-" * 78)
     sensitivity = {}
     for iv in (0.14, 0.18, 0.22):
         pool = candidate_pool(candles_by, signals, make_metas(dte_map, iv),
                               ("NIFTY",), ALL_STRATEGIES)
         base = metrics(run_portfolio(pool, cap=10, cutoff_min=None), "base", 0)
+        cap14 = metrics(run_portfolio(pool, cap=14, cutoff_min=None), "cap14", 0)
         prop = metrics(run_portfolio(pool, cap=14, cutoff_min=CUTOFF_1230), "prop", 0)
-        sensitivity[f"{iv:.2f}"] = {"current": base["net"], "proposed": prop["net"]}
-        print(f"{iv:<8.0%}{base['net']:>18,.0f}{prop['net']:>18,.0f}"
-              f"{prop['net'] - base['net']:>+14,.0f}")
-    print("-" * 62)
+        sensitivity[f"{iv:.2f}"] = {
+            "current": round(base["net"], 2),
+            "cap14": round(cap14["net"], 2),
+            "cutoff_cap14": round(prop["net"], 2),
+        }
+        print(f"{iv:<8.0%}{base['net']:>16,.0f}{cap14['net']:>16,.0f}"
+              f"{prop['net']:>16,.0f}{cap14['net'] - base['net']:>+14,.0f}")
+    print("-" * 78)
 
     if args.json_out:
         out = {

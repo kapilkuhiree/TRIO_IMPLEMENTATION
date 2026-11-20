@@ -75,18 +75,27 @@ cutoff, 11/20 with it.
 
 IV sensitivity, NIFTY both sleeves, all sessions, net Rs:
 
-| IV | current | cutoff + cap 14 | delta |
-|---|---:|---:|---:|
-| 14% | 357,281 | 228,756 | -128,525 |
-| 18% | 196,071 | 118,650 | -77,421 |
-| 22% | 145,793 | 109,085 | -36,708 |
+| IV | cap 10 | cap 14 | cutoff + cap 14 | cap-14 delta |
+|---|---:|---:|---:|---:|
+| 14% | 357,281 | 381,681 | 228,756 | +24,400 |
+| 18% | 196,071 | 196,071 | 118,650 | 0 |
+| 22% | 145,793 | 145,793 | 109,085 | 0 |
 
-The cutoff loses at every IV. The cap-14 gain is smaller but positive at all
-three (e.g. +24,400 at 14%).
+The cutoff loses at every IV.
+
+The cap-14 gain is **conditional on the IV assumption**: at 18% and 22% the
+cap never binds, because the higher premium pushes candidates past the
+Rs 18,000 premium cap before the daily counter can matter, so cap 10 and
+cap 14 are identical. The gain exists only at the realistic 14% IV, where
+lower premiums let more candidates clear the premium cap. Cap 14 is never
+worse than cap 10 at any IV, but the size of the improvement should not be
+quoted without the IV.
 
 ## Decision
 
-- **Raise `max_daily_entries` 10 -> 14.** Supported.
+- **Raise `max_daily_entries` 10 -> 14.** Supported, but the gain is
+  conditional: +Rs 24,400 at the realistic 14% IV, zero at 18%/22% where the
+  premium cap stops trades before the daily cap can bind. Never worse.
 - **Do not add a 12:30 entry cutoff.** The 94-session prior and the 20-Nov
   single day both point the other way; only 17-Nov supported it. The cutoff's
   one benefit is a smaller max drawdown (-19,987 vs -28,752), which is not

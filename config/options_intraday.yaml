@@ -81,7 +81,10 @@ options_intraday:
   # Rs 357,281 at PF 2.30; cap 14 netted Rs 381,681 at PF 2.37 with the same
   # -Rs 28,752 max drawdown and the same 50/96 winning days.  Cap 16 and no cap
   # add only ~Rs 5,000 more, so 14 keeps a backstop without rationing a normal
-  # day.  A hard 12:30 entry cutoff was tested in the same run and REJECTED:
+  # day.  The gain is IV-conditional: at 18%/22% the premium cap rejects
+  # candidates before the daily cap can bind, so cap 10 and 14 are identical
+  # there.  Cap 14 is never worse.
+  # A hard 12:30 entry cutoff was tested in the same run and REJECTED:
   # it removed 91 entries worth +Rs 157,982 and cut net by Rs 128,525.
   # See scripts/validate_entry_cap.py.
   max_daily_entries: 14
