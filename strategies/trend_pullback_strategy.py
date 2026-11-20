@@ -140,8 +140,16 @@ class TrendPullbackStrategy:
                 volume = candle.get("volume", 0)
 
                 typical_price = (high + low + close) / 3.0
-                typical_price_sum += typical_price * volume
-                volume_sum += volume
+                if not volume:
+                    # Index feeds (^NSEI/^NSEBANK) report Volume=0 on
+                    # yfinance; use an equal-weighted typical price so the
+                    # VWAP gate is defined instead of silently disabling
+                    # every pullback signal.
+                    typical_price_sum += typical_price
+                    volume_sum += 1.0
+                else:
+                    typical_price_sum += typical_price * volume
+                    volume_sum += volume
 
             if volume_sum == 0:
                 return 0.0

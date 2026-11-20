@@ -478,6 +478,71 @@ def test_interval_aligned_quote_observed_after_candle_completion_is_rejected(tmp
     assert report["pnl"]["closed_trades"] == 0
 
 
+def test_quote_carry_forward_fills_a_bounded_single_candle_gap(tmp_path):
+    contract = _instrument("10b", "NIFTY26OCT25000CE", "CE")
+    candles = {contract["tradingsymbol"]: [
+        _candle(0, 100, 101, 99, 100),
+        _candle(5, 100, 105, 99, 104),
+        _candle(10, 104, 115, 103, 112),
+        _candle(15, 112, 135, 111, 130),
+    ]}
+    # The 09:25 candle has no quote of its own; its neighbours do.
+    quotes = {contract["tradingsymbol"]: [
+        _quote(0, 99, 100),
+        _quote(5, 105, 106),
+        _quote(15, 130, 131),
+    ]}
+    archive = _seed_archive(tmp_path, [contract], candles, quotes)
+    try:
+        report = _run(
+            archive,
+            [_signal(contract["tradingsymbol"], "CE", minute=-5)],
+            quote_policy=QUOTE_POLICY_INTERVAL_ALIGNED,
+            quote_carry_forward_ms=6 * 60 * 1000,
+        )
+    finally:
+        archive.close()
+
+    assert report["status"] == OPTIONS_PNL_READY
+    assert report["coverage"]["carried_quotes"] == 1
+    assert report["provenance"]["quote_carry_forward_ms"] == 360_000
+    assert report["pnl"]["closed_trades"] == 1
+    trade = report["trade_ledger"][0]
+    # The hard target is an owned quote, not the carried one.
+    assert trade["exit_price_raw_bid"] == 130.0
+    assert trade["exit_carried"] is False
+
+
+def test_quote_carry_forward_respects_the_gap_bound(tmp_path):
+    contract = _instrument("10c", "NIFTY26OCT25000CE", "CE")
+    candles = {contract["tradingsymbol"]: [
+        _candle(0, 100, 101, 99, 100),
+        _candle(5, 100, 105, 99, 104),
+        _candle(10, 104, 115, 103, 112),
+        _candle(15, 112, 135, 111, 130),
+    ]}
+    quotes = {contract["tradingsymbol"]: [
+        _quote(0, 99, 100),
+        _quote(5, 105, 106),
+        _quote(15, 130, 131),
+    ]}
+    archive = _seed_archive(tmp_path, [contract], candles, quotes)
+    try:
+        report = _run(
+            archive,
+            [_signal(contract["tradingsymbol"], "CE", minute=-5)],
+            quote_policy=QUOTE_POLICY_INTERVAL_ALIGNED,
+            quote_carry_forward_ms=60_000,
+        )
+    finally:
+        archive.close()
+
+    assert report["status"] == NOT_READY_FOR_OPTIONS_PNL
+    assert report["coverage"]["carried_quotes"] == 0
+    assert report["diagnostics"]["counts"]["missing_intermediate_exit_bid"] == 1
+    assert report["pnl"]["closed_trades"] == 0
+
+
 def test_interval_aligned_multiple_executable_quotes_are_ambiguous(tmp_path):
     contract = _instrument("11", "NIFTY26OCT25000CE", "CE")
     candles = {contract["tradingsymbol"]: [

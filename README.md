@@ -126,7 +126,7 @@ options_intraday:
   target_premium_fraction: 0.30
   risk_per_trade_pct: 0.50
   max_daily_loss_pct: 1.50
-  max_open_positions: 2
+  max_open_positions: 1
   max_premium_exposure_pct: 5.00
   allow_averaging_down: false
   PAPER_TRADING: true
@@ -145,8 +145,8 @@ options_intraday:
   broker expiry/strike/type/symbol/lot validation. Bullish signals submit **BUY CE**;
   bearish signals submit **BUY PE**, never equity, futures or short-option orders.
 - Tomorrow's approved remote-paper limits are strict: 0.50% cash risk per trade
-  at the initial premium stop, 1.50% realized-plus-unrealized daily loss, 2
-  open positions, 5.00% aggregate full-premium exposure, no averaging down,
+  at the initial premium stop, 1.50% realized-plus-unrealized daily loss, 1
+  open position, 5.00% aggregate full-premium exposure, no averaging down,
   and no new entries after the daily-loss boundary. `PAPER_TRADING=true` and
   `remote_paper` are mandatory. Five daily entries, configured correlation
   limits, 14:30 entry cutoff and 15:10 hard-flat (IST) remain active. Wider

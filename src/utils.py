@@ -31,7 +31,18 @@ ENV_PATH = PROJECT_ROOT / ".env"
 # ---------------------------------------------------------------------------
 
 def load_env() -> None:
-    """Load .env file from project root if it exists."""
+    """Load .env file from project root if it exists.
+
+    ``PYTHON_DOTENV_DISABLED`` is honoured so an in-process test or embedder
+    keeps its own environment instead of inheriting the operator's live broker
+    and data-provider settings.  ``tests/conftest.py`` sets it for exactly
+    this reason; import-time ``load_env()`` calls in helper scripts used to
+    leak ``TRIO_MARKET_DATA_PROVIDER=zerodha`` into the offline suite and
+    silently reroute every NSE chain test to Zerodha.
+    """
+    if str(os.environ.get("PYTHON_DOTENV_DISABLED", "")).strip().lower() in {
+            "1", "true", "yes", "on"}:
+        return
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
 

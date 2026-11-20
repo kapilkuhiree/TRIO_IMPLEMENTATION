@@ -4,29 +4,145 @@
 options_intraday:
   execution_class: remote_paper
   PAPER_TRADING: true
-  entry_cutoff: "14:30"
+  # Entries stay open until 15:00 IST; the 15:10 hard flat still forces the
+  # book flat before the close.  (Was 14:30.)
+  entry_cutoff: "15:00"
   hard_flat: "15:10"
-  strategies: [orb, pullback, momentum]
+  strategies: [orb, orb_retest, mean_reversion, opening_range_reversion, smc_liquidity]
+  # Log-only sleeves: generate signals for diagnostics but never enter the
+  # tradable pool (no rank/dedupe, no intent, no orders, no risk counters).
+  # opening_range_reversion (ORRS) is shadow-only until it has >=20 forward
+  # sessions; its validated exits need a time stop that the runtime lacks.
+  # smc_liquidity (SMC) is shadow-only while its forward sample is collected;
+  # its validated exit is a structural stop/target, not the ORB premium ladder.
+  shadow_strategies: [mean_reversion, opening_range_reversion, smc_liquidity]
+  # ORB needs two consecutive 5-minute closes beyond the opening range before
+  # it may enter.  ORB-Retest keeps its own 09:45 floor; plain ORB waits for
+  # 10:00 so the first two post-range closes are available.
+  orb_confirm_closes: 2
+  earliest_entry_time_by_strategy:
+    orb: "10:00"
+    orb_retest: "09:45"
+    # ORRS needs the 09:15-09:30 range plus a completed bar to close back
+    # inside it, so the earliest possible entry is the 09:35 bar open.
+    opening_range_reversion: "09:35"
+    # SMC enforces 09:45 internally too; the key is here so the runtime gate
+    # and the strategy agree if the sleeve is ever promoted.
+    smc_liquidity: "09:45"
   # Discovery only: scan stock underlyings, but route BUY CE/PE options only.
   # Options must exist in today's exact broker listing; no equity fallback.
+  # Live scan scope is pinned by scripts/session.py through
+  # TRIO_OPTIONS_SCAN_UNDERLYINGS=NIFTY,BANKNIFTY; the basket below is only the
+  # fallback for offline tooling and tests.
   scan_basket: nifty50  # configured indices are unioned; stocks remain NIFTY50
   scan_interval_seconds: 300
+  underlying: "NIFTY"         # primary underlying for contract specs
+  underlyings: [NIFTY, BANKNIFTY]  # approved underlyings for scan/trading
   stop_premium_fraction: 0.20
   target_premium_fraction: 0.30
+  # Staged profit-lock ladder.  Each rung is a fraction of the entry premium;
+  # when the executable bid reaches a rung the stop ratchets up to that level.
+  # The ladder is full-position (no partial exits) and a jump skips straight to
+  # the highest rung reached.  Targets still fire before the ladder, so at
+  # least one rung must sit below the effective target.  Rungs at or above the
+  # target can never arm and are dropped at entry.
+  #
+  # 2026-11-17: the old [0.05, 0.08, 0.12, 0.15, 0.20, 0.25] ladder locked a
+  # 0-DTE NIFTY CE at +5%/+8%, i.e. Rs 3-5 of premium, which is inside normal
+  # tick noise: three ORB winners were scalped in under 8 minutes each.  The
+  # first rung is now 10% so the trade has room, and 15% stays as the second
+  # lock before the +25% final target.
+  profit_lock_rungs: [0.10, 0.15]
+  # Fallback only: used when profit_lock_rungs is empty or absent, where the
+  # ladder advances in uniform steps of this fraction.
   profit_lock_step_fraction: 0.10
   # Tomorrow's approved paper-test risk policy.  These keys are mandatory;
   # the runtime rejects an incomplete or non-finite effective policy.
+  # capital + scan cadence are applied by scripts/session.py at launch.
   risk_per_trade_pct: 0.70
   max_daily_loss_pct: 1.50
-  max_open_positions: 3
-  max_trades_per_day: 4
+  # Two slots: the first strategy takes one, and a second independent
+  # strategy may take the other on the same index.  The same strategy still
+  # cannot pyramid into itself.
+  #
+  # 2026-11-19: back to 2.  The 10 that was tried here was unreachable anyway:
+  # max_premium_exposure_pct 5% of Rs 10,00,000 is Rs 50,000, and one position
+  # costs Rs 15,000-18,000, so at most two (rarely three) can ever be open.
+  # The 2026-11-17 session never held more than one position at a time.
+  max_open_positions: 2
   max_premium_exposure_pct: 5.00
   allow_averaging_down: false
-  max_daily_entries: 5
+  # The only daily-entry counter.  `max_trades_per_day` used to duplicate this
+  # and _risk_preflight takes min() of the two, so editing one alone did
+  # nothing.
+  #
+  # 2026-11-20: 10 -> 14 after a 96-session replay (2026-07-06..2026-11-20,
+  # ORB + ORB-Retest, actual DTE, 14% IV, live-style portfolio).  Cap 10 netted
+  # Rs 357,281 at PF 2.30; cap 14 netted Rs 381,681 at PF 2.37 with the same
+  # -Rs 28,752 max drawdown and the same 50/96 winning days.  Cap 16 and no cap
+  # add only ~Rs 5,000 more, so 14 keeps a backstop without rationing a normal
+  # day.  The gain is IV-conditional: at 18%/22% the premium cap rejects
+  # candidates before the daily cap can bind, so cap 10 and 14 are identical
+  # there.  Cap 14 is never worse.
+  # A hard 12:30 entry cutoff was tested in the same run and REJECTED:
+  # it removed 91 entries worth +Rs 157,982 and cut net by Rs 128,525.
+  # See scripts/validate_entry_cap.py.
+  max_daily_entries: 14
+  # Once per session date, before the first entry scan: broker available cash
+  # must be at least min_wallet minus wallet_tolerance. Mid-day dips do not
+  # re-check. Lot size still follows live broker cash, not this floor.
+  min_wallet: 20000
+  wallet_tolerance: 500
   max_unrealized_loss_pct: 1.50
   max_consecutive_losses: 2
   max_portfolio_risk_pct: 1.0
-  max_correlated_positions: 1
+  # Two NIFTY legs are allowed only when they come from different
+  # strategies.  NIFTY and FINNIFTY still share this correlation group.
+  max_correlated_positions: 2
+  # Each position pays at most this much premium.  Lots are floor(cap /
+  # one-lot debit), so a NIFTY trade lands in the 15-18k band instead of
+  # scaling with account size.
+  max_premium_per_position: 18000
+  # Operational fail-safe.  A mark must stay unresolved for this many
+  # seconds before the runtime force-flattens the leg.  A tick-count
+  # threshold churned fresh positions during multi-underlying scans.
+  stale_mark_exit_seconds: 180
+  # Do not re-enter the exact same contract immediately after it closed.
+  # This prevents a stale/duplicate signal from re-firing after an exit.
+  reentry_cooldown_seconds: 300
+  reentry_cooldown_after_exit_seconds: 300
+  # Loss-only per-strategy cooldowns.  A profitable exit does not block the
+  # next entry; ORB-Retest opts out entirely because re-testing the same level
+  # is the setup itself.
+  reentry_cooldown_loss_only: true
+  reentry_cooldown_by_strategy:
+    orb: 300
+    orb_retest: 0
+    mean_reversion: 300
+  # After a stop-loss on an underlying, block any new entry on that underlying
+  # for this many seconds.  The per-contract cooldown above does not catch a
+  # strike rotation (23850 CE stop -> 23900 CE 31s later), so this is the
+  # underlying-level churn guard.
+  #
+  # 2026-11-19: was 0, which let the 2026-11-17 session re-enter the same
+  # underlying 22-251 seconds after a stop six separate times, each time just
+  # by changing strike.  300 matches the per-contract and per-strategy
+  # cooldowns already in force.
+  underlying_stop_loss_cooldown_seconds: 300
+  # Minimum minutes of runway to the 15:10 hard flat before a new entry is
+  # allowed.  Reduced to 10 so a late entry can still be managed to the flat
+  # while keeping a full 10-minute window.  (Was 30, which blocked everything
+  # after 14:40.)
+  min_entry_runway_minutes: 10
+  # After 13:30 IST the target fraction is reduced: late-day moves are noisy,
+  # wide-spread and illiquid, so a smaller target is more realistic and keeps
+  # the trade completable before the 15:10 square-off.  It must stay well above
+  # the 5%/8% ladder rungs or the profit lock cannot arm, and it should not be
+  # so small relative to stop_premium_fraction (0.20) that a single winner
+  # cannot pay for a single loser: at 0.15 the payoff is 15:20, at the old 0.10
+  # it was 10:20 and one win plus one loss lost money on 2026-11-16.
+  afternoon_target_fraction: 0.15
+  afternoon_target_from: "13:30"
   correlated_groups:
     - [NIFTY, FINNIFTY]
     - [BANKNIFTY, SBIN, ICICIBANK, HDFCBANK]
@@ -39,10 +155,55 @@ options_intraday:
       provenance: "NIFTY NSE/MegaBull contract specification effective 2026"
       valid_from: "2026-01-01"
       valid_until: "2026-12-31"
+    BANKNIFTY:
+      lot_size: 30
+      provenance: "BANKNIFTY NSE/MegaBull contract specification effective 2026"
+      valid_from: "2026-01-01"
+      valid_until: "2026-12-31"
   plan_max_age_minutes: 15
   signal_max_age_minutes: 60
-  chain_max_age_minutes: 15
+  chain_max_age_minutes: 1440
+  chain_cache_minutes: 1440
+  # Entry-time option-quote freshness.  The chain cache may live for the day,
+  # but a contract quote older than this must never be planned into a trade.
+  # Kept separate from chain_cache_minutes so long-lived diagnostics do not
+  # widen the execution gate.
+  max_quote_age_minutes: 15
+  # Shadow-only LLM reviewer.  It NEVER blocks, sizes or alters an order: one
+  # snapshot per unique signal is sent to Gemini from a background thread and
+  # the verdict is written to output/trade_log.jsonl as an `llm_verdict` event.
+  # Set enabled=false (or TRIO_LLM_JUDGE_ENABLED=0) to switch it off entirely.
+  llm_judge:
+    enabled: true
+    provider: gemini
+    # Must be a model that is still open to new keys.  gemini-2.5-flash now
+    # returns 404 NOT_FOUND ("no longer available to new users") on this API
+    # version even though it still appears in the models list.
+    model: "gemini-3.5-flash"
+    # Reasoning tokens are billed against max_output_tokens; leaving thinking
+    # on truncated the JSON verdict at this budget.  0 keeps the reply a single
+    # short object and the round trip near 1.5s.
+    thinking_budget: 0
+    max_output_tokens: 512
+    timeout_seconds: 6.0
+    max_queue: 8
+    # One call per (underlying, strategy, bar) at most.  A persistent ORB
+    # signal is re-judged every 5m bar, so a single-sleeve day can need ~54;
+    # with two underlyings and both tradable sleeves the worst case is ~220.
+    # 120 covers a normal day without letting a runaway signal burn quota.
+    max_calls_per_session: 120
+    log_only: true
+    # First non-empty value wins.  Add GEMINI_KEY_1..4 to .env for rotation;
+    # GOOGLE_GEMINI_API_KEY is the existing single-key fallback.
+    keys_env:
+      - GEMINI_KEY_1
+      - GEMINI_KEY_2
+      - GEMINI_KEY_3
+      - GEMINI_KEY_4
+      - GOOGLE_GEMINI_API_KEY
   demand_supply:
+    # Left disabled: the backtest does not model this gate, so enabling it
+    # would make live behaviour diverge from the validated strategy.
     enabled: false
     max_zone_age_bars: 36
     options:

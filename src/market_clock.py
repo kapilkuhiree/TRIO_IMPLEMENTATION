@@ -73,12 +73,41 @@ class MarketClock:
     hard_flat: str = "15:10"
     close: str = "15:30"
     holidays: Set[str] = field(default_factory=set)
+    # Per-date session overrides for exchange-declared special sessions (for
+    # example a weekend/holiday trading day).  A key here makes that date a
+    # trading day even at a weekend; the date's own
+    # ``open``/``entry_start``/... replace the base window.
+    special_sessions: Dict[str, Dict[str, str]] = field(default_factory=dict)
     valid: bool = True
     error: str = ""
 
     def _mins_of(self, attr: str) -> Optional[int]:
         try:
             return _mins(getattr(self, attr))
+        except Exception:
+            return None
+
+    def _times_for(self, dt: datetime) -> Dict[str, str]:
+        """Effective session times for ``dt``, honouring a special session."""
+        times = {
+            "open": self.open,
+            "entry_start": self.entry_start,
+            "entry_cutoff": self.entry_cutoff,
+            "hard_flat": self.hard_flat,
+            "close": self.close,
+        }
+        override = self.special_sessions.get(dt.strftime("%Y-%m-%d"))
+        if isinstance(override, dict):
+            for key in times:
+                value = override.get(key)
+                if value not in (None, ""):
+                    times[key] = str(value)
+        return times
+
+    @staticmethod
+    def _mins_for(times: Dict[str, str], key: str) -> Optional[int]:
+        try:
+            return _mins(times[key])
         except Exception:
             return None
 
@@ -90,9 +119,13 @@ class MarketClock:
             # "is this minute inside the NSE window?" — ignore the calendar.
             return True
         dt = _resolve_dt(now)
-        if dt.weekday() >= 5:  # Sat/Sun
+        day = dt.strftime("%Y-%m-%d")
+        # An explicit holiday always wins, even over a special session.
+        if day in self.holidays:
             return False
-        if dt.strftime("%Y-%m-%d") in self.holidays:
+        if day in self.special_sessions:
+            return True
+        if dt.weekday() >= 5:  # Sat/Sun
             return False
         return True
 
@@ -107,11 +140,13 @@ class MarketClock:
             return lo <= m < hi
         if not self.is_trading_day(now):
             return False
-        m = _resolve_dt(now).hour * 60 + _resolve_dt(now).minute
-        lo, hi = self._mins_of("entry_start"), self._mins_of("entry_cutoff")
+        dt = _resolve_dt(now)
+        times = self._times_for(dt)
+        lo = self._mins_for(times, "entry_start")
+        hi = self._mins_for(times, "entry_cutoff")
         if lo is None or hi is None:
             return False
-        return lo <= m < hi
+        return lo <= dt.hour * 60 + dt.minute < hi
 
     def is_exits_only(self, now=None) -> bool:
         if not self.valid:
@@ -124,11 +159,13 @@ class MarketClock:
             return lo <= m < hi
         if not self.is_trading_day(now):
             return False
-        m = _resolve_dt(now).hour * 60 + _resolve_dt(now).minute
-        lo, hi = self._mins_of("entry_cutoff"), self._mins_of("hard_flat")
+        dt = _resolve_dt(now)
+        times = self._times_for(dt)
+        lo = self._mins_for(times, "entry_cutoff")
+        hi = self._mins_for(times, "hard_flat")
         if lo is None or hi is None:
             return False
-        return lo <= m < hi
+        return lo <= dt.hour * 60 + dt.minute < hi
 
     def is_hard_flat(self, now=None) -> bool:
         if not self.valid:
@@ -141,11 +178,11 @@ class MarketClock:
             return now.hour * 60 + now.minute >= hf
         if not self.is_trading_day(now):
             return False
-        m = _resolve_dt(now).hour * 60 + _resolve_dt(now).minute
-        hf = self._mins_of("hard_flat")
+        dt = _resolve_dt(now)
+        hf = self._mins_for(self._times_for(dt), "hard_flat")
         if hf is None:
             return False
-        return m >= hf
+        return dt.hour * 60 + dt.minute >= hf
 
     def is_closed(self, now=None) -> bool:
         if not self.valid:
@@ -157,22 +194,26 @@ class MarketClock:
             return now.hour * 60 + now.minute >= cl
         if not self.is_trading_day(now):
             return True
-        m = _resolve_dt(now).hour * 60 + _resolve_dt(now).minute
-        cl = self._mins_of("close")
+        dt = _resolve_dt(now)
+        cl = self._mins_for(self._times_for(dt), "close")
         if cl is None:
             return True
-        return m >= cl
+        return dt.hour * 60 + dt.minute >= cl
 
     def session_state(self, now=None) -> str:
         if not self.valid:
             return "invalid"
         if isinstance(now, dtime):
             m = now.hour * 60 + now.minute
+            times = {key: getattr(self, key) for key in
+                     ("entry_start", "entry_cutoff", "hard_flat", "close")}
         else:
             if not self.is_trading_day(now):
                 return "closed"
-            m = _resolve_dt(now).hour * 60 + _resolve_dt(now).minute
-        es, ec, hf, cl = (self._mins_of(a) for a in
+            dt = _resolve_dt(now)
+            m = dt.hour * 60 + dt.minute
+            times = self._times_for(dt)
+        es, ec, hf, cl = (self._mins_for(times, a) for a in
                           ("entry_start", "entry_cutoff", "hard_flat", "close"))
         if any(v is None for v in (es, ec, hf, cl)):
             return "invalid"
@@ -230,6 +271,18 @@ def market_clock_from_config(cfg: Optional[Dict[str, Any]] = None) -> MarketCloc
     hols = raw.get("holidays", [])
     hol_set: Set[str] = set(str(x).strip() for x in (hols or []) if str(x).strip())
 
+    raw_special = raw.get("special_sessions", {}) or {}
+    special: Dict[str, Dict[str, str]] = {}
+    if isinstance(raw_special, dict):
+        for day, values in raw_special.items():
+            key = str(day).strip()
+            if not key or not isinstance(values, dict):
+                continue
+            special[key] = {
+                str(field): str(value) for field, value in values.items()
+                if value not in (None, "")
+            }
+
     clk = MarketClock(
         timezone_name=_as_str("timezone", "Asia/Kolkata"),
         open=_as_str("open", "09:15"),
@@ -238,6 +291,7 @@ def market_clock_from_config(cfg: Optional[Dict[str, Any]] = None) -> MarketCloc
         hard_flat=_as_str("hard_flat", "15:10"),
         close=_as_str("close", "15:30"),
         holidays=hol_set,
+        special_sessions=special,
     )
     # 00:00 sentinel (used by tests to mean "always hard-flat") — don't
     # reject on ordering; the live installed market.yaml never uses it.
@@ -257,6 +311,30 @@ def market_clock_from_config(cfg: Optional[Dict[str, Any]] = None) -> MarketCloc
     except Exception as exc:
         clk.valid = False
         clk.error = str(exc)
+
+    if clk.valid:
+        for day, values in special.items():
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+                merged = {
+                    "open": clk.open,
+                    "entry_start": clk.entry_start,
+                    "entry_cutoff": clk.entry_cutoff,
+                    "hard_flat": clk.hard_flat,
+                    "close": clk.close,
+                }
+                merged.update(values)
+                ordered = (_mins(merged["open"]) <= _mins(merged["entry_start"]) <
+                           _mins(merged["entry_cutoff"]) <= _mins(merged["hard_flat"]) <=
+                           _mins(merged["close"]))
+                if not ordered:
+                    raise ValueError(
+                        "not ordered: open <= entry_start < entry_cutoff "
+                        "<= hard_flat <= close")
+            except Exception as exc:
+                clk.valid = False
+                clk.error = f"special session {day!r}: {exc}"
+                break
     return clk
 
 

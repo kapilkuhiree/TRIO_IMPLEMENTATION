@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "retrieved_at": "2026-11-05T07:01:24.815117+00:00",
+  "symbol": "BANKNIFTY",
+  "underlying": 57369.5,
+  "requested_expiries": [
+    "23-Nov-2026",
+    "29-Dec-2026",
+    "25-Jan-2027",
+    "30-Mar-2027"
+  ],
+  "responses": [
+    {
+      "requested_expiry": "23-Nov-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": true,
+      "strike_rows": 154,
+      "ce_records": 154,
+      "pe_records": 154,
+      "validation_failures": [],
+      "raw_expiry_dates": [
+        "23-Nov-2026",
+        "29-Dec-2026",
+        "25-Jan-2027",
+        "30-Mar-2027",
+        "29-Jun-2027",
+        "28-Sep-2027"
+      ]
+    },
+    {
+      "requested_expiry": "29-Dec-2026",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": false,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "validation_failures": [
+        "missing_symbol_identity"
+      ],
+      "failure_reason": "missing_symbol_identity"
+    },
+    {
+      "requested_expiry": "25-Jan-2027",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": false,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "validation_failures": [
+        "missing_symbol_identity"
+      ],
+      "failure_reason": "missing_symbol_identity"
+    },
+    {
+      "requested_expiry": "30-Mar-2027",
+      "path": "/api/option-chain-v3",
+      "http_status": 200,
+      "success": false,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "validation_failures": [
+        "missing_symbol_identity"
+      ],
+      "failure_reason": "missing_symbol_identity"
+    },
+    {
+      "requested_expiry": null,
+      "path": "/api/option-chain-indices",
+      "http_status": 404,
+      "success": false,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "validation_failures": [],
+      "failure_reason": "endpoint_not_found"
+    }
+  ],
+  "expiry_status": {
+    "23-Nov-2026": {
+      "expiry": "23-Nov-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 154,
+      "ce_records": 154,
+      "pe_records": 154,
+      "usable": true,
+      "reason": "usable_strikes"
+    },
+    "29-Dec-2026": {
+      "expiry": "29-Dec-2026",
+      "listed_by_exchange": true,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "usable": false,
+      "reason": "zero_strikes_for_expiry"
+    },
+    "25-Jan-2027": {
+      "expiry": "25-Jan-2027",
+      "listed_by_exchange": true,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "usable": false,
+      "reason": "zero_strikes_for_expiry"
+    },
+    "30-Mar-2027": {
+      "expiry": "30-Mar-2027",
+      "listed_by_exchange": true,
+      "strike_rows": 0,
+      "ce_records": 0,
+      "pe_records": 0,
+      "usable": false,
+      "reason": "zero_strikes_for_expiry"
+    }
+  },
+  "freshness": {
+    "ttl_minutes": 15,
+    "fresh": true
+  }
+}

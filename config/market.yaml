@@ -15,3 +15,9 @@ market:
   hard_flat: "15:10"      # exclusive: at 15:10 force square-off
   close: "15:30"
   holidays: []            # e.g. ["2026-08-15", "2026-10-02"]
+  # Special exchange sessions.  A date listed here is a trading day even if it
+  # falls on a weekend/holiday, and its window replaces the base window for
+  # that date only.  Leave empty unless the exchange declares a special
+  # session; the clock supports any date keyed here.
+  special_sessions: {}
+

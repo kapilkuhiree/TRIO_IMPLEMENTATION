@@ -18,6 +18,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +52,81 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHAIN_CACHE_DIR = PROJECT_ROOT / "output" / "chain_cache"
 CHAIN_DIAGNOSTIC_DIR = PROJECT_ROOT / "output" / "chain_diagnostics"
+
+
+class ChainUnavailable(RuntimeError):
+    """Typed provider failure that drives option-chain failover.
+
+    ``reason`` is one of ``rate_limited``, ``instruments``, ``quote_failed``,
+    ``empty`` or ``error``.  Only ``rate_limited`` arms the sticky cooldown
+    that stops the process from re-hammering a throttled provider.
+    """
+
+    def __init__(self, provider: str, reason: str, detail: str = ""):
+        self.provider = provider
+        self.reason = reason
+        self.detail = detail
+        message = f"{provider}:{reason}"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
+CHAIN_PROVIDER_MODES = frozenset({"auto", "zerodha", "nse"})
+# Escalating cooldown for a throttled primary provider.  Without it the scan
+# loop retries every 10s, which re-arms the rate limit and never recovers.
+_PRIMARY_BACKOFF_MINUTES = (5, 10, 20, 30)
+_PRIMARY_BLOCK_UNTIL: Optional[datetime] = None
+_PRIMARY_FAILURE_STREAK = 0
+
+
+def chain_provider_mode() -> str:
+    """Resolve the chain provider policy.
+
+    ``TRIO_OPTIONS_CHAIN_PROVIDER`` wins when set to auto/zerodha/nse.  The
+    legacy ``TRIO_MARKET_DATA_PROVIDER=zerodha`` setting keeps its historical
+    meaning (Zerodha only) so existing behaviour is unchanged unless opted in.
+    """
+    explicit = str(os.environ.get("TRIO_OPTIONS_CHAIN_PROVIDER", "")).strip().lower()
+    if explicit in CHAIN_PROVIDER_MODES:
+        return explicit
+    if str(os.environ.get("TRIO_MARKET_DATA_PROVIDER", "")).strip().lower() == "zerodha":
+        return "zerodha"
+    return "nse"
+
+
+def _primary_blocked_until() -> Optional[datetime]:
+    return _PRIMARY_BLOCK_UNTIL
+
+
+def _primary_is_blocked(now: Optional[datetime] = None) -> bool:
+    if _PRIMARY_BLOCK_UNTIL is None:
+        return False
+    return (now or datetime.now(timezone.utc)) < _PRIMARY_BLOCK_UNTIL
+
+
+def _note_primary_failure(reason: str) -> None:
+    global _PRIMARY_BLOCK_UNTIL, _PRIMARY_FAILURE_STREAK
+    if reason != "rate_limited":
+        return
+    index = min(_PRIMARY_FAILURE_STREAK, len(_PRIMARY_BACKOFF_MINUTES) - 1)
+    minutes = _PRIMARY_BACKOFF_MINUTES[index]
+    _PRIMARY_FAILURE_STREAK += 1
+    _PRIMARY_BLOCK_UNTIL = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    logger.warning(
+        "Zerodha chain throttled; using NSE for %d minutes (retry at %s)",
+        minutes, _PRIMARY_BLOCK_UNTIL.isoformat())
+
+
+def _reset_primary_failure() -> None:
+    global _PRIMARY_BLOCK_UNTIL, _PRIMARY_FAILURE_STREAK
+    _PRIMARY_BLOCK_UNTIL = None
+    _PRIMARY_FAILURE_STREAK = 0
+
+
+def reset_chain_provider_state() -> None:
+    """Clear the sticky backoff (tests and manual operator recovery)."""
+    _reset_primary_failure()
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +305,7 @@ def _expiries_for(s: "requests.Session", symbol: str) -> List[str]:
 
 def _symbol_identity(value: Any) -> str:
     """Canonical NSE underlying, without inferring an index from a stock."""
-    return str(value or "").strip().upper().removesuffix(".NS")
+    return str(value or "").strip().upper().removesuffix(".NS").removesuffix("IDX")
 
 
 def _response_identity_failure(data: Dict[str, Any], symbol: str,
@@ -285,6 +361,78 @@ def fetch_chain(symbol: str = "NIFTY",
     symbol identity. No simulated quotes or alternate underlyings are used.
     """
     symbol = _symbol_identity(symbol or "NIFTY")
+    mode = chain_provider_mode()
+    order: List[str] = []
+    if mode in ("auto", "zerodha"):
+        order.append("zerodha")
+    if mode in ("auto", "nse"):
+        order.append("nse")
+
+    failures: List[str] = []
+    now = datetime.now(timezone.utc)
+    for provider in order:
+        if provider == "zerodha" and mode == "auto" and _primary_is_blocked(now):
+            # Sticky skip: don't spend a request on a provider we know is
+            # throttled, and don't prolong its block with retry storms.
+            failures.append("zerodha:rate_limited(backoff)")
+            continue
+        if provider == "zerodha":
+            chain = _fetch_chain_zerodha(symbol, failures)
+        else:
+            chain = _fetch_chain_nse(symbol, use_cache, diagnostic_label)
+        if chain:
+            _annotate_chain_provider(chain, provider, failures)
+            return chain
+        if not any(item.startswith(f"{provider}:") for item in failures):
+            failures.append(f"{provider}:unavailable")
+
+    logger.error("Option chain unavailable for %s (mode=%s): %s",
+                 symbol, mode, "; ".join(dict.fromkeys(failures)))
+    return None
+
+
+def _fetch_chain_zerodha(symbol: str, failures: List[str]) -> Optional[Dict[str, Any]]:
+    try:
+        from src.options_chain_zerodha import fetch_zerodha_chain
+        logger.info("Using Zerodha provider for %s chain", symbol)
+        chain = fetch_zerodha_chain(symbol, raise_errors=True)
+    except ChainUnavailable as exc:
+        failures.append(f"zerodha:{exc.reason}")
+        logger.warning("Zerodha chain unavailable (%s): %s", exc.reason, exc.detail)
+        _note_primary_failure(exc.reason)
+        return None
+    except Exception as exc:  # noqa: BLE001 - failover must never propagate
+        failures.append("zerodha:error")
+        logger.warning("Zerodha chain failed: %s", exc)
+        return None
+    if chain:
+        _reset_primary_failure()
+    return chain
+
+
+def _annotate_chain_provider(chain: Dict[str, Any], provider: str,
+                             failures: List[str]) -> None:
+    retrieval = dict(chain.get("retrieval") or {})
+    retrieval["requested_mode"] = chain_provider_mode()
+    retrieval["provider"] = provider
+    if failures:
+        retrieval["fallback_reason"] = failures[0]
+    blocked = _primary_blocked_until()
+    if blocked is not None:
+        retrieval["primary_retry_at"] = blocked.isoformat()
+    chain["retrieval"] = retrieval
+    chain["provider"] = provider
+    if not chain.get("source"):
+        chain["source"] = provider
+    if provider != "zerodha" and failures:
+        logger.warning("Chain for %s served by %s (fallback: %s)",
+                       chain.get("symbol", ""), provider, failures[0])
+
+
+def _fetch_chain_nse(symbol: str, use_cache: bool,
+                     diagnostic_label: Optional[str] = None
+                     ) -> Optional[Dict[str, Any]]:
+    """NSE public-API chain fetch (original implementation)."""
     cfg = {}
     try:
         cfg = load_config().get("options", {}) or {}
@@ -508,6 +656,28 @@ def fetch_chain(symbol: str = "NIFTY",
                            attempt + 1, exc)
             time.sleep(1 + attempt)
     logger.error("NSE chain unavailable for %s: %s", symbol, last)
+    # Fallback to cache if available when live fetch fails.  Strict callers
+    # (use_cache=False) must never be answered from disk: that path also skips
+    # the response-side identity check, so a cached chain for a different
+    # underlying could be traded.
+    cached_fallback = _cache_path(symbol)
+    if use_cache and cached_fallback.exists():
+        try:
+            payload = json.loads(cached_fallback.read_text(encoding="utf-8"))
+            hit = payload.get("chain")
+            if hit is not None:
+                hit = dict(hit)
+                hit.setdefault("symbol", symbol)
+                retrieval = {
+                    **(hit.get("retrieval") or {}),
+                    "served_from_cache": True,
+                    "cache_fallback": True,
+                }
+                hit["retrieval"] = retrieval
+                logger.info("NSE chain unavailable live; successfully fell back to cached chain for %s", symbol)
+                return hit
+        except Exception as exc:
+            logger.warning("Chain cache fallback failed for %s: %s", symbol, exc)
     _write_chain_diagnostic(symbol, {
         "schema_version": 1,
         "retrieved_at": utc_now(),

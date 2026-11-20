@@ -224,13 +224,14 @@ class PaperTrader:
         overlay may still construct a local options paper broker in ordinary
         production mode, but never in ``options_intraday`` or ``combined``.
         """
-        from src.options_intraday import load_options_intraday_config
+        from src.options_intraday import load_options_intraday_config, options_intraday_config
         cfg = load_options_intraday_config(cfg)
+        mode_cfg = options_intraday_config(cfg)
         existing = getattr(self, "opt_broker", None)
         if existing is not None:
             return existing
         if self.strict_options_mode:
-            ok, reason = validate_options_mode_environment(cfg)
+            ok, reason = validate_options_mode_environment(mode_cfg)
             if not ok:
                 raise RuntimeError(reason)
             from src.remote_paper import make_options_broker
@@ -1138,6 +1139,10 @@ class PaperTrader:
             rec.update(payload if isinstance(payload, dict) else {"data": payload})
             with open(target, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
+            # Keep the CSV mirror current: entries/exits must be visible in a
+            # spreadsheet immediately, not only after a graceful shutdown.
+            if event in ("order", "exit") and not force_sidecar:
+                self._write_trade_log_csv()
         except Exception as exc:
             logger.warning("Trade-log write failed: %s", exc)
 
@@ -1160,7 +1165,13 @@ class PaperTrader:
                     "target", "qty", "rank", "setup", "confidence",
                     "exit", "pnl", "pnl_pct", "reason", "result",
                     "price", "rr", "decision", "scanned", "candidates",
-                    "positions", "session_open"]
+                    "positions", "session_open",
+                    # Options bookkeeping so ENTRY/EXIT rows are self-describing.
+                    "position_id", "order_id", "option_underlying",
+                    "trading_symbol", "expiry", "strike", "kind",
+                    "lots", "lot_size", "entry_premium", "exit_bid",
+                    "stop_premium", "target_premium", "risk_amount",
+                    "closed_at"]
             csv_path = self.trade_log_path.with_suffix(".csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
@@ -1779,7 +1790,9 @@ class PaperTrader:
             self.ensure_option_broker(cfg)
             mode_cfg = options_intraday_config(cfg)
             try:
-                scan_interval = float(mode_cfg.get("scan_interval_seconds", 300))
+                raw_interval = (os.environ.get("TRIO_OPTIONS_SCAN_INTERVAL")
+                                or mode_cfg.get("scan_interval_seconds", 300))
+                scan_interval = float(raw_interval)
                 if not math.isfinite(scan_interval) or scan_interval <= 0:
                     raise ValueError("scan interval must be positive and finite")
             except (TypeError, ValueError, OverflowError):

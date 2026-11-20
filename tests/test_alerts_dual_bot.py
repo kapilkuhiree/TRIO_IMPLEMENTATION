@@ -123,3 +123,22 @@ def test_digest_split_filters_by_asset():
             tf.unlink()
         except Exception:
             pass
+
+def test_markdown_parse_error_retries_as_plain_text():
+    """A stray underscore must not drop the alert (Telegram 400 -> plain retry)."""
+    bad = MagicMock()
+    bad.status_code = 400
+    good = _mock_resp()
+    payloads = []
+
+    def post(url, json=None, timeout=10):
+        payloads.append(json)
+        return bad if len(payloads) == 1 else good
+
+    with patch("requests.post", side_effect=post):
+        assert alerts._send_one("123:abc", "42",
+                                "TRIO options_intraday started") is True
+
+    assert payloads[0]["parse_mode"] == "Markdown"
+    assert "parse_mode" not in payloads[1]
+    assert payloads[1] == {"chat_id": "42", "text": "TRIO options_intraday started"}

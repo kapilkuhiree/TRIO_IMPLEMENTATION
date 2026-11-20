@@ -30,6 +30,9 @@ htmlcov/
 # Env / secrets
 .env
 .env.local
+# Timestamped token backups created before a refresh.  These hold live secrets.
+.env.bak*
+*.env.bak
 
 # Logs and outputs
 logs/

@@ -40,7 +40,8 @@ def main() -> int:
     cfg["options_intraday"]["scan_underlyings"] = ["NIFTY", "BANKNIFTY"]
     cfg["options_intraday"].pop("scan_basket", None)
     # --- probability‑boosting risk controls (still within §3 limits) ---
-    cfg["options_intraday"]["risk_per_trade_pct"] = 0.70          # 0.70 % of capital per trade
+    cfg["options_intraday"]["capital"] = 1_000_000               # ₹10,00,000 paper capital
+    cfg["options_intraday"]["risk_per_trade_pct"] = 0.70          # 0.70 % of capital per trade
     cfg["options_intraday"]["max_open_positions"] = 3            # allow up to 3 simultaneous option legs
     cfg["options_intraday"]["max_trades_per_day"] = 4            # allow up to 4 approvals per day
     cfg["options_intraday"]["time_cutoff_ist"] = "15:15"         # keep the session open until 15:15 IST
@@ -78,6 +79,9 @@ def main() -> int:
             print(f"[{now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}] --- Scan #{scan_count} ---")
             
             try:
+                # Management first: without this tick, open positions are
+                # never stop/target managed (the original Friday bug).
+                runtime.tick(now=now_ist)
                 placed = runtime.scan_and_execute()
                 print(f"  -> Placed option orders this scan: {len(placed)}")
                 for order in placed:

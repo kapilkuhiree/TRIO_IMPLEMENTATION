@@ -1,0 +1,7 @@
+﻿python : C:\Python314\python.exe: No module named trio
+At line:1 char:302
++ ... tch {} } }; python -m trio main.py scan --mode options_intraday 2>&1  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Python314\py...dule named trio:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

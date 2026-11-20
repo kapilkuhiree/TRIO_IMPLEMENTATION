@@ -238,6 +238,7 @@ class CandidatePipeline:
         underlying_symbol: str = "NIFTY",
         contract_specs: Optional[Dict[str, Any]] = None,
         index: Optional[int] = None,
+        orb_confirm_closes: int = 1,
     ) -> List[OptionsCandidate]:
         """Evaluate a strategy without constructing a stateful pipeline.
 
@@ -254,16 +255,26 @@ class CandidatePipeline:
         No risk state, P&L, or trade lifecycle is touched here.
         """
         from strategies.orb_strategy import OrbStrategy
+        from strategies.orb_retest_strategy import OrbRetestStrategy
         from strategies.trend_pullback_strategy import TrendPullbackStrategy
         from strategies.momentum_continuation_strategy import (
             MomentumContinuationStrategy,
         )
+        from strategies.mean_reversion_strategy import MeanReversionStrategy
+        from strategies.opening_range_reversion_strategy import (
+            OpeningRangeReversionStrategy,
+        )
+        from strategies.smc_liquidity_strategy import SmcLiquidityStrategy
 
         key = str(strategy_name or "").strip().lower()
         strategy_types = {
             "orb": OrbStrategy,
+            "orb_retest": OrbRetestStrategy,
             "pullback": TrendPullbackStrategy,
             "momentum": MomentumContinuationStrategy,
+            "mean_reversion": MeanReversionStrategy,
+            "opening_range_reversion": OpeningRangeReversionStrategy,
+            "smc_liquidity": SmcLiquidityStrategy,
         }
         strategy_type = strategy_types.get(key)
         if strategy_type is None or not candles:
@@ -274,13 +285,46 @@ class CandidatePipeline:
         if index < 0 or index >= len(candles):
             return []
 
-        strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
-        signal = strategy.evaluate_signal(
-            candles,
-            index,
-            specs,
-            underlying_symbol=underlying_symbol,
-        )
+        if key == "mean_reversion":
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(candles, index)
+        elif key == "opening_range_reversion":
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
+        elif key == "smc_liquidity":
+            # SMC has no lot-size constructor argument; its signal boundary is
+            # the same (candles, index, specs, symbol) shape as ORRS.
+            strategy = strategy_type()
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
+        elif key == "orb":
+            strategy = strategy_type(
+                lot_size=int(specs.get("lot_size") or 0),
+                orb_confirm_closes=max(1, int(orb_confirm_closes or 1)),
+            )
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
+        else:
+            strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
 
         if isinstance(signal, dict):
             signal_dict = signal
@@ -311,8 +355,12 @@ class CandidatePipeline:
             underlying_symbol=underlying_symbol,
             strategy_name={
                 "orb": "ORB",
+                "orb_retest": "ORB-Retest",
                 "pullback": "Pullback",
                 "momentum": "Momentum",
+                "mean_reversion": "MeanReversion",
+                "opening_range_reversion": "OpeningRangeReversion",
+                "smc_liquidity": "SMC-Liquidity",
             }[key],
             direction=cls._trade_direction(signal_dict),
             option_type=option_type,
