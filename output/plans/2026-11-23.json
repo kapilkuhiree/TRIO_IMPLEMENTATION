@@ -1,6 +1,6 @@
 {
   "date": "2026-11-23",
-  "generated_at": "2026-11-19T18:44:36.933437+00:00",
+  "generated_at": "2026-11-20T18:13:28.822304+00:00",
   "trading_mode": "options_intraday",
   "asset": "options",
   "candidates": [],
@@ -22,8 +22,10 @@
   "option_underlying": "NIFTY",
   "strategies": [
     "orb",
-    "pullback",
-    "momentum"
+    "orb_retest",
+    "mean_reversion",
+    "opening_range_reversion",
+    "smc_liquidity"
   ],
   "demand_supply": {
     "enabled": true,
@@ -32,12 +34,12 @@
   "intraday_data_diagnostic": {
     "valid": false,
     "rows": 4246,
-    "current_date_rows": 0,
+    "current_date_rows": 72,
     "max_age_minutes": 15.0,
-    "latest_timestamp": null,
-    "latest_completion_timestamp": null,
+    "latest_timestamp": "2026-11-20T15:10:00+05:30",
+    "latest_completion_timestamp": "2026-11-20T15:15:00+05:30",
     "errors": [
-      "no_completed_bar_for_current_ist_date"
+      "stale_latest_bar:508.5m"
     ],
     "ignored_rows": {
       "outside_session": 175,
@@ -47,7 +49,7 @@
     "source": {
       "source": "yfinance",
       "symbol": "^NSEI",
-      "fetched_at": "2026-11-19T18:44:37.701701+00:00"
+      "fetched_at": "2026-11-20T18:13:29.671795+00:00"
     }
   },
   "execution_ready": false,
