@@ -8,7 +8,7 @@ It:
   * loads ``.env`` (Zerodha credentials) without printing any secret;
   * forces the Zerodha data + chain providers;
   * overlays ``config/options_intraday.yaml`` (ORB + mean reversion, NRML,
-    two slots, Rs 18,000 premium cap, Rs 40,000 wallet floor);
+    two slots, Rs 18,000 premium cap, Rs 20,000 wallet floor);
   * refuses to construct the runtime unless the date-locked live gate passes;
   * runs a 10-second manage/scan loop and is flat by 15:10 IST.
 
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
+import json
 import os
 import sys
 import time
@@ -616,6 +617,33 @@ def _finalize(runtime: Any, broker: Any, label: str) -> int:
     return 0 if not remaining and verified else 2
 
 
+def _resume_positions(state_path: Path, broker: Any, session_date: str) -> Dict[str, Any]:
+    """Return today's open state positions when they explain the broker book.
+
+    ``--resume`` exists because the wallet floor and the flat-account guard are
+    pre-*entry* checks: once a live position is open the account is legitimately
+    below the floor and legitimately not flat.  Resuming is only allowed when
+    the persisted state owns every holding the broker reports; anything else is
+    an unresolved book and must go through ``--flatten``.
+    """
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if str(state.get("session_date") or "") != str(session_date):
+        return {}
+    positions = state.get("positions") or {}
+    if not isinstance(positions, dict) or not positions:
+        return {}
+    held = getattr(broker, "positions", None) or {}
+    symbols = set(held) if hasattr(held, "__iter__") else set()
+    if not symbols:
+        return {}
+    if not symbols.issubset(set(positions)):
+        return {}
+    return positions
+
+
 def _run(args: argparse.Namespace) -> int:
     from src.options_intraday import options_live_requested
     from src.options_intraday_runtime import (
@@ -649,7 +677,19 @@ def _run(args: argparse.Namespace) -> int:
     balance = broker.get_balance()
     floor = float(cfg["options_intraday"].get("min_wallet") or 0.0)
     available = float(balance.get("available") or 0.0)
-    if available < floor:
+    if not broker.refresh_positions():
+        raise SystemExit("refusing to start: positions could not be read "
+                         "(cannot prove the account is flat)")
+    resume = {}
+    if getattr(args, "resume", False):
+        resume = _resume_positions(state_path, broker, _session_date(args))
+        if not resume:
+            raise SystemExit(
+                "refusing --resume: the state file owns no open position that "
+                "matches the broker book (run --flatten instead)")
+        print(f"resume           : {len(resume)} open position(s) "
+              f"{sorted(resume)}")
+    if available < floor and not resume:
         if args.dry_run:
             print(f"WARNING: available cash {available:,.2f} is below the "
                   f"Rs {floor:,.0f} floor; dry-run continues, entries will "
@@ -658,10 +698,7 @@ def _run(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"available cash {available:,.2f} is below the "
                 f"Rs {floor:,.0f} wallet floor")
-    if not broker.refresh_positions():
-        raise SystemExit("refusing to start: positions could not be read "
-                         "(cannot prove the account is flat)")
-    if broker.positions:
+    if broker.positions and not resume:
         raise SystemExit(
             f"refusing to start: holdings already present {sorted(broker.positions)}"
             " (run --flatten)")
@@ -770,6 +807,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="skip the probe confirmation prompt")
     parser.add_argument("--dry-run", action="store_true",
                         help="full loop with orders refused by the adapter")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue a session that already holds a managed "
+                             "position (skips the start-flat wallet/holdings "
+                             "guards; requires the state file to own the book)")
     parser.add_argument("--scan", action="store_true",
                         help="one read-only discovery pass")
     parser.add_argument("--as-of", help="ISO timestamp for --scan")
@@ -791,6 +832,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
+    # Kite checks the request's source address against the app's allowed IPs.
+    # Windows prefers IPv6 and its temporary address rotates, so every order
+    # was rejected as "IP (...) is not allowed" while the IPv4 was whitelisted.
+    from src.net import prefer_ipv4
+    prefer_ipv4()
     env_path = _load_env(args.env_file)
     print(f"env file         : {env_path if env_path.exists() else 'not found'}")
     if args.flatten:

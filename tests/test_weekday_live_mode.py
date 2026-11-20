@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -118,3 +119,58 @@ class _MarketData:
 
 def _market_data(exchanges):
     return _MarketData(exchanges)
+
+# ---------------------------------------------------------------------------
+# --resume: the start-flat guards must not block managing an open position
+# ---------------------------------------------------------------------------
+
+class _Broker:
+    def __init__(self, positions):
+        self.positions = positions
+
+
+def _state_file(tmp_path, session_date="2026-11-12", positions=None):
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps({
+        "session_date": session_date,
+        "positions": positions if positions is not None else {
+            "NIFTY26N1725350CE": {"lots": 1, "status": "open"},
+        },
+    }), encoding="utf-8")
+    return path
+
+
+def test_resume_matches_state_and_broker(runner, tmp_path):
+    path = _state_file(tmp_path)
+    broker = _Broker({"NIFTY26N1725350CE": 65})
+    got = runner._resume_positions(path, broker, "2026-11-12")
+    assert set(got) == {"NIFTY26N1725350CE"}
+
+
+def test_resume_rejects_a_different_session_date(runner, tmp_path):
+    path = _state_file(tmp_path, session_date="2026-11-11")
+    broker = _Broker({"NIFTY26N1725350CE": 65})
+    assert runner._resume_positions(path, broker, "2026-11-12") == {}
+
+
+def test_resume_rejects_holdings_the_state_does_not_own(runner, tmp_path):
+    path = _state_file(tmp_path)
+    broker = _Broker({"NIFTY26N1725350CE": 65, "NIFTY26N1725400PE": 65})
+    assert runner._resume_positions(path, broker, "2026-11-12") == {}
+
+
+def test_resume_rejects_a_flat_broker_book(runner, tmp_path):
+    path = _state_file(tmp_path)
+    assert runner._resume_positions(path, _Broker({}), "2026-11-12") == {}
+
+
+def test_resume_rejects_a_missing_state_file(runner, tmp_path):
+    broker = _Broker({"NIFTY26N1725350CE": 65})
+    assert runner._resume_positions(tmp_path / "nope.json", broker,
+                                   "2026-11-12") == {}
+
+
+def test_resume_rejects_state_without_positions(runner, tmp_path):
+    path = _state_file(tmp_path, positions={})
+    broker = _Broker({"NIFTY26N1725350CE": 65})
+    assert runner._resume_positions(path, broker, "2026-11-12") == {}
