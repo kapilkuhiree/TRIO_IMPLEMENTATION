@@ -163,6 +163,62 @@ strategy object per scan.
 Full suite after 5c: **790 passed**. `orb_retest_v2_backtest.json` was
 regenerated on the fixed semantics; section 4 carries the refreshed numbers.
 
+### 5d. ORRS shadow + sleeve-name normalisation (2026-11-11)
+
+**Defect found while wiring ORRS:** `_shadow_strategy_names` compared raw
+strings, so `shadow_strategies: [mean_reversion]` never matched the planner's
+`MeanReversion` → `"meanreversion"`. The MR sleeve was therefore **not** being
+shadowed; only the VWAP filter kept it out of the book. Fixed by normalising
+both sides to letters+digits (the same rule `_normalise_strategy_key` already
+applies in the runtime) and logging canonical snake_case sleeve names.
+
+- `strategies/opening_range_reversion_strategy.py` - signal-only ORRS module
+  (poke 0.15 x OR width, 0.08%-1.00% width filter, 14:00 cutoff). Exports
+  `ORRS_EXIT_PROFILE` = +22% / -32% / 0.25W invalidation / 45-minute clock /
+  2 per index per session so replay and any future executor share one source.
+- `candidate_pipeline.py` - registered `opening_range_reversion`.
+- `src/options_intraday_plan.py` - added to `ALLOWED_STRATEGIES`.
+- `src/options_live_scan.py` - spelling-insensitive shadow matching.
+- `config/options_intraday.yaml` - ORRS in `strategies` **and**
+  `shadow_strategies`; entry floor `09:35`.
+- `scripts/shadow_replay.py` - `UNADJUDICATED_SLEEVES` warning: ORRS is not
+  gradeable with the shared staged-ladder policy yet.
+
+Full suite after 5d: **820 passed**.
+
+Known limitation (unchanged in kind): a shadow record needs the planner to
+select a live contract, so `confirm_demand_supply` and the VWAP gate also
+filter the forward stream. Forward ORRS counts will be a subset of the
+backtested signal set, and are NIFTY-only because `scripts/session.py` pins the
+scan to NIFTY.
+
+Fidelity check against the research harness (60 cached sessions): the wired
+module emits **71 signals** at poke 0.15 - NIFTY 33 + BANKNIFTY 38 - which
+equals the backtest's 71 trades exactly, provided the grader applies the same
+two suppressions the backtest used: first **2 signals per index per session**
+and **no new signal while a 45-minute hold is open**. The shadow ledger records
+every signal, so grading must post-filter both, or forward counts and P&L will
+look better than they are.
+
+### 5e. MR shadow was starved by a 5-day candle window (2026-11-11)
+
+`shadow_signals` stayed 0 for the whole session even though MR should have
+pointed on 2026-11-09. `mean_reversion_strategy.HISTORY_BARS = 200` needs 200
+completed 5m bars; `build_live_options_scan` fetched `period="5d"`, which
+returns only ~155 completed bars once the forming bar is dropped. The strategy
+never cleared its own history guard, so no MR candidate reached the shadow log
+and the report's shadow section was empty.
+
+- `src/options_live_scan.py` — the batch fetch now requests `10d` (515
+  completed bars over 8 sessions on a live read-only fetch). ORRS/SMC zeros were
+  genuine and are unaffected.
+- `src/data_fetcher.py` — `_CANDLE_CACHE` is now keyed by
+  `(symbol, timeframe, period)`. It previously keyed on symbol+timeframe only,
+  so a 5d caller (e.g. `weekday_live.py`) could satisfy a 10d request within the
+  same bar and silently re-starve MR.
+- Tests: `test_candle_cache_is_keyed_by_period_not_just_symbol_and_timeframe`
+  plus the updated scan-level period assertion.
+
 ## 6. Stages 2–3 (later, after shadow evidence)
 
 - **Stage 2** — MR-only paper sleeve: `strategies: [mean_reversion]`, `max_open_positions: 1`, MR VWAP-safe path, 2–3 paper sessions.
