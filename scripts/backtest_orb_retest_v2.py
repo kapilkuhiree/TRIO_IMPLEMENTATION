@@ -297,10 +297,17 @@ def run_variant(
     cooldown: int = 0,
     cooldown_rule: str = "any",
     max_trades_per_day: int = 10,
+    entry_cutoff_min: Optional[int] = None,
     as_of: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Simulate one signal stream with one open position per symbol."""
+    """Simulate one signal stream with one open position per symbol.
+
+    ``entry_cutoff_min`` overrides the module's 14:30 last-entry minute for
+    this run only, so a 12:30 cutoff can be tested without changing the
+    default every other harness relies on.
+    """
     trades: List[Dict[str, Any]] = []
+    cutoff = ENTRY_CUTOFF_MIN if entry_cutoff_min is None else entry_cutoff_min
 
     for day, indices in sorted(by_date.items()):
         if as_of and day >= as_of:
@@ -324,7 +331,7 @@ def run_variant(
                 continue
             entry_ts = pd.Timestamp(candles[i + 1]["timestamp"])
             entry_minute = minute_of_day(entry_ts)
-            if entry_minute < earliest_min or entry_minute > ENTRY_CUTOFF_MIN:
+            if entry_minute < earliest_min or entry_minute > cutoff:
                 continue
             if last_trade is not None and cooldown > 0:
                 elapsed = (entry_ts - pd.Timestamp(last_trade["exit_ts"])).total_seconds()
@@ -354,9 +361,11 @@ def build_candidates(
     *,
     strategy: str,
     earliest_min: int,
+    entry_cutoff_min: Optional[int] = None,
     as_of: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    cutoff = ENTRY_CUTOFF_MIN if entry_cutoff_min is None else entry_cutoff_min
     for i, kind in signals.items():
         if i + 1 >= len(candles):
             continue
@@ -364,7 +373,7 @@ def build_candidates(
         if as_of and str(entry_ts.date()) >= as_of:
             continue
         entry_minute = minute_of_day(entry_ts)
-        if entry_minute < earliest_min or entry_minute > ENTRY_CUTOFF_MIN:
+        if entry_minute < earliest_min or entry_minute > cutoff:
             continue
         trade = build_candidate(candles, i, kind, meta)
         if trade is None:
