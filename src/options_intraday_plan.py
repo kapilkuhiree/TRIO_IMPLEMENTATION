@@ -885,8 +885,9 @@ def build_intraday_plan(
         plan["option_chain_diagnostic"] = plan_diag
         return plan
 
-    # LOGGING ADDED HERE: Log if candidates exist but are rejected
-    logger.warning(f"PLANNER: {len(candidates)} candidates generated, checking eligibility")
+    # Candidates existing is normal operation, not a fault: this fires on every
+    # scan while a signal persists.  Keep it at INFO so real warnings stand out.
+    logger.info(f"PLANNER: {len(candidates)} candidates generated, checking eligibility")
 
     selected: List[Tuple[OptionsCandidate, Dict[str, Any], float]] = []
     rejected = []

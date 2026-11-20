@@ -71,7 +71,7 @@ def test_switch_applies_the_approved_table(monkeypatch):
     assert mode["max_open_positions"] == 5
     assert mode["max_correlated_positions"] == 5
     assert mode["max_premium_exposure_pct"] == 9.00
-    assert mode["max_consecutive_losses"] == 5
+    assert mode["max_consecutive_losses"] == 2
     assert mode["vwap_filter_strategies"] == ["orb", "orb_retest"]
 
     # Risk envelope deliberately unchanged: one lot per trade, 1.50% daily cap.

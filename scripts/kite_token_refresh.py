@@ -21,7 +21,26 @@ import sys
 from pathlib import Path
 
 ENV_PATH = Path(".env")
-MIN_WALLET = 40000.0
+CONFIG_PATH = Path("config/options_intraday.yaml")
+DEFAULT_MIN_WALLET = 20000.0
+
+
+def _wallet_floor() -> float:
+    """Read ``min_wallet`` from the live config so this check cannot drift."""
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        mode = cfg.get("options_intraday", cfg) or {}
+        value = mode.get("min_wallet")
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return DEFAULT_MIN_WALLET
+
+
+MIN_WALLET = _wallet_floor()
 
 
 def _read_env_value(text: str, key: str) -> str:
@@ -121,7 +140,7 @@ def main() -> int:
     if not nfo_ok:
         print("  - enable NSE F&O (NFO) in console.zerodha.com -> Segments")
     if not cash_ok:
-        print("  - add funds until available cash >= 40,000")
+        print(f"  - add funds until available cash >= {MIN_WALLET:,.0f}")
     return 1
 
 

@@ -1849,8 +1849,15 @@ class OptionsIntradayRuntime:
             target_fraction = self._effective_target_fraction(current)
             profit_step_fraction = max(0.0, _finite_number(
                 self.mode_cfg.get("profit_lock_step_fraction"), 0.10))
-            profit_lock_rungs = _normalized_rungs(
-                self.mode_cfg.get("profit_lock_rungs"))
+            # A rung at or above the target is unreachable: the target branch
+            # exits first, so the ladder would never arm.  Keep only the rungs
+            # that sit below this entry's target (the afternoon target is
+            # smaller than the full-day target).
+            profit_lock_rungs = [
+                level for level in _normalized_rungs(
+                    self.mode_cfg.get("profit_lock_rungs"))
+                if level < target_fraction - 1e-9
+            ]
             candidate_metadata = candidate.get("metadata", {}) or {}
             candidate_strategy = str(
                 candidate.get("strategy")
@@ -2169,8 +2176,10 @@ class OptionsIntradayRuntime:
 
         This is a full-position ratchet: each rung only moves the stop; it
         never creates partial exits.  Rungs come from ``profit_lock_rungs``
-        (e.g. ``[0.10, 0.15, 0.20, 0.25]``).  When no rungs are configured the
-        uniform ``profit_lock_step_fraction`` is expanded into an equivalent
+        (e.g. ``[0.05, 0.08, 0.12, 0.15, 0.20, 0.25]``).  Rungs at or above
+        ``final_target_premium`` are ignored here because the target branch
+        below exits first; when no usable rungs are configured the uniform
+        ``profit_lock_step_fraction`` is expanded into an equivalent
         ladder.  The executable bid is the only trigger, and a jump over a
         rung advances directly to the highest rung reached.
         """
@@ -2185,6 +2194,12 @@ class OptionsIntradayRuntime:
             return None
 
         rungs = _normalized_rungs(position.get("profit_lock_rungs"))
+        # Drop rungs at or above the final target: the target branch below
+        # always exits first, so such a rung can only sit there inertly.
+        # Positions opened before entry-time filtering existed are cleaned up
+        # here as well.
+        target_fraction = (final_target / entry) - 1.0
+        rungs = [level for level in rungs if level < target_fraction - 1e-9]
         if not rungs:
             step = max(0.0, _finite_number(
                 position.get("profit_lock_step_fraction"),
@@ -2192,6 +2207,13 @@ class OptionsIntradayRuntime:
             ))
             if step <= 0:
                 return None
+            # A step at or above the target would expand to no rungs at all,
+            # which is exactly how the ladder stayed dormant in the reduced
+            # afternoon window.  Halve it so at least one rung is reachable.
+            # The tolerance matters: 110/100 - 1 is 0.10000000000000009, so a
+            # bare ``step >= target_fraction`` misses by one float ulp.
+            if target_fraction > 0 and step >= target_fraction - 1e-9:
+                step = target_fraction / 2.0
             # Expand the uniform step into the same ascending ladder shape,
             # stopping before the target because the target branch fires first.
             level = step

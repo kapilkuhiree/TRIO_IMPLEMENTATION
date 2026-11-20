@@ -69,7 +69,10 @@ def _paper_all_overrides() -> Dict[str, Any]:
         "max_correlated_positions": 5,
         # 5 x Rs18,000 of premium on the Rs10,00,000 risk base.
         "max_premium_exposure_pct": 9.00,
-        "max_consecutive_losses": 5,
+        # 2026-11-19: was 5.  Four consecutive NIFTY CE losses on 2026-11-17
+        # (12:36-13:12) cost Rs 8,698 that a limit of 2 would have avoided.
+        # The base overlay says 2; promoting sleeves must not loosen it.
+        "max_consecutive_losses": 2,
         # The shared trend filter stays on the sleeves that were validated
         # with it; the promoted sleeves keep their own trend logic.
         "vwap_filter_strategies": ["orb", "orb_retest"],

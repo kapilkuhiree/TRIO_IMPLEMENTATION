@@ -668,6 +668,81 @@ def test_custom_rungs_leave_the_target_exit_ahead_of_the_ladder(tmp_path):
     assert options.close_calls[-1][1:] == (62.5, "target")
 
 
+def test_afternoon_target_drops_rungs_at_or_above_it(tmp_path):
+    """A reduced afternoon target must not silently disable the ladder.
+
+    On 2026-11-16 both afternoon entries ran a 10% target against rungs that
+    started at 10%: the target branch fires first, so ``profit_lock_stage``
+    stayed 0 and the ratchet never armed.  Rungs at or above the target are
+    dropped; the rungs below it must still raise the stop.
+    """
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    position = {
+        "entry_premium": 100.0,
+        "stop_premium": 80.0,
+        "initial_stop_premium": 80.0,
+        "target_premium": 110.0,
+        "final_target_premium": 110.0,
+        "profit_lock_step_fraction": 0.10,
+        "profit_lock_rungs": [0.05, 0.08, 0.10, 0.15],
+        "profit_lock_stage": 0,
+    }
+
+    assert runtime._update_profit_ladder(position, 104.9) is None
+    assert position["profit_lock_stage"] == 0
+
+    assert runtime._update_profit_ladder(position, 105.0) is None
+    assert position["profit_lock_stage"] == 1
+    assert position["stop_premium"] == 105.0
+    assert position["target_premium"] == 108.0
+
+    # The target still wins at 110: the ladder is a ratchet, not a second exit.
+    assert runtime._update_profit_ladder(position, 110.0) == "target"
+
+
+def test_legacy_rung_at_target_still_gets_a_reachable_ladder(tmp_path):
+    """Positions stored before entry-time filtering keep a usable ladder."""
+    options = _OptionsDouble()
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    position = {
+        "entry_premium": 100.0,
+        "stop_premium": 80.0,
+        "initial_stop_premium": 80.0,
+        "target_premium": 110.0,
+        "final_target_premium": 110.0,
+        "profit_lock_step_fraction": 0.10,
+        "profit_lock_rungs": [0.10, 0.15, 0.20, 0.25],
+        "profit_lock_stage": 0,
+    }
+
+    assert runtime._update_profit_ladder(position, 105.0) is None
+    assert position["profit_lock_stage"] == 1
+    assert position["stop_premium"] == 105.0
+
+
+def test_afternoon_entry_stores_only_reachable_rungs(tmp_path):
+    """Entry-time filtering keeps the persisted rungs below the target."""
+    options = _OptionsDouble()
+    cfg = _cfg(
+        tmp_path,
+        afternoon_target_fraction=0.10,
+        afternoon_target_from="13:30",
+        profit_lock_rungs=[0.05, 0.08, 0.10, 0.15],
+    )
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), cfg)
+    plan = _plan(retrieved="2026-10-14T08:25:00+00:00")
+    plan["option_chain"] = _chain(quote_timestamp="2026-10-14T08:25:00+00:00")
+    plan["option_candidates"][0]["signal_timestamp"] = "2026-10-14T08:20:00+00:00"
+
+    runtime.execute_plan(
+        plan, options, now=datetime(2026, 10, 14, 14, 0, tzinfo=IST))
+
+    position = next(iter(runtime._state["positions"].values()))
+    assert position["final_target_premium"] == 55.0
+    assert position["profit_lock_rungs"] == [0.05, 0.08]
+
+
 def test_profitable_trailing_exit_does_not_arm_loss_cooldown(tmp_path):
     quotes = iter([
         _chain(bid=55.0, ask=60.0, quote_timestamp="2026-10-14T04:35:00+00:00"),

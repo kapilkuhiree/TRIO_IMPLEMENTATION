@@ -2,7 +2,7 @@
 
 Normal trading-day live session on Zerodha. This is the **same book** that runs
 in paper (`config/options_intraday.yaml`): ORB + mean reversion, 2 positions,
-Rs 18,000 premium cap, Rs 40,000 wallet floor. The only differences from paper
+Rs 18,000 premium cap, Rs 20,000 wallet floor. The only differences from paper
 are the venue (`execution_class=live`, `PAPER_TRADING=false`) and an explicit
 date lock.
 
@@ -13,7 +13,7 @@ date lock.
 | # | Requirement | Check |
 |---|---|---|
 | 1 | **NFO segment active** on the Kite account | `--preflight` shows `NFO` in `kite segments` |
-| 2 | **Available cash ≥ ₹40,000** | `--preflight` shows `available cash ... OK` |
+| 2 | **Available cash ≥ ₹20,000** | `--preflight` shows `available cash ... OK` |
 | 3 | **Fresh Kite access token** (tokens expire daily) | `python scripts/kite_token_refresh.py` |
 | 4 | **Flat start** — no NFO holdings, no working NFO orders | `--preflight` shows `NFO holdings 0`, `open NFO orders 0` |
 | 5 | Market data + chain reachable | `--preflight` shows 5m candles and a Zerodha chain |
@@ -96,7 +96,7 @@ strategy's state file.
 ## 6. Current blockers
 
 - Kite segments: `MF, BSE, NSE, BFO` — **NFO missing**.
-- Available cash: below the Rs 40,000 floor.
+- Available cash: below the Rs 20,000 floor.
 
 Until both are fixed, weekday live is refused by design. MegaBull paper
 (`python scripts/session.py`) is unaffected and needs neither.

@@ -24,8 +24,12 @@ logger = get_logger("data_fetcher")
 
 # 5m bars only change once per bar, so an intra-scan refetch is pure waste and
 # keeps the provider's rate limiter warm.  Keyed by the last *completed* bar so
-# a forming candle is never frozen mid-print.
-_CANDLE_CACHE: Dict[Tuple[str, str], Tuple[int, pd.DataFrame, datetime]] = {}
+# a forming candle is never frozen mid-print.  ``period`` is part of the key:
+# two callers can legitimately ask for different lookbacks in the same bar
+# (the options scan needs 10d for the MR shadow sleeve, weekday_live uses 5d),
+# and serving the shorter frame to the longer request silently starves
+# strategies whose HISTORY_BARS exceeds the short window.
+_CANDLE_CACHE: Dict[Tuple[str, str, str], Tuple[int, pd.DataFrame, datetime]] = {}
 _CANDLE_CACHE_LOCK = threading.Lock()
 _BAR_SECONDS = {"1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
                 "1h": 3600, "90m": 5400, "1d": 86400}
@@ -91,7 +95,8 @@ def _fetch_zerodha_cached(symbol: str, timeframe: str,
     On a provider failure, serve the last good frame when it is still within
     the runtime's candle-freshness window; otherwise fail closed.
     """
-    key = (str(symbol).strip().upper(), str(timeframe).lower())
+    key = (str(symbol).strip().upper(), str(timeframe).lower(),
+           str(period or "").strip().lower())
     seconds = _BAR_SECONDS.get(key[1])
     now = datetime.now(timezone.utc)
     with _CANDLE_CACHE_LOCK:

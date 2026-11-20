@@ -109,11 +109,9 @@ def _send_telegram_kind(message: str, kind: str,
     ok_any = False
     for cid in recipients:
         try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            resp = requests.post(url, json={
-                "chat_id": cid, "text": message, "parse_mode": "Markdown",
-            }, timeout=10)
-            resp.raise_for_status()
+            # _send_one retries without Markdown when Telegram rejects the
+            # entities, so one stray underscore cannot drop the alert.
+            _send_one(token, cid, message, timeout=10)
             _record_delivery(cid, ok=True, kind=kind)
             ok_any = True
         except Exception as exc:
@@ -298,11 +296,20 @@ _Educational only. Not financial advice._"""
 
 def _send_one(token: str, chat_id: str, text: str,
               timeout: int = 10) -> bool:
-    """Send a single message. Returns True on success. Test-seam."""
+    """Send a single message. Returns True on success. Test-seam.
+
+    Telegram's legacy Markdown parser rejects the *whole* message when it meets
+    an unbalanced ``_``/``*``/``[`` -- a plain sentence such as
+    ``options_intraday session started`` is enough.  Retry once without
+    ``parse_mode`` so the operator gets the text instead of a silent drop.
+    """
     import requests
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     resp = requests.post(url, json={"chat_id": chat_id, "text": text,
                                      "parse_mode": "Markdown"}, timeout=timeout)
+    if resp.status_code == 400:
+        resp = requests.post(url, json={"chat_id": chat_id, "text": text},
+                             timeout=timeout)
     resp.raise_for_status()
     return True
 

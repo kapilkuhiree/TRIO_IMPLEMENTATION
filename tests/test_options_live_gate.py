@@ -121,7 +121,7 @@ def test_live_mode_keeps_the_weekday_book(monkeypatch):
     ]
     assert effective["max_open_positions"] == 2
     assert effective["max_premium_per_position"] == 18000
-    assert effective["min_wallet"] == 40000
+    assert effective["min_wallet"] == _yaml_mode(PAPER)["min_wallet"]
     assert effective["contract_specs"]["NIFTY"]["lot_size"] == 65
     assert effective["contract_specs"]["BANKNIFTY"]["lot_size"] == 30
 

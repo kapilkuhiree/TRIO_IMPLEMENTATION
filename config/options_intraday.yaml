@@ -43,8 +43,16 @@ options_intraday:
   # Staged profit-lock ladder.  Each rung is a fraction of the entry premium;
   # when the executable bid reaches a rung the stop ratchets up to that level.
   # The ladder is full-position (no partial exits) and a jump skips straight to
-  # the highest rung reached.  Targets still fire before the ladder.
-  profit_lock_rungs: [0.10, 0.15, 0.20, 0.25]
+  # the highest rung reached.  Targets still fire before the ladder, so at
+  # least one rung must sit below the effective target.  Rungs at or above the
+  # target can never arm and are dropped at entry.
+  #
+  # 2026-11-17: the old [0.05, 0.08, 0.12, 0.15, 0.20, 0.25] ladder locked a
+  # 0-DTE NIFTY CE at +5%/+8%, i.e. Rs 3-5 of premium, which is inside normal
+  # tick noise: three ORB winners were scalped in under 8 minutes each.  The
+  # first rung is now 10% so the trade has room, and 15% stays as the second
+  # lock before the +25% final target.
+  profit_lock_rungs: [0.10, 0.15]
   # Fallback only: used when profit_lock_rungs is empty or absent, where the
   # ladder advances in uniform steps of this fraction.
   profit_lock_step_fraction: 0.10
@@ -56,15 +64,25 @@ options_intraday:
   # Two slots: the first strategy takes one, and a second independent
   # strategy may take the other on the same index.  The same strategy still
   # cannot pyramid into itself.
+  #
+  # 2026-11-19: back to 2.  The 10 that was tried here was unreachable anyway:
+  # max_premium_exposure_pct 5% of Rs 10,00,000 is Rs 50,000, and one position
+  # costs Rs 15,000-18,000, so at most two (rarely three) can ever be open.
+  # The 2026-11-17 session never held more than one position at a time.
   max_open_positions: 2
-  max_trades_per_day: 10
   max_premium_exposure_pct: 5.00
   allow_averaging_down: false
+  # The only daily-entry counter.  `max_trades_per_day` used to duplicate this
+  # and _risk_preflight takes min() of the two, so editing one alone did
+  # nothing.  Back to 10 on 2026-11-19: the 2026-11-17 session took 26 entries,
+  # and its first 10 netted +Rs 8,939 with a -Rs 3,426 drawdown.  Entries 11-26
+  # added Rs 135 of profit for Rs 11,343 of extra drawdown, so the tail past 10
+  # is not earning its risk.
   max_daily_entries: 10
   # Once per session date, before the first entry scan: broker available cash
   # must be at least min_wallet minus wallet_tolerance. Mid-day dips do not
   # re-check. Lot size still follows live broker cash, not this floor.
-  min_wallet: 40000
+  min_wallet: 20000
   wallet_tolerance: 500
   max_unrealized_loss_pct: 1.50
   max_consecutive_losses: 2
@@ -95,9 +113,13 @@ options_intraday:
   # After a stop-loss on an underlying, block any new entry on that underlying
   # for this many seconds.  The per-contract cooldown above does not catch a
   # strike rotation (23850 CE stop -> 23900 CE 31s later), so this is the
-  # underlying-level churn guard.  Disabled here in favour of the loss-only
-  # per-strategy cooldowns above.
-  underlying_stop_loss_cooldown_seconds: 0
+  # underlying-level churn guard.
+  #
+  # 2026-11-19: was 0, which let the 2026-11-17 session re-enter the same
+  # underlying 22-251 seconds after a stop six separate times, each time just
+  # by changing strike.  300 matches the per-contract and per-strategy
+  # cooldowns already in force.
+  underlying_stop_loss_cooldown_seconds: 300
   # Minimum minutes of runway to the 15:10 hard flat before a new entry is
   # allowed.  Reduced to 10 so a late entry can still be managed to the flat
   # while keeping a full 10-minute window.  (Was 30, which blocked everything
@@ -105,8 +127,12 @@ options_intraday:
   min_entry_runway_minutes: 10
   # After 13:30 IST the target fraction is reduced: late-day moves are noisy,
   # wide-spread and illiquid, so a smaller target is more realistic and keeps
-  # the trade completable before the 15:10 square-off.
-  afternoon_target_fraction: 0.10
+  # the trade completable before the 15:10 square-off.  It must stay well above
+  # the 5%/8% ladder rungs or the profit lock cannot arm, and it should not be
+  # so small relative to stop_premium_fraction (0.20) that a single winner
+  # cannot pay for a single loser: at 0.15 the payoff is 15:20, at the old 0.10
+  # it was 10:20 and one win plus one loss lost money on 2026-11-16.
+  afternoon_target_fraction: 0.15
   afternoon_target_from: "13:30"
   correlated_groups:
     - [NIFTY, FINNIFTY]
@@ -134,6 +160,38 @@ options_intraday:
   # Kept separate from chain_cache_minutes so long-lived diagnostics do not
   # widen the execution gate.
   max_quote_age_minutes: 15
+  # Shadow-only LLM reviewer.  It NEVER blocks, sizes or alters an order: one
+  # snapshot per unique signal is sent to Gemini from a background thread and
+  # the verdict is written to output/trade_log.jsonl as an `llm_verdict` event.
+  # Set enabled=false (or TRIO_LLM_JUDGE_ENABLED=0) to switch it off entirely.
+  llm_judge:
+    enabled: true
+    provider: gemini
+    # Must be a model that is still open to new keys.  gemini-2.5-flash now
+    # returns 404 NOT_FOUND ("no longer available to new users") on this API
+    # version even though it still appears in the models list.
+    model: "gemini-3.5-flash"
+    # Reasoning tokens are billed against max_output_tokens; leaving thinking
+    # on truncated the JSON verdict at this budget.  0 keeps the reply a single
+    # short object and the round trip near 1.5s.
+    thinking_budget: 0
+    max_output_tokens: 512
+    timeout_seconds: 6.0
+    max_queue: 8
+    # One call per (underlying, strategy, bar) at most.  A persistent ORB
+    # signal is re-judged every 5m bar, so a single-sleeve day can need ~54;
+    # with two underlyings and both tradable sleeves the worst case is ~220.
+    # 120 covers a normal day without letting a runaway signal burn quota.
+    max_calls_per_session: 120
+    log_only: true
+    # First non-empty value wins.  Add GEMINI_KEY_1..4 to .env for rotation;
+    # GOOGLE_GEMINI_API_KEY is the existing single-key fallback.
+    keys_env:
+      - GEMINI_KEY_1
+      - GEMINI_KEY_2
+      - GEMINI_KEY_3
+      - GEMINI_KEY_4
+      - GOOGLE_GEMINI_API_KEY
   demand_supply:
     # Left disabled: the backtest does not model this gate, so enabling it
     # would make live behaviour diverge from the validated strategy.

@@ -29,12 +29,17 @@ def test_options_overlay_declares_staged_profit_lock_ladder():
     overlay = yaml.safe_load(
         (ROOT / "config" / "options_intraday.yaml").read_text(encoding="utf-8")
     )["options_intraday"]
-    assert overlay["profit_lock_rungs"] == [0.10, 0.15, 0.20, 0.25]
+    # 2026-11-17: the 5%/8% rungs were removed because they locked a 0-DTE
+    # NIFTY CE at Rs 3-5 of premium, inside normal tick noise.
+    assert overlay["profit_lock_rungs"] == [0.10, 0.15]
+    # At least one rung must sit below the reduced afternoon target, otherwise
+    # the target branch exits first and the ladder can never arm.
+    assert min(overlay["profit_lock_rungs"]) < overlay["afternoon_target_fraction"]
     # Uniform step remains as the documented fallback.
     assert overlay["profit_lock_step_fraction"] == 0.10
 
 
-def test_options_overlay_allows_two_independent_strategy_slots():
+def test_options_overlay_allows_multiple_independent_strategy_slots():
     """Two slots, each capped at the 15-18k premium band.
 
     The same strategy still cannot pyramid into itself, but a second
