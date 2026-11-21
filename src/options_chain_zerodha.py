@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date, timedelta, timezone
+import time
 from src.zerodha_market_data import ZerodhaMarketData, get_shared_adapter
 from src.options_chain import ChainUnavailable
 from src.utils import get_logger
@@ -192,6 +193,9 @@ def fetch_zerodha_chain(symbol: str,
         quotes: Dict[str, Any] = {}
 
         # Batch in groups of 100 to avoid API limits
+        # and (optionally) pace calls so a persistent ORB signal does not
+        # re-arm the Kite rate limiter every 10s.
+        last_quote_ms = 0.0
         for i in range(0, len(all_symbols), 100):
             batch = all_symbols[i:i + 100]
             try:
@@ -203,9 +207,19 @@ def fetch_zerodha_chain(symbol: str,
                 # can produce a plan from stale/empty legs.  Abort and let the
                 # router fall back to the other provider instead.
                 logger.warning(f"Quote fetch batch failed: {e}; aborting Zerodha chain.")
+                # If spacing is configured, pause before the next batch so a
+                # burst of calls does not re-arm the Kite rate limiter.
+                spacing = _finite_number(
+                    os.environ.get("TRIO_ZERODHA_QUOTE_SPACING"), 0.25)
+                if spacing > 0 and last_quote_ms > 0:
+                    elapsed = time.monotonic() - last_quote_ms
+                    if elapsed < spacing:
+                        time.sleep(spacing - elapsed)
                 return _chain_failure(
                     "rate_limited" if _is_rate_limited(e) else "quote_failed",
                     f"{type(e).__name__}: {e}", raise_errors)
+            last_quote_ms = time.monotonic()
+            _PZERO = _now_monotonic()
 
         # 6. Build structure per expiry/strike
         for exp in expiries:

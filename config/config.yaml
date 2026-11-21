@@ -141,6 +141,16 @@ options:
   min_oi: 1000                # skip wing when OI below this (illiquid)
   max_iv_rank: 80             # rich vol: penalty 0.5 on option rank
   chain_cache_minutes: 15     # NSE chain TTL intraday
+  # Live-chain request budget.  A persistent ORB signal used to refetch the
+  # full chain every 10s (30 Kite "Too many requests" bursts and 1,021 NSE
+  # fallbacks on 2026-11-20).  Quote only the nearest expiries and a bounded
+  # strike band around spot; the planner never selects a far wing anyway.
+  chain_max_expiries: 2       # nearest N expiries for Zerodha/NSE live fetch
+  chain_strike_band_pct: 0.10 # +/-10% of spot for Zerodha chain quotes
+  zerodha_quote_batch_size: 500  # Kite quote maximum per request
+  zerodha_quote_spacing_seconds: 0.25  # gap between Kite quote requests
+  nse_max_expiries: 2         # nearest N expiries requested from NSE
+  nse_cookie_ttl_seconds: 600 # reuse the warmed NSE session for 10 minutes
   risk_free_rate: 0.065       # BS fallback only
   max_premium_pct: 5.0        # skip when premium > 5% of spot (junk)
   expiry_preference: "weekly" # weekly tactical + monthly swing (both swept)

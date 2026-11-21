@@ -36,6 +36,12 @@ options_intraday:
   # fallback for offline tooling and tests.
   scan_basket: nifty50  # configured indices are unioned; stocks remain NIFTY50
   scan_interval_seconds: 300
+  # When the last scan had to fall back from Zerodha to NSE (or the chain was
+  # unavailable), slow the discovery loop from the launcher's 10s cadence to
+  # this value.  The NSE public endpoint cannot survive a 10s hammer, and the
+  # slower cadence stops a throttled Kite account from being re-probed in a
+  # tight loop.  A healthy Zerodha scan returns to the normal cadence.
+  degraded_scan_interval_seconds: 60
   underlying: "NIFTY"         # primary underlying for contract specs
   underlyings: [NIFTY, BANKNIFTY]  # approved underlyings for scan/trading
   stop_premium_fraction: 0.20

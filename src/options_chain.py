@@ -95,6 +95,15 @@ def chain_provider_mode() -> str:
     return "nse"
 
 
+# Live-chain request budget.  A persistent ORB signal used to refetch the
+# full chain every 10s (30 Kite "Too many requests" bursts and 1,021 NSE
+# fallbacks on 2026-11-20).  Quote only the nearest expiries and a bounded
+# strike band around spot; the planner never selects a far wing anyway.
+zerodha_quote_spacing_seconds: float = 0.25
+zerodha_quote_batch_size: int = 500
+_PZERO: Optional[float] = None  # last zerodha quote timestamp (monotonic)
+
+
 def _primary_blocked_until() -> Optional[datetime]:
     return _PRIMARY_BLOCK_UNTIL
 
