@@ -108,10 +108,12 @@ options_intraday:
   # threshold churned fresh positions during multi-underlying scans.
   stale_mark_exit_seconds: 180
   # Remote-mirror health guard.  A failed position refresh blocks new entries
-  # immediately and marks every open leg unresolved.  If the mirror stays
-  # unhealthy for this many seconds, each open leg gets ONE defensive close
+  # immediately and marks every open leg unresolved.  If the remote book stays
+  # UNREACHABLE for this many seconds, each open leg gets ONE defensive close
   # (exit reason: mirror-unhealthy).  The attempt is not repeated during the
-  # same outage: retrying blind risks a duplicate sell.  Recovery clears the
+  # same outage: retrying blind risks a duplicate sell.  A book mismatch (an
+  # unknown holding or a missing owned leg) blocks entries too, but never arms
+  # this flatten: it may be an unrelated manual trade.  Recovery clears the
   # flags and the flatten marker.
   mirror_unhealthy_flatten_seconds: 120
   # Re-log the mirror failure at most once per this many seconds instead of

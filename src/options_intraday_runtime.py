@@ -343,6 +343,10 @@ class OptionsIntradayRuntime:
             # resume entries while the remote book is still unreadable.
             "mirror_failures": 0,
             "mirror_unhealthy_since_ms": 0,
+            # Only a transport/refresh outage arms the defensive flatten.  A
+            # book mismatch blocks entries but must never flatten unrelated
+            # legs (it could be a manual trade in the same account).
+            "mirror_flatten_since_ms": 0,
             "mirror_last_alert_ms": 0,
             "mirror_flatten_attempted_ms": 0,
             "last_mirror_error": "",
@@ -698,7 +702,8 @@ class OptionsIntradayRuntime:
             self._state.get("mirror_unhealthy_since_ms"), 0.0) > 0
 
     def _record_mirror_failure(self, reason: str,
-                               now: Optional[datetime] = None) -> None:
+                               now: Optional[datetime] = None,
+                               arm_flatten: bool = True) -> None:
         """Persist an unhealthy mirror and mark every open leg unresolved.
 
         The guard is deliberately fail-closed: an unreadable remote book is
@@ -706,6 +711,12 @@ class OptionsIntradayRuntime:
         are blocked and every open leg loses its trusted mark until a later
         reconciliation succeeds.  Only our own fixed reason strings are
         stored/logged, never a raw transport body.
+
+        ``arm_flatten`` is True only for failures that mean the remote book
+        itself is unreachable.  A book mismatch (an unknown holding or a
+        missing owned leg) blocks entries but does not arm the timer: the
+        mismatch may be an unrelated manual trade, and force-flattening our
+        legs would be an over-reaction.
         """
         current = _now_ist(now)
         now_ms = int(current.timestamp() * 1000)
@@ -718,6 +729,15 @@ class OptionsIntradayRuntime:
         self._state["mirror_failures"] = failures
         self._state["mirror_unhealthy_since_ms"] = int(since)
         self._state["last_mirror_error"] = str(reason)
+        if arm_flatten:
+            if _finite_number(
+                    self._state.get("mirror_flatten_since_ms"), 0.0) <= 0:
+                self._state["mirror_flatten_since_ms"] = now_ms
+        else:
+            # A mismatch is not a reachability outage.  Cancel any timer armed
+            # by an earlier refresh failure so a mismatch can never inherit
+            # it and force-flatten our legs.
+            self._state["mirror_flatten_since_ms"] = 0
         for position in (self._state.get("positions", {}) or {}).values():
             if not isinstance(position, dict):
                 continue
@@ -751,6 +771,7 @@ class OptionsIntradayRuntime:
             return
         self._state["mirror_failures"] = 0
         self._state["mirror_unhealthy_since_ms"] = 0
+        self._state["mirror_flatten_since_ms"] = 0
         self._state["mirror_last_alert_ms"] = 0
         self._state["mirror_flatten_attempted_ms"] = 0
         self._state["last_mirror_error"] = ""
@@ -767,7 +788,7 @@ class OptionsIntradayRuntime:
                 position["mark_status"] = "stale"
                 position["unresolved_count"] = 0
         logger.warning(
-            "options remote mirror recovered after %d failed refresh(es)",
+            "options remote mirror recovered after %d failed check(s)",
             failures)
 
     def _refresh_source(self, source: Any,
@@ -884,7 +905,8 @@ class OptionsIntradayRuntime:
                 set_broker_uncertain("options remote book has unknown holdings")
             except Exception:
                 pass
-            self._record_mirror_failure("unknown remote holding", now)
+            self._record_mirror_failure(
+                "unknown remote holding", now, arm_flatten=False)
             raise OptionsIntradayUnresolved(unknown, "unknown remote holding")
         missing: List[str] = []
         defensively_flattened: List[Tuple[str, Dict[str, Any]]] = []
@@ -925,7 +947,8 @@ class OptionsIntradayRuntime:
                 set_broker_uncertain("owned options position is not mirrored")
             except Exception:
                 pass
-            self._record_mirror_failure("owned remote position missing", now)
+            self._record_mirror_failure(
+                "owned remote position missing", now, arm_flatten=False)
             raise OptionsIntradayUnresolved(missing, "owned remote position missing")
         was_blocked = self._broker_blocked
         self._broker_blocked = False
@@ -2603,7 +2626,7 @@ class OptionsIntradayRuntime:
 
 
     def _mirror_flatten_due(self, now: datetime) -> bool:
-        """True once the mirror has been unhealthy for the configured window."""
+        """True once a transport outage has lasted the configured window."""
         if _finite_number(
                 self._state.get("mirror_flatten_attempted_ms"), 0.0) > 0:
             # One defensive attempt per outage.  Retrying a close while the
@@ -2612,7 +2635,7 @@ class OptionsIntradayRuntime:
         seconds = _finite_number(
             self.mode_cfg.get("mirror_unhealthy_flatten_seconds"), 120.0)
         since = _finite_number(
-            self._state.get("mirror_unhealthy_since_ms"), 0.0)
+            self._state.get("mirror_flatten_since_ms"), 0.0)
         if seconds <= 0 or since <= 0:
             return False
         now_ms = int(_now_ist(now).timestamp() * 1000)
@@ -2670,6 +2693,10 @@ class OptionsIntradayRuntime:
         try:
             self._reconcile(broker, now=current)
         except OptionsIntradayUnresolved as exc:
+            if not self._state.get("positions", {}):
+                # Nothing to flatten: still fail closed so entries stay off
+                # and the unresolved state is visible.
+                raise
             if not self._mirror_flatten_due(current):
                 raise
             closed.extend(self._flatten_mirror_unhealthy(broker, current))

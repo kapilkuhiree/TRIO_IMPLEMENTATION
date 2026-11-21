@@ -1056,6 +1056,62 @@ def test_mirror_outage_flattens_once_after_threshold(tmp_path):
     assert len(options.close_calls) == 1
 
 
+def test_unknown_holding_blocks_entries_but_never_arms_flatten(tmp_path):
+    options = _OptionsDouble()
+    options.refresh_positions = lambda: True
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, chain_provider=lambda *args, **kwargs: _chain(
+            bid=45.0, ask=50.0, quote_timestamp=QUOTE)))
+    assert runtime.execute_plan(_plan(), options, now=NOW)
+    position_id = next(iter(options.positions))
+
+    # Arm the flatten timer with a real refresh failure first, then switch to
+    # a readable mirror that has an unrelated holding.  The mismatch must
+    # cancel the earlier timer rather than inherit it.
+    options.refresh_positions = lambda: False
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.tick(now=NOW + timedelta(seconds=5))
+    assert runtime._state["mirror_flatten_since_ms"] > 0
+    options.refresh_positions = lambda: True
+    options.positions["MANUAL_TRADE"] = Position(
+        symbol="MANUAL_TRADE", side="LONG", quantity=1,
+        avg_price=100.0, current_price=100.0)
+
+    # Well past the 120s transport threshold: a mismatch must still not
+    # force-flatten our legs, because the holding may be an unrelated manual
+    # trade in the same account.
+    for seconds in (10, 200):
+        with pytest.raises(OptionsIntradayUnresolved, match="unknown remote holding"):
+            runtime.tick(now=NOW + timedelta(seconds=seconds))
+    assert options.close_calls == []
+    assert runtime._state["mirror_flatten_since_ms"] == 0
+    assert runtime._state["mirror_unhealthy_since_ms"] > 0
+    assert runtime._state["positions"][position_id]["mark_unresolved"] is True
+
+    # Removing the unrelated holding clears the guard without any exit.
+    options.positions.pop("MANUAL_TRADE")
+    assert runtime.tick(now=NOW + timedelta(seconds=220)) == []
+    assert options.close_calls == []
+    assert runtime._state["mirror_failures"] == 0
+
+
+def test_missing_owned_leg_never_arms_defensive_flatten(tmp_path):
+    options = _OptionsDouble()
+    options.refresh_positions = lambda: True
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    assert runtime.execute_plan(_plan(), options, now=NOW)
+    options.positions.clear()
+
+    for seconds in (10, 200):
+        with pytest.raises(OptionsIntradayUnresolved,
+                           match="owned remote position missing"):
+            runtime.tick(now=NOW + timedelta(seconds=seconds))
+    assert options.close_calls == []
+    assert runtime._state["mirror_flatten_since_ms"] == 0
+    assert runtime._state["mirror_unhealthy_since_ms"] > 0
+
+
 def test_mirror_unhealthy_state_survives_restart(tmp_path):
     options = _OptionsDouble()
     options.refresh_positions = lambda: True
