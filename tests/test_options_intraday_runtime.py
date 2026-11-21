@@ -987,6 +987,98 @@ def test_unknown_remote_holding_blocks_entries_without_closing_it(tmp_path):
         runtime.execute_plan(_plan(), options, now=NOW)
     assert options.close_calls == []
     assert options.open_calls == []
+    # An unreadable/unexpected remote book is also a mirror-health failure.
+    assert runtime._state["mirror_failures"] == 1
+
+
+def test_mirror_failure_blocks_entries_and_recovers_before_flatten(tmp_path):
+    options = _OptionsDouble()
+    options.refresh_positions = lambda: True
+    runtime = OptionsIntradayRuntime(
+        _Trader(options, tmp_path),
+        _cfg(tmp_path, chain_provider=lambda *args, **kwargs: _chain(
+            bid=45.0, ask=50.0, quote_timestamp=QUOTE)))
+    assert runtime.execute_plan(_plan(), options, now=NOW)
+    position_id = next(iter(options.positions))
+    entries = len(options.open_calls)
+
+    options.refresh_positions = lambda: False
+    with pytest.raises(OptionsIntradayUnresolved, match="remote mirror"):
+        runtime.tick(now=NOW + timedelta(seconds=10))
+    assert runtime._state["mirror_failures"] == 1
+    assert runtime._state["mirror_unhealthy_since_ms"] > 0
+    assert runtime._state["last_mirror_error"] == "remote mirror refresh returned unhealthy"
+    assert runtime._state["positions"][position_id]["mark_unresolved"] is True
+    assert options.close_calls == []
+
+    # Entries are blocked while the persisted failure is unresolved.
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.execute_plan(_plan(), options, now=NOW + timedelta(seconds=20))
+    assert len(options.open_calls) == entries
+    assert options.close_calls == []
+
+    # Recovery before the 120s threshold clears the guard and prevents a
+    # defensive flatten; the leg is managed normally again.
+    options.refresh_positions = lambda: True
+    assert runtime.tick(now=NOW + timedelta(seconds=60)) == []
+    assert runtime._state["mirror_failures"] == 0
+    assert runtime._state["mirror_unhealthy_since_ms"] == 0
+    assert runtime._state["last_mirror_error"] == ""
+    assert options.close_calls == []
+    assert runtime._state["positions"][position_id]["mark_unresolved"] is False
+
+
+def test_mirror_outage_flattens_once_after_threshold(tmp_path):
+    options = _OptionsDouble()
+    options.refresh_positions = lambda: True
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    assert runtime.execute_plan(_plan(), options, now=NOW)
+    position_id = next(iter(options.positions))
+
+    options.refresh_positions = lambda: False
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.tick(now=NOW + timedelta(seconds=10))
+    # 90s after the first failure is still inside the 120s window.
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.tick(now=NOW + timedelta(seconds=90))
+    assert options.close_calls == []
+
+    closed = runtime.tick(now=NOW + timedelta(seconds=130))
+    assert [record["reason"] for record in closed] == ["mirror-unhealthy"]
+    assert position_id not in runtime._state["positions"]
+    assert options.close_calls[-1][2] == "mirror-unhealthy"
+    assert runtime._state["mirror_flatten_attempted_ms"] > 0
+
+    # The defensive close is never repeated during the same outage: a blind
+    # retry could oversell the leg.
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.tick(now=NOW + timedelta(seconds=140))
+    assert len(options.close_calls) == 1
+
+
+def test_mirror_unhealthy_state_survives_restart(tmp_path):
+    options = _OptionsDouble()
+    options.refresh_positions = lambda: True
+    runtime = OptionsIntradayRuntime(_Trader(options, tmp_path), _cfg(tmp_path))
+    assert runtime.execute_plan(_plan(), options, now=NOW)
+
+    options.refresh_positions = lambda: False
+    with pytest.raises(OptionsIntradayUnresolved):
+        runtime.tick(now=NOW + timedelta(seconds=10))
+
+    restarted_options = _OptionsDouble()
+    restarted_options.positions.update(options.positions)
+    restarted_options.refresh_positions = lambda: False
+    restarted = OptionsIntradayRuntime(
+        _Trader(restarted_options, tmp_path), _cfg(tmp_path))
+    assert restarted._mirror_unhealthy()
+    assert restarted._state["mirror_failures"] >= 1
+    assert restarted._state["last_mirror_error"] == "remote mirror refresh returned unhealthy"
+
+    with pytest.raises(OptionsIntradayUnresolved):
+        restarted.execute_plan(
+            _plan(), restarted_options, now=NOW + timedelta(seconds=30))
+    assert restarted_options.open_calls == []
 
 
 def test_existing_megabull_options_adapter_routes_with_fake_transport(tmp_path):

@@ -107,6 +107,16 @@ options_intraday:
   # seconds before the runtime force-flattens the leg.  A tick-count
   # threshold churned fresh positions during multi-underlying scans.
   stale_mark_exit_seconds: 180
+  # Remote-mirror health guard.  A failed position refresh blocks new entries
+  # immediately and marks every open leg unresolved.  If the mirror stays
+  # unhealthy for this many seconds, each open leg gets ONE defensive close
+  # (exit reason: mirror-unhealthy).  The attempt is not repeated during the
+  # same outage: retrying blind risks a duplicate sell.  Recovery clears the
+  # flags and the flatten marker.
+  mirror_unhealthy_flatten_seconds: 120
+  # Re-log the mirror failure at most once per this many seconds instead of
+  # writing a critical line on every scan.
+  mirror_alert_repeat_seconds: 60
   # Do not re-enter the exact same contract immediately after it closed.
   # This prevents a stale/duplicate signal from re-firing after an exit.
   reentry_cooldown_seconds: 300

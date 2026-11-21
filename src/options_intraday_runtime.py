@@ -175,6 +175,9 @@ NON_LOSS_EXIT_REASONS = frozenset({
     "trailing-stop",
     "eod-squareoff",
     "fail-safe-stale-data",
+    # A mirror-outage flatten is an operational safety exit, not a strategy
+    # loss.  Counting it would let two network incidents halt the session.
+    "mirror-unhealthy",
 })
 
 
@@ -336,6 +339,13 @@ class OptionsIntradayRuntime:
             "positions": {},
             "closed": [],
             "last_reconciled_at": "",
+            # Remote-mirror health.  Persisted so a restart cannot silently
+            # resume entries while the remote book is still unreadable.
+            "mirror_failures": 0,
+            "mirror_unhealthy_since_ms": 0,
+            "mirror_last_alert_ms": 0,
+            "mirror_flatten_attempted_ms": 0,
+            "last_mirror_error": "",
         }
 
     def _load_state(self) -> Dict[str, Any]:
@@ -682,15 +692,96 @@ class OptionsIntradayRuntime:
     # an unknown or equity position.
     # ------------------------------------------------------------------
 
-    def _refresh_source(self, source: Any) -> None:
+    def _mirror_unhealthy(self) -> bool:
+        """True while the last remote reconciliation is known to be bad."""
+        return _finite_number(
+            self._state.get("mirror_unhealthy_since_ms"), 0.0) > 0
+
+    def _record_mirror_failure(self, reason: str,
+                               now: Optional[datetime] = None) -> None:
+        """Persist an unhealthy mirror and mark every open leg unresolved.
+
+        The guard is deliberately fail-closed: an unreadable remote book is
+        treated as "we cannot prove our positions", not as "flat".  Entries
+        are blocked and every open leg loses its trusted mark until a later
+        reconciliation succeeds.  Only our own fixed reason strings are
+        stored/logged, never a raw transport body.
+        """
+        current = _now_ist(now)
+        now_ms = int(current.timestamp() * 1000)
+        since = _finite_number(
+            self._state.get("mirror_unhealthy_since_ms"), 0.0)
+        if since <= 0:
+            since = now_ms
+        failures = int(_finite_number(
+            self._state.get("mirror_failures"), 0.0)) + 1
+        self._state["mirror_failures"] = failures
+        self._state["mirror_unhealthy_since_ms"] = int(since)
+        self._state["last_mirror_error"] = str(reason)
+        for position in (self._state.get("positions", {}) or {}).values():
+            if not isinstance(position, dict):
+                continue
+            position["unresolved_count"] = int(_finite_number(
+                position.get("unresolved_count"), 0.0)) + 1
+            position["mark_status"] = "unresolved"
+            position["mark_unresolved"] = True
+            position.setdefault("mark_unresolved_since_ms", now_ms)
+            position.setdefault("mirror_unresolved_since_ms", now_ms)
+        repeat = _finite_number(
+            self.mode_cfg.get("mirror_alert_repeat_seconds"), 60.0)
+        last_alert = _finite_number(
+            self._state.get("mirror_last_alert_ms"), 0.0)
+        if repeat <= 0 or now_ms - last_alert >= repeat * 1000.0:
+            self._state["mirror_last_alert_ms"] = now_ms
+            logger.critical(
+                "options remote mirror unhealthy: %s | failures %d | "
+                "open positions marked unresolved", reason, failures)
+        try:
+            self._persist()
+        except Exception:
+            # The caller is already failing closed; never mask the original
+            # mirror error with a secondary state-write error.
+            pass
+
+    def _clear_mirror_failure(self) -> None:
+        """Clear persisted mirror flags after a successful reconciliation."""
+        failures = int(_finite_number(
+            self._state.get("mirror_failures"), 0.0))
+        if failures <= 0 and not self._mirror_unhealthy():
+            return
+        self._state["mirror_failures"] = 0
+        self._state["mirror_unhealthy_since_ms"] = 0
+        self._state["mirror_last_alert_ms"] = 0
+        self._state["mirror_flatten_attempted_ms"] = 0
+        self._state["last_mirror_error"] = ""
+        for position in (self._state.get("positions", {}) or {}).values():
+            if not isinstance(position, dict):
+                continue
+            position.pop("mirror_flatten_at_ms", None)
+            if position.get("mirror_unresolved_since_ms"):
+                # The mirror is readable again.  Drop the outage-only flag so
+                # the normal fresh-mark path starts from a clean slate.
+                position.pop("mirror_unresolved_since_ms", None)
+                position.pop("mark_unresolved_since_ms", None)
+                position["mark_unresolved"] = False
+                position["mark_status"] = "stale"
+                position["unresolved_count"] = 0
+        logger.warning(
+            "options remote mirror recovered after %d failed refresh(es)",
+            failures)
+
+    def _refresh_source(self, source: Any,
+                        now: Optional[datetime] = None) -> None:
         refresh = getattr(source, "refresh_positions", None)
         if not callable(refresh):
             return
         try:
             result = refresh()
         except Exception as exc:
+            self._record_mirror_failure("remote mirror refresh failed", now)
             raise OptionsIntradayUnresolved(("remote-mirror",), "remote mirror unhealthy") from exc
         if result is False:
+            self._record_mirror_failure("remote mirror refresh returned unhealthy", now)
             raise OptionsIntradayUnresolved(("remote-mirror",), "remote mirror unhealthy")
 
     def _remote_asset(self, source: Any, value: Any) -> str:
@@ -729,7 +820,8 @@ class OptionsIntradayRuntime:
             return ASSET_OPTIONS
         return classify_instrument(symbol, metadata)
 
-    def _remote_positions(self, broker: Any) -> List[Any]:
+    def _remote_positions(self, broker: Any,
+                          now: Optional[datetime] = None) -> List[Any]:
         sources: List[Any] = []
         for source in (
             broker,
@@ -740,7 +832,7 @@ class OptionsIntradayRuntime:
                 sources.append(source)
         positions: List[Any] = []
         for source in sources:
-            self._refresh_source(source)
+            self._refresh_source(source, now=now)
             raw = getattr(source, "positions", None)
             if isinstance(raw, dict):
                 values = list(raw.values())
@@ -751,6 +843,8 @@ class OptionsIntradayRuntime:
                 try:
                     values = list(getter() or []) if callable(getter) else []
                 except Exception as exc:
+                    self._record_mirror_failure(
+                        "remote positions unavailable", now)
                     raise OptionsIntradayUnresolved(("remote-mirror",), "remote positions unavailable") from exc
             for value in values:
                 if _position_quantity(value) <= 0:
@@ -774,8 +868,9 @@ class OptionsIntradayRuntime:
                         owned.add(_normalize_symbol(value))
         return owned
 
-    def _reconcile(self, broker: Any) -> List[Any]:
-        positions = self._remote_positions(broker)
+    def _reconcile(self, broker: Any,
+                   now: Optional[datetime] = None) -> List[Any]:
+        positions = self._remote_positions(broker, now=now)
         remote_symbols = {_normalize_symbol(_position_symbol(item)) for item in positions}
         remote_symbols.discard("")
         owned = self._owned_remote_symbols()
@@ -789,8 +884,10 @@ class OptionsIntradayRuntime:
                 set_broker_uncertain("options remote book has unknown holdings")
             except Exception:
                 pass
+            self._record_mirror_failure("unknown remote holding", now)
             raise OptionsIntradayUnresolved(unknown, "unknown remote holding")
         missing: List[str] = []
+        defensively_flattened: List[Tuple[str, Dict[str, Any]]] = []
         for sid, position in (self._state.get("positions", {}) or {}).items():
             expected = {_normalize_symbol(sid)}
             if isinstance(position, dict):
@@ -799,7 +896,26 @@ class OptionsIntradayRuntime:
                                 *(position.get("remote_symbols", []) or [])]
                                if value)
             if not (expected & remote_symbols):
-                missing.append(str(sid))
+                # A leg we already sent a defensive close for may legitimately
+                # disappear while the mirror is still recovering.  Settle that
+                # book entry instead of treating it as an unexplained loss of
+                # the owned position.
+                if (isinstance(position, dict) and
+                        _finite_number(position.get("mirror_flatten_at_ms"), 0.0) > 0):
+                    defensively_flattened.append((str(sid), dict(position)))
+                else:
+                    missing.append(str(sid))
+        for sid, position in defensively_flattened:
+            reference = (_finite(position.get("last_bid"))
+                         or _finite_number(position.get("entry_premium"), 0.0))
+            if not reference or reference <= 0:
+                missing.append(sid)
+                continue
+            try:
+                self._close_one(broker, sid, position, reference,
+                                "mirror-unhealthy", now=now, assume_flat=True)
+            except OptionsIntradayUnresolved:
+                missing.append(sid)
         if missing:
             self._broker_blocked = True
             self._state["broker_blocked"] = True
@@ -809,6 +925,7 @@ class OptionsIntradayRuntime:
                 set_broker_uncertain("owned options position is not mirrored")
             except Exception:
                 pass
+            self._record_mirror_failure("owned remote position missing", now)
             raise OptionsIntradayUnresolved(missing, "owned remote position missing")
         was_blocked = self._broker_blocked
         self._broker_blocked = False
@@ -819,7 +936,8 @@ class OptionsIntradayRuntime:
                 clear_broker_uncertain()
             except Exception:
                 pass
-        self._state["last_reconciled_at"] = _iso(datetime.now(timezone.utc))
+        self._clear_mirror_failure()
+        self._state["last_reconciled_at"] = _iso(_now_ist(now))
         self._persist()
         return positions
 
@@ -1244,6 +1362,8 @@ class OptionsIntradayRuntime:
         state = self._risk_state()
         if bool(getattr(state, "halt_active", False)):
             return 0, 0.0, "production risk halt is active"
+        if self._mirror_unhealthy():
+            return 0, 0.0, "options remote mirror is unhealthy; entries are blocked"
         # Churn guard: a stop-loss on an underlying blocks new entries on that
         # underlying for a configurable cooldown.  This is what stops a strike
         # rotation (23850 CE stop -> 23900 CE 31s later), which the per-contract
@@ -1596,7 +1716,7 @@ class OptionsIntradayRuntime:
 
         self._roll_daily_state(initial.date().isoformat())
         broker = self._require_broker()
-        self._reconcile(broker)
+        self._reconcile(broker, now=initial)
         if not self._clock().can_enter(initial):
             return []
         if not self._wallet_floor_ok(broker, initial.date().isoformat()):
@@ -1724,7 +1844,7 @@ class OptionsIntradayRuntime:
         broker = self._require_broker(opt_broker)
         self._validate_plan_window(plan or {}, current)
         self._last_plan = deepcopy(plan)
-        self._reconcile(broker)
+        self._reconcile(broker, now=current)
         placed: List[Dict[str, Any]] = []
         candidates = plan.get("option_candidates", []) or []
         if not isinstance(candidates, list):
@@ -2275,7 +2395,8 @@ class OptionsIntradayRuntime:
     # ------------------------------------------------------------------
 
     def _close_confirmed(self, broker: Any, position_id: str,
-                         result: Any) -> Tuple[bool, List[Any]]:
+                         result: Any,
+                         now: Optional[datetime] = None) -> Tuple[bool, List[Any]]:
         if not isinstance(result, dict) or not result:
             return False, []
         status = str(result.get("status", "")).upper()
@@ -2293,7 +2414,7 @@ class OptionsIntradayRuntime:
         # A spread adapter's non-empty close result is only accepted after a
         # fresh mirror shows neither the umbrella nor its exact remote leg.
         try:
-            remote = self._remote_positions(broker)
+            remote = self._remote_positions(broker, now=now)
         except OptionsIntradayUnresolved:
             raise
         remote_keys = {_normalize_symbol(_position_symbol(item))
@@ -2344,7 +2465,9 @@ class OptionsIntradayRuntime:
 
     def _close_one(self, broker: Any, position_id: str, position: Dict[str, Any],
                     bid: float, reason: str,
-                    now: Optional[datetime] = None) -> Dict[str, Any]:
+                    now: Optional[datetime] = None,
+                    assume_flat: bool = False,
+                    confirm: bool = True) -> Dict[str, Any]:
         # Paper-trading leniency: attempt the close, but if it cannot be confirmed
         # (e.g. remote-book state mismatch from a state reset), still advance the
         # runtime book so the tick loop continues and stop/target/ladder logic runs
@@ -2352,7 +2475,11 @@ class OptionsIntradayRuntime:
         # or override the runtime view.
         close = getattr(broker, "close_spread", None)
         result: Any = None
-        if callable(close):
+        if assume_flat:
+            # The remote leg already disappeared after a defensive close was
+            # sent; settle the book without submitting another sell.
+            result = {"status": "FILLED"}
+        elif callable(close):
             try:
                 result = close(position_id, bid, reason)
             except Exception:
@@ -2360,16 +2487,24 @@ class OptionsIntradayRuntime:
         # A restarted process does not own the in-memory spread any more, so
         # close_spread() returns {} and the position would be stranded forever.
         # Fall back to flattening the known remote legs directly.
-        if not result:
+        if not result and not assume_flat:
             result = self._close_remote_legs(broker, position, bid, reason) or result
         # If we have a result, try confirmation; otherwise fall back to confirming
         # for paper mode so the position is removed from the runtime book and
         # stop/target/ladder logic can run on the next pass.
-        if result is not None:
+        if assume_flat:
+            confirmed = True
+        elif result is not None and confirm:
             try:
-                confirmed, _ = self._close_confirmed(broker, position_id, result)
+                confirmed, _ = self._close_confirmed(
+                    broker, position_id, result, now=now)
             except Exception:
                 confirmed = False
+        elif result is not None:
+            # Defensive flatten during a mirror outage cannot use the mirror to
+            # confirm.  Accept only an explicit filled close so an accepted or
+            # pending order never marks the leg flat.
+            confirmed = _status(result) in _FILLED
         else:
             confirmed = False
         if confirmed:
@@ -2467,11 +2602,83 @@ class OptionsIntradayRuntime:
             (position_id,), "options close is not confirmed flat")
 
 
+    def _mirror_flatten_due(self, now: datetime) -> bool:
+        """True once the mirror has been unhealthy for the configured window."""
+        if _finite_number(
+                self._state.get("mirror_flatten_attempted_ms"), 0.0) > 0:
+            # One defensive attempt per outage.  Retrying a close while the
+            # mirror is still blind risks a duplicate sell.
+            return False
+        seconds = _finite_number(
+            self.mode_cfg.get("mirror_unhealthy_flatten_seconds"), 120.0)
+        since = _finite_number(
+            self._state.get("mirror_unhealthy_since_ms"), 0.0)
+        if seconds <= 0 or since <= 0:
+            return False
+        now_ms = int(_now_ist(now).timestamp() * 1000)
+        return now_ms - since >= seconds * 1000.0
+
+    def _flatten_mirror_unhealthy(self, broker: Any,
+                                  now: datetime) -> List[Dict[str, Any]]:
+        """Send one defensive close for every open leg during an outage.
+
+        Confirmation is bypassed only for the explicit filled result of this
+        one close: the mirror is the thing that is down, so demanding a fresh
+        mirror would guarantee the safety exit is never booked.  Unconfirmed
+        results stay open and keep the runtime in its unresolved state.
+        """
+        now_ms = int(_now_ist(now).timestamp() * 1000)
+        self._state["mirror_flatten_attempted_ms"] = now_ms
+        positions = deepcopy(self._state.get("positions", {}) or {})
+        closed: List[Dict[str, Any]] = []
+        unresolved: List[str] = []
+        for position_id, position in positions.items():
+            if not isinstance(position, dict):
+                continue
+            stored = self._state.setdefault(
+                "positions", {}).setdefault(position_id, position)
+            stored["mirror_flatten_at_ms"] = now_ms
+            reference = (_finite(position.get("last_bid"))
+                         or _finite_number(position.get("entry_premium"), 0.0))
+            if not reference or reference <= 0:
+                unresolved.append(str(position_id))
+                continue
+            try:
+                closed.append(self._close_one(
+                    broker, str(position_id), stored, reference,
+                    "mirror-unhealthy", now=now, confirm=False))
+            except OptionsIntradayUnresolved as exc:
+                unresolved.extend(exc.identifiers or (str(position_id),))
+        self._persist()
+        if closed:
+            logger.critical(
+                "options remote mirror unhealthy beyond %.0fs: flattened "
+                "%d open leg(s) defensively",
+                _finite_number(self.mode_cfg.get(
+                    "mirror_unhealthy_flatten_seconds"), 120.0), len(closed))
+        if unresolved:
+            logger.critical(
+                "options remote mirror defensive flatten unresolved for: %s",
+                ", ".join(sorted(set(unresolved))))
+        return closed
+
     def _tick(self, now: Optional[datetime], force_flat: bool = False) -> List[Dict[str, Any]]:
         current = _now_ist(now)
         self._roll_daily_state(current.date().isoformat())
         broker = self._require_broker()
-        self._reconcile(broker)
+        closed: List[Dict[str, Any]] = []
+        try:
+            self._reconcile(broker, now=current)
+        except OptionsIntradayUnresolved as exc:
+            if not self._mirror_flatten_due(current):
+                raise
+            closed.extend(self._flatten_mirror_unhealthy(broker, current))
+            if self._state.get("positions", {}):
+                raise OptionsIntradayUnresolved(
+                    (*exc.identifiers, "mirror-unhealthy"),
+                    "mirror unhealthy and defensive flatten is unresolved"
+                ) from exc
+            return closed
         positions = deepcopy(self._state.get("positions", {}) or {})
         self._state["mark_cycle_ms"] = int(current.timestamp() * 1000)
         if not positions:
@@ -2481,7 +2688,6 @@ class OptionsIntradayRuntime:
         hard_flat = force_flat or (clock.valid and clock.is_hard_flat(current))
         chains: Dict[str, Any] = {}
         unresolved: List[str] = []
-        closed: List[Dict[str, Any]] = []
         state_changed = False
         for position_id, position in positions.items():
             if not isinstance(position, dict):
@@ -2605,7 +2811,7 @@ class OptionsIntradayRuntime:
             # never silently ignored at shutdown.
             broker = self._broker or getattr(self.trader, "opt_broker", None)
             if broker is not None:
-                self._reconcile(self._require_broker(broker))
+                self._reconcile(self._require_broker(broker), now=now)
             return []
         return self._tick(now, force_flat=True)
 
