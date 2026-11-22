@@ -1734,3 +1734,57 @@ def test_paper_all_yaml_policy_unchanged_by_default(tmp_path):
 
     assert effective["max_open_positions"] == 2
     assert "vwap_filter_strategies" not in effective or not effective["vwap_filter_strategies"]
+
+
+# ---------------------------------------------------------------------------
+# Degraded scans: a chain failover must slow the discovery loop
+# ---------------------------------------------------------------------------
+
+def test_scan_is_not_degraded_before_the_first_scan(tmp_path):
+    runtime = OptionsIntradayRuntime(_Trader(_OptionsDouble(), tmp_path), _cfg(tmp_path))
+    assert runtime.scan_degraded() is False
+
+
+def test_chain_failover_marks_the_scan_degraded(tmp_path, monkeypatch):
+    runtime, _, _, chains = _live_runtime(tmp_path, monkeypatch, ("NIFTY",))
+    chains["NIFTY"]["provider"] = "nse"
+    chains["NIFTY"]["retrieval"] = {
+        "provider": "nse",
+        "requested_mode": "auto",
+        "fallback_reason": "zerodha:rate_limited",
+    }
+
+    runtime.scan_and_execute(now=datetime(2026, 10, 14, 9, 35, tzinfo=IST))
+
+    assert runtime.last_scan_diagnostics["per_underlying"]["NIFTY"][
+        "chain_fallback_reason"] == "zerodha:rate_limited"
+    assert runtime.scan_degrade_reason() == "zerodha:rate_limited"
+    assert runtime.scan_degraded() is True
+
+
+def test_deliberate_nse_provider_is_not_degraded(tmp_path, monkeypatch):
+    """An operator who *chose* NSE must not be throttled by the fallback rule."""
+    runtime, _, _, chains = _live_runtime(tmp_path, monkeypatch, ("NIFTY",))
+    chains["NIFTY"]["provider"] = "nse"
+    chains["NIFTY"]["retrieval"] = {"provider": "nse", "requested_mode": "nse"}
+
+    runtime.scan_and_execute(now=datetime(2026, 10, 14, 9, 35, tzinfo=IST))
+
+    assert "chain_fallback_reason" not in runtime.last_scan_diagnostics["per_underlying"]["NIFTY"]
+    assert runtime.scan_degraded() is False
+
+
+@pytest.mark.parametrize("normal,degraded,flag,expected", [
+    (10, 60, True, 60),     # failover slows the loop
+    (10, 60, False, 10),    # healthy scan keeps the launcher cadence
+    (10, 5, True, 10),      # degraded must never speed the loop up
+    (10, "broken", True, 10),
+    (10, None, True, 10),
+    (10, 0, True, 10),
+    (10, float("nan"), True, 10),
+    (10, float("inf"), True, 10),
+])
+def test_next_options_scan_delay_is_conservative(normal, degraded, flag, expected):
+    from src.paper_trader import next_options_scan_delay
+
+    assert next_options_scan_delay(normal, degraded, flag) == expected

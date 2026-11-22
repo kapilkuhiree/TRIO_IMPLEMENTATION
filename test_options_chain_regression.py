@@ -43,6 +43,7 @@ class FakeSession:
 
 def test_expiry_rows_are_grouped_by_requested_expiry():
     expiries = ["13-Oct-2026", "19-Oct-2026", "27-Oct-2026"]
+    requested = expiries[:options_chain.DEFAULT_NSE_MAX_EXPIRIES]
     with patch.object(options_chain, "_session", return_value=FakeSession()), \
          patch.object(options_chain, "_warm_cookies", return_value=True), \
          patch.object(options_chain, "_expiries_for", return_value=expiries), \
@@ -50,7 +51,10 @@ def test_expiry_rows_are_grouped_by_requested_expiry():
          patch.object(options_chain, "_cache_write"):
         result = options_chain.fetch_chain("NIFTY", use_cache=True)
     assert result is not None
-    assert all(result["by_expiry"].get(exp) for exp in expiries)
+    # Only the nearest expiries are requested (live-chain request budget), and
+    # each one must be grouped under its own key, never under the first one.
+    assert all(result["by_expiry"].get(exp) for exp in requested)
+    assert all(exp not in result["by_expiry"] for exp in expiries[len(requested):])
     assert result["by_expiry"]["19-Oct-2026"][0]["expiry"] == "19-Oct-2026"
 
 

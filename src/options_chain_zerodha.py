@@ -1,12 +1,71 @@
+import math
 import os
+import time
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date, timedelta, timezone
-import time
 from src.zerodha_market_data import ZerodhaMarketData, get_shared_adapter
 from src.options_chain import ChainUnavailable
 from src.utils import get_logger
 
 logger = get_logger("options_chain_zerodha")
+
+# Kite's quote endpoint accepts at most 500 instruments per call, but the
+# request is a GET with every symbol in the query string, so a full 500-symbol
+# batch can exceed the gateway's header/URL limit.  100 is the proven value in
+# this codebase; 200 halves the call count and stays well inside the URL limit.
+_DEFAULT_QUOTE_BATCH = 100
+_MAX_QUOTE_BATCH = 500
+_DEFAULT_QUOTE_SPACING = 0.25
+
+# Monotonic timestamp of the last Kite quote request.  Module level on purpose:
+# the limit is per API key, so pacing must hold across chain fetches, not just
+# across batches inside one fetch.
+_LAST_QUOTE_AT: Optional[float] = None
+
+
+def _finite_option(value: Any, default: float) -> float:
+    """Coerce ``value`` to a finite, non-negative float, else return default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(number) or number < 0:
+        return default
+    return number
+
+
+def _quote_batch_size(configured: Optional[int] = None) -> int:
+    """Instruments per Kite quote() request (config > env > safe default)."""
+    if configured is not None:
+        raw = _finite_option(configured, _DEFAULT_QUOTE_BATCH)
+    else:
+        raw = _finite_option(os.environ.get("TRIO_ZERODHA_QUOTE_BATCH"),
+                             _DEFAULT_QUOTE_BATCH)
+    return int(min(_MAX_QUOTE_BATCH, max(1, raw)))
+
+
+def _quote_spacing_seconds(configured: Optional[float] = None) -> float:
+    """Minimum gap between Kite quote() requests (config > env > default)."""
+    if configured is not None:
+        return _finite_option(configured, _DEFAULT_QUOTE_SPACING)
+    return _finite_option(os.environ.get("TRIO_ZERODHA_QUOTE_SPACING"),
+                          _DEFAULT_QUOTE_SPACING)
+
+
+def _pace_quote(spacing: float) -> None:
+    """Wait out the remainder of ``spacing`` since the previous quote call."""
+    global _LAST_QUOTE_AT
+    if spacing > 0 and _LAST_QUOTE_AT is not None:
+        remaining = spacing - (time.monotonic() - _LAST_QUOTE_AT)
+        if remaining > 0:
+            time.sleep(remaining)
+    _LAST_QUOTE_AT = time.monotonic()
+
+
+def reset_rate_limit_state() -> None:
+    """Forget pacing state (tests and operator recovery)."""
+    global _LAST_QUOTE_AT
+    _LAST_QUOTE_AT = None
 
 
 def _safe_getquote_value(value: Any, default: Any = 0.0) -> Any:
@@ -87,7 +146,9 @@ def _convert_to_ist_iso(dt: Any) -> str:
 def fetch_zerodha_chain(symbol: str,
                         raise_errors: bool = False,
                         max_expiries: Optional[int] = None,
-                        max_strike_distance_pct: Optional[float] = None
+                        max_strike_distance_pct: Optional[float] = None,
+                        quote_batch_size: Optional[int] = None,
+                        quote_spacing_seconds: Optional[float] = None
                         ) -> Optional[Dict[str, Any]]:
     """Fetch option chain from Zerodha Kite API and format for TRIO.
 
@@ -108,6 +169,11 @@ def fetch_zerodha_chain(symbol: str,
     every listed strike.  The planner only selects near-the-money contracts,
     so a narrow band cuts batch-quote calls without shrinking the tradable
     set in practice.
+
+    ``quote_batch_size`` and ``quote_spacing_seconds`` bound the request
+    volume: at most that many contracts per Kite ``quote()`` call, with at
+    least that gap between consecutive calls (including calls made by a
+    previous chain fetch, because Kite's limit is per API key).
     """
     try:
         adapter = get_shared_adapter()
@@ -192,12 +258,14 @@ def fetch_zerodha_chain(symbol: str,
         all_symbols = [f"NFO:{i['tradingsymbol']}" for i in options]
         quotes: Dict[str, Any] = {}
 
-        # Batch in groups of 100 to avoid API limits
-        # and (optionally) pace calls so a persistent ORB signal does not
-        # re-arm the Kite rate limiter every 10s.
-        last_quote_ms = 0.0
-        for i in range(0, len(all_symbols), 100):
-            batch = all_symbols[i:i + 100]
+        # Pace every Kite quote call.  A persistent ORB signal refetching the
+        # chain every 10s used to re-arm the rate limiter with unspaced bursts
+        # (30 "Too many requests" errors on 2026-11-20).
+        batch_size = _quote_batch_size(quote_batch_size)
+        spacing = _quote_spacing_seconds(quote_spacing_seconds)
+        for i in range(0, len(all_symbols), batch_size):
+            batch = all_symbols[i:i + batch_size]
+            _pace_quote(spacing)
             try:
                 batch_quotes = adapter.quote("NFO", [s.split("NFO:")[1] for s in batch])
                 if isinstance(batch_quotes, dict):
@@ -206,20 +274,12 @@ def fetch_zerodha_chain(symbol: str,
                 # A partially quoted chain silently narrows the strike set and
                 # can produce a plan from stale/empty legs.  Abort and let the
                 # router fall back to the other provider instead.
-                logger.warning(f"Quote fetch batch failed: {e}; aborting Zerodha chain.")
-                # If spacing is configured, pause before the next batch so a
-                # burst of calls does not re-arm the Kite rate limiter.
-                spacing = _finite_number(
-                    os.environ.get("TRIO_ZERODHA_QUOTE_SPACING"), 0.25)
-                if spacing > 0 and last_quote_ms > 0:
-                    elapsed = time.monotonic() - last_quote_ms
-                    if elapsed < spacing:
-                        time.sleep(spacing - elapsed)
+                logger.warning(
+                    "Quote fetch batch failed (%d-%d of %d): %s; aborting Zerodha chain.",
+                    i, min(i + batch_size, len(all_symbols)), len(all_symbols), e)
                 return _chain_failure(
                     "rate_limited" if _is_rate_limited(e) else "quote_failed",
                     f"{type(e).__name__}: {e}", raise_errors)
-            last_quote_ms = time.monotonic()
-            _PZERO = _now_monotonic()
 
         # 6. Build structure per expiry/strike
         for exp in expiries:

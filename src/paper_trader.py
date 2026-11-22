@@ -47,6 +47,25 @@ from src.demand_supply import (
 logger = get_logger("paper_trader")
 
 
+def next_options_scan_delay(normal_seconds: float, degraded_seconds: Any,
+                            degraded: bool) -> float:
+    """Seconds to wait before the next options entry scan.
+
+    A degraded scan (chain failover) uses the slower interval.  It never speeds
+    the loop up, and an absent or invalid ``degraded_scan_interval_seconds``
+    keeps the normal cadence, so a typo in config cannot hammer a provider.
+    """
+    if not degraded:
+        return normal_seconds
+    try:
+        candidate = float(degraded_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return normal_seconds
+    if not math.isfinite(candidate) or candidate <= normal_seconds:
+        return normal_seconds
+    return candidate
+
+
 class PaperTrader:
     """
     Paper trading loop. Scans symbols at regular intervals,
@@ -1798,9 +1817,11 @@ class PaperTrader:
             except (TypeError, ValueError, OverflowError):
                 logger.warning("Invalid options scan interval; using 300 seconds.")
                 scan_interval = 300.0
+            degraded_interval = mode_cfg.get("degraded_scan_interval_seconds", 60)
 
             started = time.monotonic()
             next_scan_at = None
+            degraded_mode = False
             while True:
                 tick_started = time.monotonic()
                 ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
@@ -1822,11 +1843,33 @@ class PaperTrader:
                         logger.error("Options live scan failed; still managing exits: %s",
                                      exc)
                     finally:
-                        next_scan_at = scan_started + scan_interval
+                        # A chain failover (throttled Zerodha, NSE fallback)
+                        # must not be re-probed at the fast intraday cadence:
+                        # that loop is what produced 30 Kite 429 bursts and
+                        # 1,021 NSE fallbacks on 2026-11-20.
+                        degraded_now = False
+                        try:
+                            degraded_reason = runtime.scan_degrade_reason()
+                            degraded_now = degraded_reason is not None
+                        except Exception:
+                            degraded_reason, degraded_now = None, False
+                        if degraded_now != degraded_mode:
+                            degraded_mode = degraded_now
+                            if degraded_now:
+                                logger.warning(
+                                    "Options scan degraded (%s); next scans every %ss",
+                                    degraded_reason, degraded_interval)
+                            else:
+                                logger.info(
+                                    "Options scan recovered; next scans every %ss",
+                                    scan_interval)
+                        delay = next_options_scan_delay(
+                            scan_interval, degraded_interval, degraded_now)
+                        next_scan_at = scan_started + delay
                         if next_scan_at <= time.monotonic():
                             # A scan that overran its entire interval must not
                             # trigger a burst of overdue catchup scans.
-                            next_scan_at = time.monotonic() + scan_interval
+                            next_scan_at = time.monotonic() + delay
 
                 ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
                 try:

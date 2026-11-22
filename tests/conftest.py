@@ -45,6 +45,26 @@ def pytest_runtest_teardown(item, nextitem):
     _reset_offline_environment()
 
 
+def _reset_chain_provider_session():
+    """Drop module-level provider state so one test cannot leak into the next.
+
+    ``src.options_chain`` now caches one warmed NSE cookie session and
+    ``src.options_chain_zerodha`` remembers the last Kite quote timestamp; both
+    would otherwise survive monkeypatch teardown and make later tests
+    order-dependent.
+    """
+    try:
+        from src.options_chain import reset_chain_provider_state
+        reset_chain_provider_state()
+    except Exception:
+        pass
+    try:
+        from src.options_chain_zerodha import reset_rate_limit_state
+        reset_rate_limit_state()
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _restore_offline_broker_environment(monkeypatch):
     """Keep one test's broker-mode mutation from leaking into later tests."""
@@ -54,6 +74,7 @@ def _restore_offline_broker_environment(monkeypatch):
     monkeypatch.setenv("TRIO_LIVE", "0")
     monkeypatch.setenv("TRIO_OPTIONS_LIVE", "0")
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    _reset_chain_provider_session()
     try:
         yield
     finally:
@@ -62,3 +83,4 @@ def _restore_offline_broker_environment(monkeypatch):
         # the complete offline boundary before pytest unwinds MonkeyPatch so
         # those mutations cannot affect the next test's PaperTrader setup.
         _reset_offline_environment()
+        _reset_chain_provider_session()

@@ -62,6 +62,7 @@ def offline(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         pytest.fail("external HTTP is forbidden")
 
+    chain.reset_chain_provider_state()
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
     monkeypatch.setattr(chain, "load_config", lambda: {"options": {"chain_cache_minutes": 15}})
     monkeypatch.setattr(chain, "CHAIN_CACHE_DIR", tmp_path / "cache")
@@ -199,3 +200,165 @@ def test_no_expiry_info_uses_aggregate_equity_chain_without_guessing(monkeypatch
     assert result["by_expiry"][EXPIRY]
     assert parse_qs(urlsplit(session.calls[-1][0]).query) == {
         "type": ["Equity"], "symbol": ["RELIANCE"]}
+
+
+# ---------------------------------------------------------------------------
+# NSE request budget: one warmed cookie jar, only the nearest expiries
+# ---------------------------------------------------------------------------
+
+def _warmups(session):
+    return [url for url, _ in session.calls
+            if urlsplit(url).path == "/option-chain"]
+
+
+def _expiry_requests(session):
+    return [url for url, _ in session.calls
+            if "/api/option-chain-v3" in url and "expiry=" in url]
+
+
+def test_warmed_nse_session_is_reused_between_fetches(monkeypatch):
+    session = Session(payload("NIFTY"))
+    created = []
+
+    def factory():
+        created.append(1)
+        return session
+
+    monkeypatch.setattr(chain.requests, "Session", factory)
+
+    assert chain.fetch_chain("NIFTY", use_cache=False) is not None
+    assert len(_warmups(session)) == 1
+
+    assert chain.fetch_chain("NIFTY", use_cache=False) is not None
+    assert len(created) == 1, "a warmed cookie jar must be reused"
+    assert len(_warmups(session)) == 1, "no second cookie handshake"
+
+
+def test_expired_nse_cookie_jar_is_rewarmed(monkeypatch):
+    monkeypatch.setattr(chain, "load_config",
+                        lambda: {"options": {"nse_cookie_ttl_seconds": 0}})
+    session = Session()
+    created = []
+
+    def factory():
+        created.append(1)
+        return session
+
+    monkeypatch.setattr(chain.requests, "Session", factory)
+
+    chain.fetch_chain("NIFTY", use_cache=False)
+    chain.fetch_chain("NIFTY", use_cache=False)
+
+    assert len(created) == 2
+    assert len(_warmups(session)) == 2
+
+
+def test_nse_requests_only_the_nearest_expiries(monkeypatch):
+    expiries = ["27-Oct-2026", "03-Nov-2026", "10-Nov-2026", "17-Nov-2026"]
+    session = Session(expiries=expiries)
+    install(monkeypatch, session)
+
+    chain.fetch_chain("NIFTY", use_cache=False)
+
+    assert len(_expiry_requests(session)) == chain.DEFAULT_NSE_MAX_EXPIRIES
+
+
+def test_nse_expiry_cap_is_configurable(monkeypatch):
+    monkeypatch.setattr(chain, "load_config",
+                        lambda: {"options": {"nse_max_expiries": 1}})
+    expiries = ["27-Oct-2026", "03-Nov-2026", "10-Nov-2026", "17-Nov-2026"]
+    session = Session(expiries=expiries)
+    install(monkeypatch, session)
+
+    chain.fetch_chain("NIFTY", use_cache=False)
+
+    requested = _expiry_requests(session)
+    assert len(requested) == 1
+    assert "27-Oct-2026" in requested[0]
+
+
+def test_failed_warmup_leaves_no_session_to_reuse(monkeypatch):
+    class Blocked(Session):
+        def get(self, url, **kwargs):
+            if urlsplit(url).path == "/option-chain":
+                return Response({}, status=403)
+            return super().get(url, **kwargs)
+
+    session = Blocked()
+    install(monkeypatch, session)
+
+    assert chain.fetch_chain("NIFTY", use_cache=False) is None
+    assert chain._NSE_SESSION is None
+
+
+# ---------------------------------------------------------------------------
+# Live-chain request budget: config is actually read and actually forwarded
+# ---------------------------------------------------------------------------
+
+def test_chain_budget_defaults_match_the_documented_limits():
+    assert chain._chain_budget() == {
+        "max_expiries": 2,
+        "strike_band_pct": 0.10,
+        "quote_batch_size": 100,
+        "quote_spacing_seconds": 0.25,
+    }
+
+
+def test_chain_budget_reads_config(monkeypatch):
+    monkeypatch.setattr(chain, "load_config", lambda: {"options": {
+        "chain_max_expiries": 1,
+        "chain_strike_band_pct": 0.05,
+        "zerodha_quote_batch_size": 250,
+        "zerodha_quote_spacing_seconds": 0.5,
+    }})
+
+    assert chain._chain_budget() == {
+        "max_expiries": 1,
+        "strike_band_pct": 0.05,
+        "quote_batch_size": 250,
+        "quote_spacing_seconds": 0.5,
+    }
+
+
+@pytest.mark.parametrize("band", [0, -0.1, 1.5, "wide", None])
+def test_chain_budget_rejects_an_invalid_strike_band(monkeypatch, band):
+    monkeypatch.setattr(chain, "load_config",
+                        lambda: {"options": {"chain_strike_band_pct": band}})
+    assert chain._chain_budget()["strike_band_pct"] == chain.DEFAULT_CHAIN_STRIKE_BAND_PCT
+
+
+def test_chain_budget_never_requests_zero_expiries(monkeypatch):
+    monkeypatch.setattr(chain, "load_config",
+                        lambda: {"options": {"chain_max_expiries": 0}})
+    assert chain._chain_budget()["max_expiries"] == 1
+
+
+def test_zerodha_fetch_receives_the_configured_budget(monkeypatch):
+    from src import options_chain_zerodha as ocz
+
+    monkeypatch.setattr(chain, "load_config", lambda: {"options": {
+        "chain_max_expiries": 3,
+        "chain_strike_band_pct": 0.08,
+        "zerodha_quote_batch_size": 250,
+        "zerodha_quote_spacing_seconds": 0.5,
+    }})
+    seen = {}
+
+    def fake_fetch(symbol, **kwargs):
+        seen["symbol"] = symbol
+        seen["kwargs"] = kwargs
+        return {"symbol": symbol, "by_expiry": {}}
+
+    monkeypatch.setattr(ocz, "fetch_zerodha_chain", fake_fetch)
+
+    chain._fetch_chain_zerodha("NIFTY", [])
+
+    assert seen["kwargs"] == {
+        "raise_errors": True,
+        "max_expiries": 3,
+        "max_strike_distance_pct": 0.08,
+        "quote_batch_size": 250,
+        "quote_spacing_seconds": 0.5,
+    }
+
+

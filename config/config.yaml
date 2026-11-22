@@ -147,8 +147,8 @@ options:
   # strike band around spot; the planner never selects a far wing anyway.
   chain_max_expiries: 2       # nearest N expiries for Zerodha/NSE live fetch
   chain_strike_band_pct: 0.10 # +/-10% of spot for Zerodha chain quotes
-  zerodha_quote_batch_size: 500  # Kite quote maximum per request
-  zerodha_quote_spacing_seconds: 0.25  # gap between Kite quote requests
+  zerodha_quote_batch_size: 100   # contracts per Kite quote() call
+  zerodha_quote_spacing_seconds: 0.25  # minimum gap between Kite quote calls
   nse_max_expiries: 2         # nearest N expiries requested from NSE
   nse_cookie_ttl_seconds: 600 # reuse the warmed NSE session for 10 minutes
   risk_free_rate: 0.065       # BS fallback only

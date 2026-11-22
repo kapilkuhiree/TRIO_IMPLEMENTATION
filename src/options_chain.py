@@ -18,6 +18,7 @@ DISCLAIMER: Educational purposes only. Not financial advice.
 
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -95,13 +96,73 @@ def chain_provider_mode() -> str:
     return "nse"
 
 
-# Live-chain request budget.  A persistent ORB signal used to refetch the
-# full chain every 10s (30 Kite "Too many requests" bursts and 1,021 NSE
+# Live-chain request budget defaults.  A persistent ORB signal used to refetch
+# the full chain every 10s (30 Kite "Too many requests" bursts and 1,021 NSE
 # fallbacks on 2026-11-20).  Quote only the nearest expiries and a bounded
 # strike band around spot; the planner never selects a far wing anyway.
-zerodha_quote_spacing_seconds: float = 0.25
-zerodha_quote_batch_size: int = 500
-_PZERO: Optional[float] = None  # last zerodha quote timestamp (monotonic)
+DEFAULT_CHAIN_MAX_EXPIRIES = 2
+DEFAULT_CHAIN_STRIKE_BAND_PCT = 0.10
+DEFAULT_NSE_MAX_EXPIRIES = 2
+DEFAULT_NSE_COOKIE_TTL_SECONDS = 600.0
+DEFAULT_ZERODHA_QUOTE_BATCH = 100
+DEFAULT_ZERODHA_QUOTE_SPACING = 0.25
+
+# One warmed NSE session is reused across fetches.  Warming a brand-new cookie
+# jar for every chain fetch doubled the request load during the 2026-11-20
+# fallback storm; NSE blocks bare requests, so the warmup cannot be skipped,
+# only amortised.
+_NSE_SESSION: Optional["requests.Session"] = None
+_NSE_SESSION_AT: Optional[float] = None
+
+
+def _options_section() -> Dict[str, Any]:
+    """The ``options`` config block, or an empty dict when unavailable."""
+    try:
+        return load_config().get("options", {}) or {}
+    except Exception:
+        return {}
+
+
+def _finite_number(value: Any, default: float) -> float:
+    """Coerce ``value`` to a finite float, else return ``default``."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _chain_budget() -> Dict[str, Any]:
+    """Resolve the live-chain request budget from ``config/config.yaml``."""
+    cfg = _options_section()
+    expiries = int(max(1, _finite_number(
+        cfg.get("chain_max_expiries"), DEFAULT_CHAIN_MAX_EXPIRIES)))
+    band = _finite_number(cfg.get("chain_strike_band_pct"),
+                          DEFAULT_CHAIN_STRIKE_BAND_PCT)
+    if not 0 < band <= 1:
+        band = DEFAULT_CHAIN_STRIKE_BAND_PCT
+    batch = int(max(1, _finite_number(
+        cfg.get("zerodha_quote_batch_size"), DEFAULT_ZERODHA_QUOTE_BATCH)))
+    spacing = max(0.0, _finite_number(
+        cfg.get("zerodha_quote_spacing_seconds"), DEFAULT_ZERODHA_QUOTE_SPACING))
+    return {
+        "max_expiries": expiries,
+        "strike_band_pct": band,
+        "quote_batch_size": batch,
+        "quote_spacing_seconds": spacing,
+    }
+
+
+def _nse_max_expiries() -> int:
+    cfg = _options_section()
+    return int(max(1, _finite_number(
+        cfg.get("nse_max_expiries"), DEFAULT_NSE_MAX_EXPIRIES)))
+
+
+def _nse_cookie_ttl_seconds() -> float:
+    cfg = _options_section()
+    return max(0.0, _finite_number(
+        cfg.get("nse_cookie_ttl_seconds"), DEFAULT_NSE_COOKIE_TTL_SECONDS))
 
 
 def _primary_blocked_until() -> Optional[datetime]:
@@ -134,8 +195,9 @@ def _reset_primary_failure() -> None:
 
 
 def reset_chain_provider_state() -> None:
-    """Clear the sticky backoff (tests and manual operator recovery)."""
+    """Clear the sticky backoff and the warmed NSE cookie session."""
     _reset_primary_failure()
+    _drop_nse_session()
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +213,33 @@ def _session() -> "requests.Session":
         "Referer": NSE_HOME,
     })
     return s
+
+
+def _drop_nse_session() -> None:
+    """Forget the warmed session so the next fetch redoes the handshake."""
+    global _NSE_SESSION, _NSE_SESSION_AT
+    _NSE_SESSION = None
+    _NSE_SESSION_AT = None
+
+
+def _nse_session(ttl_seconds: float) -> Optional["requests.Session"]:
+    """A warmed NSE session, reused until ``ttl_seconds`` elapse.
+
+    Returns ``None`` when the cookie handshake fails (typically a blocked IP),
+    leaving no half-warmed session behind for the next caller.
+    """
+    global _NSE_SESSION, _NSE_SESSION_AT
+    if (_NSE_SESSION is not None and _NSE_SESSION_AT is not None
+            and ttl_seconds > 0
+            and time.monotonic() - _NSE_SESSION_AT < ttl_seconds):
+        return _NSE_SESSION
+    _drop_nse_session()
+    session = _session()
+    if not _warm_cookies(session):
+        return None
+    _NSE_SESSION = session
+    _NSE_SESSION_AT = time.monotonic()
+    return session
 
 
 def _warm_cookies(s: "requests.Session") -> bool:
@@ -404,7 +493,15 @@ def _fetch_chain_zerodha(symbol: str, failures: List[str]) -> Optional[Dict[str,
     try:
         from src.options_chain_zerodha import fetch_zerodha_chain
         logger.info("Using Zerodha provider for %s chain", symbol)
-        chain = fetch_zerodha_chain(symbol, raise_errors=True)
+        budget = _chain_budget()
+        chain = fetch_zerodha_chain(
+            symbol,
+            raise_errors=True,
+            max_expiries=budget["max_expiries"],
+            max_strike_distance_pct=budget["strike_band_pct"],
+            quote_batch_size=budget["quote_batch_size"],
+            quote_spacing_seconds=budget["quote_spacing_seconds"],
+        )
     except ChainUnavailable as exc:
         failures.append(f"zerodha:{exc.reason}")
         logger.warning("Zerodha chain unavailable (%s): %s", exc.reason, exc.detail)
@@ -442,12 +539,10 @@ def _fetch_chain_nse(symbol: str, use_cache: bool,
                      diagnostic_label: Optional[str] = None
                      ) -> Optional[Dict[str, Any]]:
     """NSE public-API chain fetch (original implementation)."""
-    cfg = {}
-    try:
-        cfg = load_config().get("options", {}) or {}
-    except Exception:
-        pass
+    cfg = _options_section()
     ttl = int(cfg.get("chain_cache_minutes", 15))
+    max_expiries = _nse_max_expiries()
+    session_ttl = _nse_cookie_ttl_seconds()
 
     if use_cache:
         hit = _cache_fresh(symbol, ttl)
@@ -469,16 +564,17 @@ def _fetch_chain_nse(symbol: str, use_cache: bool,
     last: Exception = RuntimeError("unreachable")
     for attempt in range(RETRIES + 1):
         try:
-            s = _session()
-            if not _warm_cookies(s):
+            s = _nse_session(session_ttl)
+            if s is None:
                 raise RuntimeError("NSE cookie warmup failed (likely blocked)")
             expiries = _expiries_for(s, symbol)
+            requested = [e for e in expiries[:max_expiries] if e]
             # Known indices and actual stocks have different NSE endpoints.
             chain_type = "Indices" if symbol in INDEX_SYMBOLS else "Equity"
             legacy_kind = "indices" if symbol in INDEX_SYMBOLS else "equities"
             encoded_symbol = quote(symbol, safe="")
             paths: List[tuple[str, str]] = []
-            for exp in (expiries[:4] or [""]):
+            for exp in (requested or [""]):
                 paths.append((
                     "/api/option-chain-v3?type={t}&symbol={s}&expiry={e}"
                     .format(t=chain_type, s=encoded_symbol, e=quote(exp, safe="")) if exp else
@@ -622,9 +718,7 @@ def _fetch_chain_nse(symbol: str, use_cache: bool,
                 "retrieved_at": retrieved_at,
                 "symbol": symbol,
                 "underlying": underlying,
-                "requested_expiries": [
-                    item for item in expiries[:4] if item
-                ],
+                "requested_expiries": list(requested),
                 "responses": response_diagnostics,
                 "expiry_status": {},
                 "freshness": {"ttl_minutes": ttl, "fresh": True},
@@ -645,7 +739,7 @@ def _fetch_chain_nse(symbol: str, use_cache: bool,
                      "quote_timestamp": quote_timestamp,
                      "diagnostics": diagnostic}
             diagnostic["expiry_status"] = {
-                exp: expiry_status(chain, exp) for exp in expiries[:4]
+                exp: expiry_status(chain, exp) for exp in expiries[:max_expiries]
             }
             if diagnostic_label:
                 diagnostic["label"] = diagnostic_label
@@ -658,6 +752,9 @@ def _fetch_chain_nse(symbol: str, use_cache: bool,
             last = exc
             logger.warning("NSE chain blocked (attempt %d): %s",
                            attempt + 1, exc)
+            # The cookie jar is the thing that gets blocked; drop it so the
+            # next attempt performs a fresh handshake.
+            _drop_nse_session()
             time.sleep(2 + attempt * 2)
         except Exception as exc:
             last = exc

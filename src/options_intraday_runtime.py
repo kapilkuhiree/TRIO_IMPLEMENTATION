@@ -1724,6 +1724,28 @@ class OptionsIntradayRuntime:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def scan_degrade_reason(self) -> Optional[str]:
+        """The chain failover that made the last scan degraded, if any.
+
+        ``build_live_options_scan`` records the reason per underlying (and a
+        deliberate ``chain_provider: nse`` configuration records none), so an
+        operator who *chooses* NSE is never slowed down by this.
+        """
+        diagnostics = self.last_scan_diagnostics or {}
+        reason = diagnostics.get("chain_fallback_reason")
+        if reason:
+            return str(reason)
+        per_underlying = diagnostics.get("per_underlying") or {}
+        if isinstance(per_underlying, dict):
+            for state in per_underlying.values():
+                if isinstance(state, dict) and state.get("chain_fallback_reason"):
+                    return str(state["chain_fallback_reason"])
+        return None
+
+    def scan_degraded(self) -> bool:
+        """True when the last entry scan had to fail over its chain provider."""
+        return self.scan_degrade_reason() is not None
+
     def scan_and_execute(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Scan the configured broad universe, then freshly confirm each entry.
 
