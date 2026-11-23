@@ -3,9 +3,16 @@
   "closed": [],
   "daily_entries": 0,
   "intents": {},
-  "last_reconciled_at": "2026-11-20T18:12:24.062040+00:00",
-  "mark_cycle_ms": 1792989581124,
+  "last_mirror_error": "",
+  "last_reconciled_at": "2026-11-23T19:41:05.192122+00:00",
+  "mark_cycle_ms": 1795462864986,
+  "mirror_failures": 0,
+  "mirror_flatten_attempted_ms": 0,
+  "mirror_flatten_since_ms": 0,
+  "mirror_last_alert_ms": 0,
+  "mirror_unhealthy_since_ms": 0,
   "positions": {},
   "schema_version": 1,
-  "session_date": "2026-11-20"
+  "session_date": "2026-11-24",
+  "wallet_floor_checked_on": ""
 }
