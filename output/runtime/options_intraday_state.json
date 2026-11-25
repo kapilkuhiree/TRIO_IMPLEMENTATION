@@ -4,8 +4,8 @@
   "daily_entries": 0,
   "intents": {},
   "last_mirror_error": "",
-  "last_reconciled_at": "2026-11-24T20:17:52.539470+00:00",
-  "mark_cycle_ms": 1795551472296,
+  "last_reconciled_at": "2026-11-25T19:31:26.328737+00:00",
+  "mark_cycle_ms": 1795635086130,
   "mirror_failures": 0,
   "mirror_flatten_attempted_ms": 0,
   "mirror_flatten_since_ms": 0,
@@ -13,6 +13,6 @@
   "mirror_unhealthy_since_ms": 0,
   "positions": {},
   "schema_version": 1,
-  "session_date": "2026-11-25",
+  "session_date": "2026-11-26",
   "wallet_floor_checked_on": ""
 }
