@@ -16,7 +16,7 @@ import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from candidate_pipeline import CandidatePipeline, OptionsCandidate
-from contract_selector import select_option_contract
+from contract_selector import select_option_contract, select_structure_contracts
 from src.demand_supply import confirm_demand_supply, demand_supply_enabled
 from src.utils import get_logger
 
@@ -31,12 +31,47 @@ DEFAULT_STRATEGIES = ("orb", "pullback", "momentum")
 # momentum branch loses in every window; it is opt-in via the mode config.
 ALLOWED_STRATEGIES = set(DEFAULT_STRATEGIES) | {
     "mean_reversion",
+    "orb_smt",
     "orb_retest",
     "opening_range_reversion",
     "smc_liquidity",
+    "long_straddle",
+    "long_strangle",
 }
 NSE_OPEN = time(9, 15)
 NSE_LAST_BAR_START = time(15, 10)
+
+# Last logged per-underlying sleeve summary, used to avoid logging the same
+# no-change diagnostic on every 10-second options scan.
+_LAST_STRATEGY_DIAG: Dict[str, str] = {}
+
+
+def _strategy_diag_summary(diag: Dict[str, Any]) -> str:
+    """Compact, deterministic one-line view of per-sleeve planner state."""
+    parts = []
+    for name in sorted(str(key) for key in (diag or {})):
+        info = (diag or {}).get(name) or {}
+        if not isinstance(info, dict):
+            parts.append(f"{name}={info}")
+            continue
+        status = str(info.get("status") or "unknown")
+        if status == "signal":
+            parts.append(f"{name}=signal({int(info.get('signals') or 0)})")
+        elif status == "rejected":
+            parts.append(f"{name}=rejected:{info.get('reason') or 'unknown'}")
+        else:
+            parts.append(f"{name}={status}")
+    return ", ".join(parts)
+
+
+def _log_strategy_diagnostics(underlying: str, diag: Dict[str, Any]) -> None:
+    """Log a planner diagnostic line only when the sleeve state changes."""
+    summary = _strategy_diag_summary(diag)
+    key = str(underlying or "").upper()
+    if _LAST_STRATEGY_DIAG.get(key) == summary:
+        return
+    _LAST_STRATEGY_DIAG[key] = summary
+    logger.info("PLANNER strategies %s: %s", key, summary)
 
 
 def fetch_market_data(symbol: str, timeframe: str):
@@ -577,11 +612,116 @@ def _strategy_confidence(mode_cfg: Dict[str, Any], strategy: str, candidate: Opt
     return int(parsed if parsed is not None else 80)
 
 
+def _structure_leg_payload(contract: Dict[str, Any], kind: str,
+                           expiry: str) -> Dict[str, Any]:
+    """Convert one selected structure contract into the runtime leg shape."""
+    premium = float(contract["ask"])
+    return {
+        "strike": float(contract["strike"]),
+        "expiry": expiry,
+        "kind": kind,
+        "side": "BUY",
+        "premium": premium,
+        "premium_src": "live",
+        "bid": float(contract["bid"]),
+        "ask": premium,
+        "oi": float(contract["open_interest"]),
+        "open_interest": float(contract["open_interest"]),
+        "volume": float(contract["volume"]),
+        "quote_timestamp": contract["quote_timestamp"],
+        "row_timestamp": contract.get("row_timestamp"),
+        "trading_symbol": contract.get("trading_symbol"),
+    }
+
+
 def _candidate_dict(candidate: OptionsCandidate, *, rank: int, confidence: int,
                     option_contract: Dict[str, Any], expiry: str,
                     expiry_status: Dict[str, Any], lot_size: int,
                     quote_age: float, risk_budget: float,
                     signal_timestamp: str, strategy: str) -> Dict[str, Any]:
+    is_structure = (
+        bool(getattr(candidate, "structure_legs", None)) or
+        bool(option_contract.get("__structure_legs__")) or
+        str(candidate.option_type or "").upper() == "CE+PE"
+    )
+    if is_structure:
+        ce_contract = option_contract["ce_contract"]
+        pe_contract = option_contract["pe_contract"]
+        legs = [
+            _structure_leg_payload(ce_contract, "CE", expiry),
+            _structure_leg_payload(pe_contract, "PE", expiry),
+        ]
+        net_debit = round(sum(float(leg["premium"]) for leg in legs), 2)
+        max_loss = round(net_debit * lot_size, 2)
+        quote_timestamp = legs[0]["quote_timestamp"]
+        setup = candidate.strategy_name
+        return {
+            "asset": "options",
+            "symbol": candidate.underlying_symbol,
+            "signal_underlying": candidate.underlying_symbol,
+            "option_underlying": candidate.underlying_symbol,
+            "underlying": candidate.underlying_symbol,
+            "exchange": "NSE",
+            "signal_timestamp": signal_timestamp,
+            "source": f"5m:{strategy}",
+            "strategy": strategy,
+            "setup": setup,
+            "setup_name": setup,
+            "direction": "any",
+            "signal": "BUY",
+            "action": "BUY",
+            "order_side": "BUY",
+            "entry_price": float(candidate.entry_price),
+            "stop_loss": 0.0,
+            "target": 0.0,
+            "underlying_entry": float(candidate.entry_price),
+            "underlying_stop_loss": 0.0,
+            "underlying_target": 0.0,
+            "confidence": confidence,
+            "rank": rank,
+            "rank_score": round(float(candidate.contract_rank_score), 4),
+            "risk_budget": risk_budget,
+            "risk_amount": max_loss,
+            "position_size": lot_size,
+            "lots": 1,
+            "option_legs": {
+                "strategy": str(strategy).replace("_", "-"),
+                "structure": setup.upper(),
+                "bias": "ANY",
+                "underlying": candidate.underlying_symbol,
+                "spot": float(candidate.entry_price),
+                "exchange": "NSE",
+                "lot_size": lot_size,
+                "expiry": expiry,
+                "legs": legs,
+                "structure_legs": list(
+                    getattr(candidate, "structure_legs", None) or []),
+                "net_debit": net_debit,
+                "maxLoss": max_loss,
+                "max_loss": max_loss,
+                "rank": rank,
+                "confidence": confidence,
+                "risk_budget": risk_budget,
+            },
+            "option_diagnostic": {
+                "signal_underlying": candidate.underlying_symbol,
+                "option_underlying": candidate.underlying_symbol,
+                "underlying_mapping": "same_underlying_option_only",
+                "requested_expiry": expiry,
+                "expiry_status": expiry_status,
+                "selection_stage": "selected",
+                "quote_timestamp": quote_timestamp,
+                "quote_age_seconds": round(quote_age, 3),
+                "lot_size_source": "verified",
+                "rejection_reasons": [],
+                "demand_supply": getattr(candidate, "demand_supply_confirmation", {
+                    "confirmed": True,
+                    "reason": "direction-neutral long-volatility structure",
+                }),
+            },
+            "signal_reason": candidate.signal_reason,
+            "historical_options_pnl": "NOT_READY",
+        }
     direction = str(candidate.direction or "").lower()
     signal = "BUY" if direction == "bullish" else "SELL"
     kind = "CE" if signal == "BUY" else "PE"
@@ -878,6 +1018,7 @@ def build_intraday_plan(
             "signals": len(generated),
         }
     plan["strategy_diagnostics"] = strategy_diag
+    _log_strategy_diagnostics(underlying, strategy_diag)
 
     if not candidates:
         plan_diag["valid"] = True
@@ -895,45 +1036,90 @@ def build_intraday_plan(
     signal_timestamp = _iso_ist(latest_candle_ts + BAR_SIZE)
     for candidate in candidates:
         direction = str(candidate.direction or "").lower()
-        expected_kind = "CE" if direction == "bullish" else "PE" if direction == "bearish" else ""
-        if expected_kind not in {"CE", "PE"} or candidate.option_type.upper() != expected_kind:
-            rejected.append({
-                "strategy": candidate.strategy_name,
-                "reason": "signal direction/option identity mismatch",
-            })
-            continue
-        values = [candidate.entry_price, candidate.stop_loss, candidate.target]
-        if any(_finite(value) is None or float(value) <= 0 for value in values):
-            rejected.append({"strategy": candidate.strategy_name, "reason": "invalid underlying levels"})
-            continue
-        confirmation = confirm_demand_supply(
-            normalized_candles,
-            direction,
-            index=latest_index,
-            cfg=cfg,
-            context="options",
+        is_structure = (
+            bool(getattr(candidate, "structure_legs", None)) or
+            str(candidate.option_type or "").upper() == "CE+PE"
         )
-        candidate.demand_supply_confirmation = confirmation.to_dict()
-        if not confirmation.confirmed:
-            rejected.append({
-                "strategy": candidate.strategy_name,
-                "reason": "demand_supply_confirmation_failed",
-                "details": [confirmation.reason],
-            })
-            continue
-        result = select_option_contract(
-            underlying_symbol=underlying,
-            underlying_price=float(candidate.entry_price),
-            signal_direction=direction,
-            available_contracts=fresh_contracts,
-            contract_specs=contract_specs,
-            min_oi=min_oi,
-            max_spread_pct=max_spread,
-            moneyness_target="ATM",
-            expected_exchange="NSE",
-            expected_expiry=expiry,
-            live_quote_only=True,
-        )
+        if is_structure:
+            # A straddle/strangle has no directional underlying stop/target.
+            # Its trigger is already causal (ORB/pullback/momentum) and it is
+            # direction-neutral, so the directional demand/supply gate is not
+            # meaningful here; the plan still records an explicit confirmation
+            # for the downstream validator.
+            structure_legs = list(getattr(candidate, "structure_legs", None) or [])
+            kinds = sorted(
+                str(leg.get("kind") or "").strip().upper()
+                for leg in structure_legs if isinstance(leg, dict)
+            )
+            if (len(structure_legs) != 2 or kinds != ["CE", "PE"] or
+                    any(str(leg.get("side") or "").strip().upper() != "BUY"
+                        for leg in structure_legs if isinstance(leg, dict))):
+                rejected.append({
+                    "strategy": candidate.strategy_name,
+                    "reason": "structure requires one BUY CE and one BUY PE leg",
+                })
+                continue
+            if _finite(candidate.entry_price) is None or float(candidate.entry_price) <= 0:
+                rejected.append({"strategy": candidate.strategy_name, "reason": "invalid underlying levels"})
+                continue
+            candidate.demand_supply_confirmation = {
+                "confirmed": True,
+                "reason": "direction-neutral long-volatility structure",
+            }
+        else:
+            expected_kind = "CE" if direction == "bullish" else "PE" if direction == "bearish" else ""
+            if expected_kind not in {"CE", "PE"} or candidate.option_type.upper() != expected_kind:
+                rejected.append({
+                    "strategy": candidate.strategy_name,
+                    "reason": "signal direction/option identity mismatch",
+                })
+                continue
+            values = [candidate.entry_price, candidate.stop_loss, candidate.target]
+            if any(_finite(value) is None or float(value) <= 0 for value in values):
+                rejected.append({"strategy": candidate.strategy_name, "reason": "invalid underlying levels"})
+                continue
+            confirmation = confirm_demand_supply(
+                normalized_candles,
+                direction,
+                index=latest_index,
+                cfg=cfg,
+                context="options",
+            )
+            candidate.demand_supply_confirmation = confirmation.to_dict()
+            if not confirmation.confirmed:
+                rejected.append({
+                    "strategy": candidate.strategy_name,
+                    "reason": "demand_supply_confirmation_failed",
+                    "details": [confirmation.reason],
+                })
+                continue
+        if is_structure:
+            result = select_structure_contracts(
+                underlying_symbol=underlying,
+                underlying_price=float(candidate.entry_price),
+                available_contracts=fresh_contracts,
+                contract_specs=contract_specs,
+                structure_legs=structure_legs,
+                min_oi=min_oi,
+                max_spread_pct=max_spread,
+                expected_exchange="NSE",
+                expected_expiry=expiry,
+                live_quote_only=True,
+            )
+        else:
+            result = select_option_contract(
+                underlying_symbol=underlying,
+                underlying_price=float(candidate.entry_price),
+                signal_direction=direction,
+                available_contracts=fresh_contracts,
+                contract_specs=contract_specs,
+                min_oi=min_oi,
+                max_spread_pct=max_spread,
+                moneyness_target="ATM",
+                expected_exchange="NSE",
+                expected_expiry=expiry,
+                live_quote_only=True,
+            )
         if "selected_contract" not in result:
             rejected.append({
                 "strategy": candidate.strategy_name,
@@ -949,7 +1135,9 @@ def build_intraday_plan(
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid * 100.0
         oi_bonus = min(float(contract["open_interest"]) / 10000.0, 10.0)
-        candidate.contract_rank_score = 100.0 - spread_pct + oi_bonus
+        candidate.contract_rank_score = float(
+            contract.get("contract_rank_score") or 100.0 - spread_pct + oi_bonus
+        )
         quote_time = _parse_timestamp(contract["quote_timestamp"], allow_naive=False)
         quote_age = (now_ist - quote_time).total_seconds()
         selected.append((candidate, contract, quote_age))

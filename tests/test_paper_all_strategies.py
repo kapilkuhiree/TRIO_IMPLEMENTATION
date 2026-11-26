@@ -38,6 +38,7 @@ def _cfg():
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     monkeypatch.delenv(session.PAPER_ALL_STRATEGIES_ENV, raising=False)
+    monkeypatch.delenv(session.PAPER_LONG_STRUCTURES_ENV, raising=False)
     monkeypatch.delenv("TRIO_OPTIONS_LIVE", raising=False)
     # _run_options_only_session uses os.environ.setdefault for the live policy.
     # Pin these with monkeypatch so this module cannot leak them into siblings.
@@ -80,6 +81,54 @@ def test_switch_applies_the_approved_table(monkeypatch):
     assert mode["risk_per_trade_pct"] == 0.70
     assert mode["PAPER_TRADING"] is True
     assert mode["execution_class"] == "remote_paper"
+
+
+def test_long_structures_switch_only_enables_the_two_structures(monkeypatch):
+    monkeypatch.setenv(session.PAPER_LONG_STRUCTURES_ENV, "1")
+    cfg = _cfg()
+
+    assert session._apply_paper_all_strategies(cfg) is True
+    mode = cfg["options_intraday"]
+
+    assert mode["strategies"] == ["long_straddle", "long_strangle"]
+    assert mode["shadow_strategies"] == []
+    assert mode["max_open_positions"] == 2
+    assert mode["max_correlated_positions"] == 2
+    assert mode["max_premium_exposure_pct"] == 9.00
+    assert mode["max_consecutive_losses"] == 2
+    assert mode["vwap_filter_strategies"] == []
+    # The shared risk envelope is untouched.
+    assert mode["max_daily_loss_pct"] == 1.50
+    assert mode["max_premium_per_position"] == 18000
+    assert mode["risk_per_trade_pct"] == 0.70
+
+
+def test_long_structures_switch_wins_over_paper_all(monkeypatch):
+    monkeypatch.setenv(session.PAPER_ALL_STRATEGIES_ENV, "1")
+    monkeypatch.setenv(session.PAPER_LONG_STRUCTURES_ENV, "1")
+    cfg = _cfg()
+
+    assert session._apply_paper_all_strategies(cfg) is True
+    assert cfg["options_intraday"]["strategies"] == [
+        "long_straddle", "long_strangle"]
+    assert cfg["options_intraday"]["vwap_filter_strategies"] == []
+
+
+@pytest.mark.parametrize("cfg_update", [
+    {"execution_class": "live"},
+    {"PAPER_TRADING": False},
+])
+def test_long_structures_switch_refuses_outside_remote_paper(
+        monkeypatch, cfg_update):
+    monkeypatch.setenv(session.PAPER_LONG_STRUCTURES_ENV, "1")
+    cfg = _cfg()
+    cfg["options_intraday"].update(cfg_update)
+    before = deepcopy(cfg)
+
+    with pytest.raises(OptionsIntradayPolicyError, match="remote_paper"):
+        session._apply_paper_all_strategies(cfg)
+
+    assert cfg == before
 
 
 def test_switch_is_idempotent(monkeypatch):
@@ -159,6 +208,30 @@ def test_launcher_applies_overrides_before_building_the_trader(monkeypatch):
     assert seen["max_open_positions"] == 5
     assert seen["shadow_strategies"] == []
     assert seen["vwap_filter_strategies"] == ["orb", "orb_retest"]
+
+
+def test_launcher_applies_long_structures_only(monkeypatch):
+    monkeypatch.setenv(session.PAPER_LONG_STRUCTURES_ENV, "1")
+    cfg = _cfg()
+    seen = {}
+
+    class _Stop(RuntimeError):
+        pass
+
+    def factory(*args, **kwargs):
+        seen.update(deepcopy(cfg["options_intraday"]))
+        raise _Stop
+
+    monkeypatch.setattr(session, "PaperTrader", factory)
+    monkeypatch.setattr(session, "load_config", lambda: cfg)
+
+    with pytest.raises(_Stop):
+        session._run_options_only_session(
+            cfg, "options_intraday", interval_seconds=60,
+            max_seconds=1, management_only=False)
+
+    assert seen["strategies"] == ["long_straddle", "long_strangle"]
+    assert seen["shadow_strategies"] == []
 
 
 def test_launcher_without_the_switch_keeps_the_yaml_policy(monkeypatch):

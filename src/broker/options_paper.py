@@ -24,10 +24,30 @@ from src.utils import get_logger, load_config, utc_now
 logger = get_logger("broker.options_paper")
 
 
+_STRUCTURE_STRATEGIES = frozenset({"long-straddle", "long-strangle"})
+
+
 def _spread_id(strategy: str, expiry: str, long_k: float,
                short_k: float) -> str:
     return (f"OPT_{strategy}_{expiry}_{int(long_k)}x{int(short_k)}"
             .replace(" ", ""))
+
+
+def _is_long_structure(strategy: str, legs: List[Dict[str, Any]]) -> bool:
+    """True for a long straddle/strangle: two BUY legs, one CE and one PE.
+
+    Both spellings (``long_straddle`` and ``long-straddle``) are recognized.
+    A structure has NO short leg, so it must not be validated as a debit
+    spread.
+    """
+    normalized = str(strategy or "").strip().lower().replace("_", "-")
+    if normalized not in _STRUCTURE_STRATEGIES or len(legs) != 2:
+        return False
+    if any(str(leg.get("side") or "").strip().upper() != "BUY"
+           for leg in legs):
+        return False
+    kinds = {str(leg.get("kind") or "").strip().upper() for leg in legs}
+    return kinds == {"CE", "PE"}
 
 
 class OptionsPaperBroker(BaseBroker):
@@ -54,12 +74,14 @@ class OptionsPaperBroker(BaseBroker):
 
     def open_spread(self, candidate: Any, lots: int = 1,
                     reason: str = "options-plan") -> BrokerOrder:
-        """Open one spread (or single long) from an OptionTradeCandidate.
+        """Open one spread, single long, or long structure from a candidate.
 
         Returns a FILLED umbrella order (legs recorded in the order's
         error field as JSON would be hacky — legs live in self.spreads
         keyed by symbol). Single-leg longs (long-call/long-put) are
-        supported: risk = premium, no short leg."""
+        supported: risk = premium, no short leg. Long straddles/strangles
+        are two BUY legs (CE + PE) with no short leg; their debit is the
+        sum of both premiums."""
         try:
             d = candidate.to_dict() if hasattr(candidate, "to_dict") \
                 else dict(candidate)
@@ -68,12 +90,21 @@ class OptionsPaperBroker(BaseBroker):
         legs = d.get("legs", []) or []
         strat = str(d.get("strategy") or "spread")
         single = (len(legs) == 1 and strat in ("long-call", "long-put"))
+        structure = _is_long_structure(strat, legs)
+        normalized = strat.strip().lower().replace("_", "-")
+        if normalized in _STRUCTURE_STRATEGIES and not structure:
+            return self._reject(strat, 0, 0.0,
+                                "long structure needs two BUY CE/PE legs")
         if len(legs) < 2 and not single:
             return self._reject(d.get("strategy", "?"), 0, 0.0,
                                 "spread needs 2 legs")
         longs = [l for l in legs if l.get("side") == "BUY"]
         shorts = [l for l in legs if l.get("side") == "SELL"]
-        if single:
+        if structure:
+            # Both CE and PE legs are BUYs; ``longs`` already holds both,
+            # so no SELL leg is required (unlike a debit spread).
+            pass
+        elif single:
             if not longs:
                 return self._reject(d.get("strategy", "?"), 0, 0.0,
                                     "long needs a BUY leg")
@@ -83,6 +114,9 @@ class OptionsPaperBroker(BaseBroker):
         long_k = float(longs[0].get("strike") or 0)
         short_k = float(shorts[0].get("strike") or 0) if shorts else 0.0
         net = float(d.get("net_debit") or 0.0)
+        if structure and net <= 0:
+            net = round(sum(float(l.get("premium") or 0.0)
+                            for l in longs), 2)
         expiry = str(d.get("expiry") or "")
         sid = _spread_id(strat, expiry, long_k, short_k)
         if sid in self.positions:
@@ -93,9 +127,9 @@ class OptionsPaperBroker(BaseBroker):
             return self._reject(sid, lots, net, "Insufficient capital")
         # Fill realism (spec §6): when fill_model is "bidask", reprice every
         # leg to its executable side (BUY at ask + slip, SELL at bid - slip)
-        # instead of the selector's mid. Legs come from the candidate, so
-        # this works for both a single long and a debit spread. A leg with no
-        # bid/ask (sim-priced) is left untouched by fill_leg_premium.
+        # instead of the selector's mid. For a structure both BUY legs are
+        # summed; a leg with no bid/ask (sim-priced) is left untouched by
+        # fill_leg_premium.
         try:
             bidask = (str(load_config().get("options", {}).get(
                 "fill_model", "mid")).strip().lower() == "bidask")

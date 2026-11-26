@@ -238,10 +238,13 @@ def _strategy_key(value: Any) -> str:
 # always labelled the way the config spells it.
 _CANONICAL_STRATEGY_NAMES = {
     "orb": "orb",
+    "orbsmt": "orb_smt",
     "orbretest": "orb_retest",
     "meanreversion": "mean_reversion",
     "openingrangereversion": "opening_range_reversion",
     "smcliquidity": "smc_liquidity",
+    "longstraddle": "long_straddle",
+    "longstrangle": "long_strangle",
     "pullback": "pullback",
     "momentum": "momentum",
 }
@@ -284,6 +287,13 @@ def _vwap_filter_scope(mode: Mapping[str, Any]) -> Optional[set]:
 
 def _vwap_scoped_out(mode: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
     """True when this candidate's sleeve is exempt from the VWAP filter."""
+    option = candidate.get("option_legs") or {}
+    if isinstance(option, Mapping):
+        structure = str(option.get("strategy") or "").lower().replace("_", "-")
+        if structure in {"long-straddle", "long-strangle"}:
+            # A structure owns both CE and PE; the CE-only trend gate would
+            # misclassify a two-leg, direction-neutral entry.
+            return True
     scope = _vwap_filter_scope(mode)
     return scope is not None and _candidate_strategy_key(candidate) not in scope
 

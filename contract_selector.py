@@ -37,6 +37,7 @@ Never uses future contract information to make historical decisions.
 
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
+from copy import deepcopy
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +414,235 @@ def select_option_contract(
                 "moneyness_target": moneyness_target,
             }
         }
+
+
+# -----------------------------------------------------------------------
+# TWO-LEG STRUCTURE CONTRACT SELECTION (LONG STRADDLE / STRANGLE)
+# -----------------------------------------------------------------------
+
+_STRUCTURE_STRIKE_TOLERANCE = 1e-8
+
+
+def select_structure_contracts(
+    underlying_symbol: str,
+    underlying_price: float,
+    available_contracts: List[Dict[str, Any]],
+    contract_specs: Dict[str, Any],
+    structure_legs: List[Dict[str, Any]],
+    min_oi: int = 100,
+    max_spread_pct: float = 5.0,
+    expected_exchange: Optional[str] = None,
+    expected_expiry: Optional[str] = None,
+    live_quote_only: bool = True,
+) -> Dict[str, Any]:
+    """Select both legs of a two-leg long option structure.
+
+    ``structure_legs`` must describe exactly two BUY legs, one CE and one PE.
+    Each leg's ``offset`` is a number of strike steps from the ATM strike;
+    ``0/0`` is a long straddle and ``+1/-1`` is a long strangle.
+
+    The function is pure: it neither mutates its inputs nor consults any
+    provider.  It returns a single synthetic contract carrying both legs, or
+    an auditable rejection record.
+
+    Args:
+        underlying_symbol: Underlying symbol recorded on the selected contract.
+        underlying_price: Spot used to derive the ATM strike.
+        available_contracts: Candidate live contract dicts.
+        contract_specs: Contract specifications (step, lot size).
+        structure_legs: Exactly two ``{"kind", "side", "offset"}`` leg dicts.
+        min_oi: Minimum open interest passed to ``is_contract_eligible``.
+        max_spread_pct: Maximum spread passed to ``is_contract_eligible``.
+        expected_exchange: Optional required exchange (case-insensitive).
+        expected_expiry: Optional required expiry (exact string match).
+        live_quote_only: Forwarded to ``is_contract_eligible``.
+
+    Returns:
+        ``{"selected_contract": {...}}`` or
+        ``{"rejection": {"reason": ..., "rejection_reasons": [...]}}``.
+    """
+    rejection_reasons: List[str] = []
+
+    def _reject(reason: str) -> Dict[str, Any]:
+        reasons = list(rejection_reasons)
+        if reason not in reasons:
+            reasons.append(reason)
+        return {"rejection": {"reason": reason, "rejection_reasons": reasons}}
+
+    # --- Leg shape: exactly two BUY legs, one CE and one PE. -------------
+    if not isinstance(structure_legs, (list, tuple)) or len(structure_legs) != 2:
+        return _reject("structure_legs must contain exactly two BUY legs (one CE and one PE)")
+
+    normalized_legs: List[Dict[str, Any]] = []
+    for position, leg in enumerate(structure_legs):
+        if not isinstance(leg, dict):
+            return _reject(f"structure_legs[{position}] is not a mapping")
+        kind = str(leg.get("kind", "")).strip().upper()
+        side = str(leg.get("side", "")).strip().upper()
+        try:
+            offset = int(leg.get("offset", 0) or 0)
+        except (TypeError, ValueError):
+            return _reject(f"Invalid offset in structure_legs[{position}]: {leg.get('offset')}")
+        if kind not in ("CE", "PE"):
+            return _reject(f"Invalid option kind in structure_legs[{position}]: {leg.get('kind')}")
+        if side != "BUY":
+            return _reject(f"structure_legs[{position}] side must be BUY, got {leg.get('side')}")
+        item = deepcopy(leg)
+        item["kind"] = kind
+        item["side"] = side
+        item["offset"] = offset
+        normalized_legs.append(item)
+
+    if sorted(str(leg["kind"]) for leg in normalized_legs) != ["CE", "PE"]:
+        return _reject("structure_legs must contain exactly one CE and one PE leg")
+
+    specs = contract_specs if isinstance(contract_specs, dict) else {}
+    step = specs.get("strike_interval")
+    if step in (None, ""):
+        step = specs.get("strike_step")
+    try:
+        step = float(50 if step in (None, "") else step)
+    except (TypeError, ValueError):
+        step = 50.0
+    if step <= 0:
+        step = 50.0
+
+    try:
+        spot = float(underlying_price)
+    except (TypeError, ValueError):
+        return _reject(f"Invalid underlying price: {underlying_price}")
+    atm = round(spot / step) * step
+
+    contracts = [row for row in (available_contracts or []) if isinstance(row, dict)]
+
+    def _find_leg(leg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        kind = leg["kind"]
+        target = atm + int(leg["offset"]) * step
+        found: Optional[Dict[str, Any]] = None
+        for contract in contracts:
+            if str(contract.get("option_type", "")).strip().upper() != kind:
+                continue
+            errors: List[str] = []
+            raw_strike = contract.get("strike")
+            try:
+                strike = float(raw_strike)
+            except (TypeError, ValueError):
+                errors.append(f"non-numeric strike {raw_strike!r}")
+                strike = None
+            if strike is not None and abs(strike - target) > _STRUCTURE_STRIKE_TOLERANCE:
+                errors.append(f"strike {strike} does not match target {target}")
+            if expected_expiry is not None and str(contract.get("expiry", "")) != str(expected_expiry):
+                errors.append(f"expiry {contract.get('expiry')!r} does not match {expected_expiry!r}")
+            if expected_exchange is not None and (
+                str(contract.get("exchange", "")).upper() != str(expected_exchange).upper()
+            ):
+                errors.append(f"exchange {contract.get('exchange')!r} does not match {expected_exchange!r}")
+            if errors:
+                rejection_reasons.extend(f"{kind} contract: {error}" for error in errors)
+                continue
+
+            eligible, reason = is_contract_eligible(
+                contract,
+                min_oi=min_oi,
+                max_spread_pct=max_spread_pct,
+                live_quote_only=live_quote_only,
+            )
+            if not eligible:
+                rejection_reasons.append(f"{kind} strike {target}: {reason}")
+                continue
+            if found is None:
+                found = contract
+
+        if found is None:
+            rejection_reasons.append(f"No eligible {kind} contract at strike {target}")
+        return found
+
+    ce_leg = normalized_legs[0] if normalized_legs[0]["kind"] == "CE" else normalized_legs[1]
+    pe_leg = normalized_legs[0] if normalized_legs[0]["kind"] == "PE" else normalized_legs[1]
+    ce_contract = _find_leg(ce_leg)
+    pe_contract = _find_leg(pe_leg)
+    if ce_contract is None or pe_contract is None:
+        missing = "/".join(
+            kind for kind, contract in (("CE", ce_contract), ("PE", pe_contract))
+            if contract is None
+        )
+        return _reject(
+            f"No eligible two-leg structure contracts found (missing {missing} leg) "
+            "after filtering by strike, expiry, exchange, OI and spread"
+        )
+
+    # A structure must share one expiry and one exchange across both legs.
+    ce_expiry = str(ce_contract.get("expiry") or "")
+    pe_expiry = str(pe_contract.get("expiry") or "")
+    if ce_expiry and pe_expiry and ce_expiry != pe_expiry:
+        return _reject(f"CE/PE expiry mismatch: {ce_expiry!r} vs {pe_expiry!r}")
+    expiry = ce_expiry or pe_expiry
+    if not expiry:
+        return _reject("Missing common expiry for CE/PE structure")
+
+    ce_exchange = str(ce_contract.get("exchange") or "")
+    pe_exchange = str(pe_contract.get("exchange") or "")
+    if ce_exchange and pe_exchange and ce_exchange.upper() != pe_exchange.upper():
+        return _reject(f"CE/PE exchange mismatch: {ce_exchange!r} vs {pe_exchange!r}")
+    exchange = ce_exchange or pe_exchange or (
+        str(expected_exchange) if expected_exchange is not None else ""
+    )
+
+    def _number(value: Any, default: float = 0.0) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if result == result and result not in (float("inf"), float("-inf")) else default
+
+    def _spread_pct(contract: Dict[str, Any]) -> float:
+        bid = _number(contract.get("bid"))
+        ask = _number(contract.get("ask"))
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / mid * 100.0 if mid > 0 else 100.0
+
+    raw_lot = specs.get("lot_size")
+    if raw_lot in (None, ""):
+        raw_lot = ce_contract.get("lot_size")
+    if raw_lot in (None, ""):
+        raw_lot = pe_contract.get("lot_size")
+    if raw_lot in (None, "") and contracts:
+        raw_lot = contracts[0].get("lot_size")
+    try:
+        lot_size = int(float(raw_lot))
+    except (TypeError, ValueError):
+        lot_size = 0
+
+    average_spread_pct = (_spread_pct(ce_contract) + _spread_pct(pe_contract)) / 2.0
+    rank_score = 100.0 - average_spread_pct + min(_number(min_oi) / 10000.0, 10.0)
+
+    ce_ts = str(ce_contract.get("quote_timestamp") or "")
+    pe_ts = str(pe_contract.get("quote_timestamp") or "")
+
+    return {
+        "selected_contract": {
+            "__structure_legs__": True,
+            "structure_legs": normalized_legs,
+            "underlying_symbol": str(underlying_symbol).upper(),
+            "underlying_price": spot,
+            "strike": atm,
+            "option_type": "CE+PE",
+            "expiry": expiry,
+            "exchange": exchange,
+            "lot_size": lot_size,
+            "ce_contract": dict(ce_contract),
+            "pe_contract": dict(pe_contract),
+            "bid": _number(ce_contract.get("bid")) + _number(pe_contract.get("bid")),
+            "ask": _number(ce_contract.get("ask")) + _number(pe_contract.get("ask")),
+            "open_interest": min(
+                _number(ce_contract.get("open_interest")),
+                _number(pe_contract.get("open_interest")),
+            ),
+            "volume": min(_number(ce_contract.get("volume")), _number(pe_contract.get("volume"))),
+            "quote_timestamp": max(ce_ts, pe_ts),
+            "contract_rank_score": rank_score,
+        }
+    }
 
 
 # -----------------------------------------------------------------------

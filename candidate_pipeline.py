@@ -76,13 +76,18 @@ class OptionsCandidate:
     underlying_symbol: str
     strategy_name: str
     direction: str  # "bullish" or "bearish"
-    option_type: str  # "CE" or "PE"
+    option_type: str  # "CE", "PE", or "CE+PE" for two-leg structures
     entry_price: float
     stop_loss: float
     target: float
     signal_reason: str
     underlying_price_at_signal: float
-    
+
+    # Two-leg structure definition (long_straddle / long_strangle).  Each entry
+    # is {"kind": "CE"|"PE", "offset": int, "side": "BUY"}.  Empty for the
+    # single-leg sleeves, which keep their existing behaviour untouched.
+    structure_legs: Optional[List[Dict[str, Any]]] = None
+
     # Contract selection fields
     selected_contract: Optional[Dict[str, Any]] = None
     contract_eligibility: Optional[Tuple[bool, str]] = None
@@ -265,16 +270,22 @@ class CandidatePipeline:
             OpeningRangeReversionStrategy,
         )
         from strategies.smc_liquidity_strategy import SmcLiquidityStrategy
+        from strategies.orb_smt_strategy import OrbSmtStrategy
+        from strategies.long_straddle_strategy import LongStraddleStrategy
+        from strategies.long_strangle_strategy import LongStrangleStrategy
 
         key = str(strategy_name or "").strip().lower()
         strategy_types = {
             "orb": OrbStrategy,
+            "orb_smt": OrbSmtStrategy,
             "orb_retest": OrbRetestStrategy,
             "pullback": TrendPullbackStrategy,
             "momentum": MomentumContinuationStrategy,
             "mean_reversion": MeanReversionStrategy,
             "opening_range_reversion": OpeningRangeReversionStrategy,
             "smc_liquidity": SmcLiquidityStrategy,
+            "long_straddle": LongStraddleStrategy,
+            "long_strangle": LongStrangleStrategy,
         }
         strategy_type = strategy_types.get(key)
         if strategy_type is None or not candles:
@@ -284,6 +295,54 @@ class CandidatePipeline:
         index = len(candles) - 1 if index is None else int(index)
         if index < 0 or index >= len(candles):
             return []
+
+        if key in {"long_straddle", "long_strangle"}:
+            # Long-volatility structures are direction-neutral.  The strategy
+            # owns trigger timing and leg offsets; the live planner owns the
+            # executable CE/PE quote selection, so no premium is fabricated
+            # here even when the chain snapshot was not passed into specs.
+            strategy = strategy_type(lot_size=int(specs.get("lot_size") or 0))
+            signal = strategy.evaluate_signal(
+                candles,
+                index,
+                specs,
+                underlying_symbol=underlying_symbol,
+            )
+            if not bool(getattr(signal, "allowed", False)):
+                return []
+            structure_legs = [
+                {
+                    "kind": str(leg.kind).strip().upper(),
+                    "side": str(leg.side or "BUY").strip().upper(),
+                    "offset": int(leg.offset),
+                }
+                for leg in (getattr(signal, "legs", None) or [])
+            ]
+            if len(structure_legs) != 2:
+                return []
+            candle = candles[index] or {}
+            timestamp = getattr(signal, "trigger_time", "") or candle.get("timestamp", "")
+            spot = float(getattr(signal, "entry_price", 0.0) or 0.0)
+            return [OptionsCandidate(
+                candidate_id=(
+                    f"{key.upper()}_{timestamp or 'unknown'}_{index}"
+                ),
+                signal_timestamp=str(timestamp or ""),
+                underlying_symbol=underlying_symbol,
+                # Keep the canonical key here: the planner lowers this field
+                # into candidate["strategy"], which the runtime and adapter
+                # use for per-strategy gates and structure detection.
+                strategy_name=key,
+                direction="any",
+                option_type="CE+PE",
+                entry_price=spot,
+                stop_loss=0.0,
+                target=0.0,
+                signal_reason=str(getattr(signal, "reasoning", "") or f"{key} signal"),
+                underlying_price_at_signal=spot,
+                structure_legs=structure_legs,
+                exchange=str(candle.get("exchange") or "NSE").upper(),
+            )]
 
         if key == "mean_reversion":
             strategy = strategy_type()
@@ -306,7 +365,9 @@ class CandidatePipeline:
                 specs,
                 underlying_symbol=underlying_symbol,
             )
-        elif key == "orb":
+        elif key in {"orb", "orb_smt"}:
+            # ORB-SMT shares the parent ORB constructor and geometry; its
+            # evaluate_signal only rejects signals the parent already produced.
             strategy = strategy_type(
                 lot_size=int(specs.get("lot_size") or 0),
                 orb_confirm_closes=max(1, int(orb_confirm_closes or 1)),
@@ -355,6 +416,7 @@ class CandidatePipeline:
             underlying_symbol=underlying_symbol,
             strategy_name={
                 "orb": "ORB",
+                "orb_smt": "ORB-SMT",
                 "orb_retest": "ORB-Retest",
                 "pullback": "Pullback",
                 "momentum": "Momentum",
@@ -519,20 +581,26 @@ class CandidatePipeline:
         """
         records = list(available_contracts or self.available_option_records)
         for candidate in self.candidates:
-            expected_option_type = "CE" if candidate.direction.lower() == "bullish" else "PE"
-            if candidate.option_type.upper() != expected_option_type:
-                reason = (
-                    f"Option direction mismatch: {candidate.direction} requires "
-                    f"{expected_option_type}, got {candidate.option_type}"
-                )
-                candidate.contract_eligibility = (False, reason)
-                candidate.contract_rank_score = 0.0
-                self.rejected_candidates.append({
-                    "candidate": candidate,
-                    "reason": reason,
-                    "stage": "contract_selection",
-                })
-                continue
+            # Structure strategies (long_straddle/long_strangle) use "CE+PE"
+            # option_type; allow them through without matching the single-leg
+            # CE/PE expectation.  The contract selector will handle selecting
+            # both CE and PE contracts based on moneyness.
+            is_structure = candidate.option_type.upper() == "CE+PE"
+            if not is_structure:
+                expected_option_type = "CE" if candidate.direction.lower() == "bullish" else "PE"
+                if candidate.option_type.upper() != expected_option_type:
+                    reason = (
+                        f"Option direction mismatch: {candidate.direction} requires "
+                        f"{expected_option_type}, got {candidate.option_type}"
+                    )
+                    candidate.contract_eligibility = (False, reason)
+                    candidate.contract_rank_score = 0.0
+                    self.rejected_candidates.append({
+                        "candidate": candidate,
+                        "reason": reason,
+                        "stage": "contract_selection",
+                    })
+                    continue
             # An injected candidate may carry its own fixture/history window;
             # otherwise use the pipeline's supplied option records.
             candidate_records = list(candidate.option_candles or records)

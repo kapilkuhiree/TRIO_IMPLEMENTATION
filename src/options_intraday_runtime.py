@@ -72,6 +72,28 @@ _FILLED = {"FILLED", "COMPLETE", "EXECUTED"}
 _PENDING = {"PENDING", "SUBMITTED", "PLACED", "ACCEPTED", "QUEUED", "OPEN"}
 _REJECTED = {"REJECTED", "CANCELLED", "FAILED", "DECLINED"}
 _COMBINED = "combined"
+_STRUCTURE_STRATEGIES = {
+    "long-straddle", "long-strangle", "long_straddle", "long_strangle",
+}
+
+
+def _is_structure_option(option: Any) -> bool:
+    """One umbrella entry with two BUY legs (long straddle/strangle)."""
+    if not isinstance(option, dict):
+        return False
+    strategy = str(option.get("strategy") or "").strip().lower().replace("_", "-")
+    legs = option.get("legs") or []
+    return strategy in _STRUCTURE_STRATEGIES and len(legs) >= 2
+
+
+def _structure_asks(option: Dict[str, Any]) -> float:
+    """Combined ask debit for one structure lot."""
+    asks = [
+        _finite_number(leg.get("ask"), 0.0)
+        for leg in (option.get("legs") or [])
+        if isinstance(leg, dict)
+    ]
+    return float(sum(asks))
 
 
 def _finite_number(value: Any, default: float = 0.0) -> float:
@@ -1056,9 +1078,23 @@ class OptionsIntradayRuntime:
 
     def _adapter_payload(self, candidate: Dict[str, Any], option: Dict[str, Any],
                          row: Dict[str, Any], trading_symbol: str,
-                         quote_timestamp: Any) -> Dict[str, Any]:
+                         quote_timestamp: Any,
+                         leg_metadata: Optional[List[Dict[str, Any]]] = None
+                         ) -> Dict[str, Any]:
         payload = deepcopy(option)
         payload["legs"] = deepcopy(option.get("legs") or [])
+        payload["leg_metadata"] = deepcopy(leg_metadata or [])
+        if leg_metadata:
+            # Each structure leg keeps its own exact broker listing.  The
+            # top-level fields remain the CE leg for backwards compatibility
+            # with the single-leg adapter path.
+            for index, metadata in enumerate(leg_metadata):
+                if index >= len(payload["legs"]):
+                    break
+                leg = payload["legs"][index]
+                leg["trading_symbol"] = metadata.get("trading_symbol")
+                leg["validated_contract"] = deepcopy(
+                    metadata.get("validated_contract") or {})
         payload["asset"] = "options"
         payload["execution_class"] = self.execution_class
         payload["validated_contract"] = deepcopy(row)
@@ -1379,6 +1415,14 @@ class OptionsIntradayRuntime:
             str(leg.get("kind", "")).strip().upper(),
         ))
 
+    def _entry_key(self, option: Dict[str, Any], leg: Dict[str, Any]) -> str:
+        """Ledger key: one identity for a single leg or a whole CE+PE structure."""
+        if _is_structure_option(option):
+            return "STRUCT&" + "&".join(
+                self._candidate_key(option, item)
+                for item in (option.get("legs") or []) if isinstance(item, dict))
+        return self._candidate_key(option, leg)
+
     def _risk_preflight(self, candidate: Dict[str, Any], option: Dict[str, Any],
                         leg: Dict[str, Any], broker: Any,
                         now: Optional[datetime] = None) -> Tuple[int, float, str]:
@@ -1491,7 +1535,10 @@ class OptionsIntradayRuntime:
         if group and self._correlated_count(group) >= group_limit:
             return 0, 0.0, "correlated-options limit reached"
 
-        ask = _finite_number(leg.get("ask"), 0.0)
+        # A long straddle/strangle pays both leg asks in one position.  The
+        # single-leg sleeves keep their existing ask-based sizing.
+        ask = (_structure_asks(option) if _is_structure_option(option)
+               else _finite_number(leg.get("ask"), 0.0))
         lot_size = int(_finite_number(option.get("lot_size"), 0.0))
         if ask <= 0 or lot_size <= 0:
             return 0, 0.0, "complete-lot debit is unavailable"
@@ -1516,6 +1563,11 @@ class OptionsIntradayRuntime:
         # the percent-of-capital rule buy several lots.
         premium_cap = max(0.0, _finite_number(
             self.mode_cfg.get("max_premium_per_position"), 0.0))
+        if _is_structure_option(option) and premium_cap > 0:
+            # The configured ceiling is per option leg.  A straddle/strangle
+            # buys two legs in one umbrella entry, so its ceiling is one cap
+            # per leg; the paper-all table itself stays unchanged.
+            premium_cap *= len(option.get("legs") or [])
         lot_debit = max(ask * lot_size, 0.01)
         lot_bounds = [
             available / lot_debit,
@@ -1662,13 +1714,19 @@ class OptionsIntradayRuntime:
             "strategy": self._candidate_strategy(candidate),
             "expiry": option.get("expiry", ""),
             "strike": _finite_number(leg.get("strike"), 0.0),
-            "kind": str(leg.get("kind", "")).upper(),
+            "kind": ("CE+PE" if _is_structure_option(payload)
+                     else str(leg.get("kind", "")).upper()),
             "trading_symbol": payload.get("trading_symbol", ""),
-            "remote_symbols": [payload.get("trading_symbol", "")],
+            "remote_symbols": [
+                str(meta.get("trading_symbol") or "")
+                for meta in (payload.get("leg_metadata") or [])
+                if meta.get("trading_symbol")
+            ] or [payload.get("trading_symbol", "")],
             "lots": lots,
             "lot_size": int(option.get("lot_size", 0) or 0),
             "risk_amount": risk_amount,
-            "ask_premium": _finite_number(leg.get("ask"), 0.0),
+            "ask_premium": (_structure_asks(option) if _is_structure_option(option)
+                            else _finite_number(leg.get("ask"), 0.0)),
             "premium_exposure": premium_exposure,
             "signal_timestamp": candidate.get("signal_timestamp"),
             "order_id": "",
@@ -1815,7 +1873,7 @@ class OptionsIntradayRuntime:
                 continue
             option = original.get("option_legs") or {}
             leg = (option.get("legs") or [{}])[0]
-            key = self._candidate_key(option, leg)
+            key = self._entry_key(option, leg)
             intent = (self._state.get("intents") or {}).get(key)
             if intent and intent.get("status") != "rejected":
                 status = str(intent.get("status") or "")
@@ -1843,8 +1901,9 @@ class OptionsIntradayRuntime:
             fresh_candidates = [(candidate, fresh) for fresh in refreshed[symbol]["snapshots"]
                                 for candidate in fresh.get("option_candidates", [])]
             matched = next(((candidate, fresh) for candidate, fresh in fresh_candidates
-                            if self._candidate_key(candidate["option_legs"],
-                                                   candidate["option_legs"]["legs"][0]) == key
+                            if self._entry_key(
+                                candidate["option_legs"],
+                                candidate["option_legs"]["legs"][0]) == key
                             and candidate.get("strategy") == original.get("strategy")
                             and candidate.get("action") == original.get("action")), None)
             if matched is None:
@@ -1908,7 +1967,8 @@ class OptionsIntradayRuntime:
             option = deepcopy(candidate.get("option_legs") or {})
             legs = option.get("legs") or []
             leg = legs[0]
-            key = self._candidate_key(option, leg)
+            is_structure = _is_structure_option(option)
+            key = self._entry_key(option, leg)
             existing_intent = (self._state.get("intents", {}) or {}).get(key)
             if existing_intent and existing_intent.get("status") != "rejected":
                 status = str(existing_intent.get("status") or "")
@@ -1932,11 +1992,23 @@ class OptionsIntradayRuntime:
                         "execution_class": self.execution_class,
                     })
                     continue
-            trading_symbol, contract = self._validate_instrument(
-                candidate, option, leg, broker)
+            # Validate every leg against the current broker listing before any
+            # umbrella order is sent.  Single-leg sleeves still validate only
+            # their one contract, exactly as before.
+            leg_metadata = [
+                self._validate_instrument(candidate, option, item, broker)
+                for item in legs if isinstance(item, dict)
+            ] if is_structure else []
+            trading_symbol, contract = leg_metadata[0] if leg_metadata else (
+                self._validate_instrument(candidate, option, leg, broker))
             payload = self._adapter_payload(
                 candidate, option, contract, trading_symbol,
-                (plan.get("option_chain", {}) or {}).get("quote_timestamp"))
+                (plan.get("option_chain", {}) or {}).get("quote_timestamp"),
+                leg_metadata=[
+                    {"trading_symbol": symbol, "validated_contract": row}
+                    for symbol, row in leg_metadata
+                ] if is_structure else None,
+            )
             lots, risk_amount, risk_reason = self._risk_preflight(
                 candidate, option, leg, broker, now=current)
             if lots <= 0:
@@ -1965,7 +2037,8 @@ class OptionsIntradayRuntime:
                     "execution_class": self.execution_class,
                 })
                 continue
-            ask_premium = _finite_number(leg.get("ask"), 0.0)
+            ask_premium = (_structure_asks(option) if is_structure
+                           else _finite_number(leg.get("ask"), 0.0))
             premium_exposure = self._full_debit(
                 ask_premium, lots, int(option.get("lot_size", 0) or 0))
             intent = self._intent(key, candidate, payload, lots, risk_amount,
@@ -2048,16 +2121,25 @@ class OptionsIntradayRuntime:
                 "option_underlying": option.get("underlying", ""),
                 "expiry": option.get("expiry", ""),
                 "strike": _finite_number(leg.get("strike"), 0.0),
-                "kind": str(leg.get("kind", "")).upper(),
+                "kind": ("CE+PE" if is_structure
+                         else str(leg.get("kind", "")).upper()),
                 "trading_symbol": trading_symbol,
-                "remote_symbols": [trading_symbol],
+                "remote_symbols": ([symbol for symbol, _ in leg_metadata]
+                                   if leg_metadata else [trading_symbol]),
                 "validated_contract": contract,
+                "validated_contracts": (
+                    [row for _, row in leg_metadata] if leg_metadata else [contract]),
+                "legs": deepcopy(legs) if is_structure else [],
+                "structure": str(option.get("structure") or "") if is_structure else "",
                 "lots": lots,
                 "lot_size": int(option.get("lot_size", 0) or 0),
                 "entry_premium": filled_premium,
                 "ask_premium": ask_premium,
                 "premium_exposure": premium_exposure,
-                "last_bid": _finite_number(leg.get("bid"), 0.0),
+                "last_bid": (
+                    sum(_finite_number(item.get("bid"), 0.0)
+                        for item in legs if isinstance(item, dict))
+                    if is_structure else _finite_number(leg.get("bid"), 0.0)),
                 "stop_premium": round(filled_premium * (1.0 - stop_fraction), 2),
                 "target_premium": round(filled_premium * (1.0 + target_fraction), 2),
                 "initial_stop_premium": round(filled_premium * (1.0 - stop_fraction), 2),
@@ -2295,6 +2377,66 @@ class OptionsIntradayRuntime:
         if age > timedelta(minutes=ttl) or age < -timedelta(seconds=15):
             return None
         return bid
+
+    def _zerodha_structure_mark(self, position: Dict[str, Any],
+                                now: datetime) -> Optional[float]:
+        """Combined executable bid for a two-leg structure, or None."""
+        if os.environ.get("TRIO_MARKET_DATA_PROVIDER") != "zerodha":
+            return None
+        legs = [leg for leg in (position.get("legs") or [])
+                if isinstance(leg, dict)]
+        if len(legs) < 2:
+            return None
+        try:
+            adapter = getattr(self, "_zerodha_adapter", None)
+            if adapter is None:
+                from src.zerodha_market_data import get_shared_adapter
+                adapter = get_shared_adapter()
+                self._zerodha_adapter = adapter
+            ttl = _finite_number(self.mode_cfg.get("chain_max_age_minutes"), 15.0)
+            validated = position.get("validated_contracts") or []
+            total = 0.0
+            for index, leg in enumerate(legs):
+                symbol = str(leg.get("trading_symbol") or "").strip()
+                if not symbol:
+                    return None
+                row = (leg.get("validated_contract") or
+                       (validated[index] if index < len(validated) else None) or {})
+                token = row.get("instrumentToken") or row.get("instrument_token")
+                instrument: Dict[str, Any] = {"tradingsymbol": symbol}
+                if token:
+                    instrument["instrument_token"] = token
+                quote = adapter.option_quote(instrument)
+                bid = _finite(quote.get("bid"))
+                stamp = parse_exchange_timestamp(quote.get("timestamp"))
+                if bid is None or bid <= 0 or stamp is None:
+                    return None
+                age = now.astimezone(timezone.utc) - stamp
+                if age > timedelta(minutes=ttl) or age < -timedelta(seconds=15):
+                    return None
+                total += bid
+            return total
+        except Exception:
+            return None
+
+    def _chain_structure_quote(self, chain: Dict[str, Any],
+                               position: Dict[str, Any],
+                               now: datetime) -> Optional[float]:
+        """Combined chain bid for a two-leg structure, or None."""
+        legs = [leg for leg in (position.get("legs") or [])
+                if isinstance(leg, dict)]
+        if len(legs) < 2:
+            return None
+        total = 0.0
+        for leg in legs:
+            proxy = dict(position)
+            proxy["strike"] = _finite_number(leg.get("strike"), -1.0)
+            proxy["kind"] = str(leg.get("kind") or "").upper()
+            bid = self._chain_quote(chain, proxy, now)
+            if bid is None:
+                return None
+            total += bid
+        return total
 
     def _completed_bar_trigger(self, position: Dict[str, Any], now: datetime,
                                chain: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2743,16 +2885,20 @@ class OptionsIntradayRuntime:
                 unresolved.append(str(position_id))
                 continue
             underlying = str(position.get("option_underlying", "")).upper()
-            # One contract quote is enough to manage an open leg.  Only fall
-            # back to the full chain when the direct mark is unavailable.
-            bid = self._zerodha_mark(position, current)
+            # One contract quote is enough to manage a single open leg.  A
+            # structure needs both leg bids; the umbrella premium is their sum.
+            is_structure = bool(position.get("legs") or position.get("structure"))
+            bid = (self._zerodha_structure_mark(position, current) if is_structure
+                   else self._zerodha_mark(position, current))
             chain = None
             if bid is None:
                 if underlying not in chains:
                     chains[underlying] = self._fresh_chain(
                         broker, current, underlying)
                 chain = chains[underlying]
-                bid = self._chain_quote(chain, position, current) if chain else None
+                bid = (self._chain_structure_quote(chain, position, current)
+                       if is_structure else self._chain_quote(chain, position, current)
+                       ) if chain else None
             reason = ""
             if hard_flat:
                 reason = "eod-squareoff"

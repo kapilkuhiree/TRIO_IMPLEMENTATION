@@ -48,6 +48,25 @@ _MONTH_CODES = {
 _KIND_ALIASES = {"CE": "CE", "CALL": "CE", "C": "CE",
                  "PE": "PE", "PUT": "PE", "P": "PE"}
 
+# Long-only two-leg structures (long straddle / long strangle).
+_STRUCTURE_STRATEGIES = frozenset({"long-straddle", "long-strangle"})
+
+
+def _is_long_structure(strategy: str, legs: List[Dict[str, Any]]) -> bool:
+    """True for a long straddle/strangle: two BUY legs, one CE and one PE.
+
+    Both spellings (``long_straddle`` and ``long-straddle``) are recognized.
+    There is deliberately no SELL leg requirement here.
+    """
+    normalized = str(strategy or "").strip().lower().replace("_", "-")
+    if normalized not in _STRUCTURE_STRATEGIES or len(legs) != 2:
+        return False
+    if any(str(leg.get("side") or "").strip().upper() != "BUY"
+           for leg in legs):
+        return False
+    kinds = {str(leg.get("kind") or "").strip().upper() for leg in legs}
+    return kinds == {"CE", "PE"}
+
 
 def option_symbol(underlying: str, expiry: str, strike: float,
                   kind: str) -> str:
@@ -117,6 +136,43 @@ class MegaBullOptionsBroker(BaseBroker):
         return (f"OPT_{strategy}_{expiry}_{int(long_k)}x{int(short_k)}"
                 .replace(" ", ""))
 
+    @staticmethod
+    def _structure_leg_identity(leg: Dict[str, Any],
+                                d: Dict[str, Any]):
+        """Per-leg symbol/contract for a structure.
+
+        The CE leg may inherit the candidate's top-level symbol/contract;
+        the PE leg must carry its own validated metadata.
+        """
+        kind = str(leg.get("kind") or "").strip().upper()
+        symbol = str(leg.get("trading_symbol") or "").strip()
+        contract = leg.get("validated_contract")
+        if kind == "CE":
+            symbol = symbol or str(d.get("trading_symbol") or "").strip()
+            contract = contract or d.get("validated_contract")
+        return symbol, (contract or {})
+
+    @staticmethod
+    def _leg_contract_ok(symbol: str, contract: Any, current: Any) -> bool:
+        """Both the leg's own metadata and the remote listing must agree."""
+        if not symbol or not isinstance(contract, dict) or not contract:
+            return False
+        token = (contract.get("instrumentToken") or
+                 contract.get("instrument_token") or contract.get("token"))
+        current_token = None
+        if isinstance(current, dict):
+            current_token = (current.get("instrumentToken") or
+                             current.get("instrument_token"))
+        if not token or not current_token:
+            return False
+        contract_symbol = (contract.get("tradingSymbol") or
+                           contract.get("trading_symbol") or
+                           contract.get("symbol"))
+        if contract_symbol and (
+                str(contract_symbol).strip().upper() != symbol.upper()):
+            return False
+        return str(token) == str(current_token)
+
     def _leg_price(self, mega_symbol: str, ref: float) -> float:
         """Remote fill print for a leg: mirror first, ref premium next."""
         pos = self.mega.positions.get(mega_symbol)
@@ -125,14 +181,30 @@ class MegaBullOptionsBroker(BaseBroker):
         return float(ref or 0.0)
 
     def _close_remote(self, mega_symbol: str, side: str, lots: int,
-                      ref_price: float, reason: str) -> bool:
-        """Fire one leg's exit; True only when the remote book flattened."""
+                      ref_price: float, reason: str,
+                      units: Optional[int] = None) -> bool:
+        """Fire one leg's exit; True only when that own quantity is closed.
+
+        MegaBull's remote book is keyed by symbol, not by umbrella spread. Two
+        paper trades may legitimately hold the same symbol (e.g. a 25900 CE
+        straddle leg and a separate 25900 CE ORB trade), so ``fraction=1.0``
+        would sell the other trade's units too. Close only this trade's own
+        units and leave any sister units for their own close path.
+        """
         try:
             price = (float(ref_price) if getattr(self, "strict_options_only", False)
                      else self._leg_price(mega_symbol, ref_price))
+            own_units = int(units or 0)
+            if own_units <= 0:
+                own_units = int(lots or 0) * int(self.lot_size or 0)
+            remote = self.mega.positions.get(mega_symbol)
+            remote_qty = int(getattr(remote, "quantity", 0) or 0)
+            fraction = 1.0
+            if remote_qty > own_units > 0:
+                fraction = own_units / remote_qty
             rec = self.mega.close_position(
                 mega_symbol, price,
-                reason, fraction=1.0)
+                reason, fraction=fraction)
             return bool(rec)
         except Exception as exc:
             logger.warning("Remote leg close failed %s: %s",
@@ -146,7 +218,7 @@ class MegaBullOptionsBroker(BaseBroker):
             if leg.get("confirmed"):
                 ok = self._close_remote(
                     leg["mega_symbol"], leg["side"], leg["lots"],
-                    leg.get("price", 0.0), reason)
+                    leg.get("price", 0.0), reason, leg.get("units"))
                 leg["confirmed"] = ok
                 all_closed = all_closed and ok
         return all_closed
@@ -174,16 +246,27 @@ class MegaBullOptionsBroker(BaseBroker):
         expiry = str(d.get("expiry") or "")
         strat = str(d.get("strategy") or "spread")
         single = (len(legs) == 1 and strat in ("long-call", "long-put"))
+        structure = _is_long_structure(strat, legs)
         strict = bool(getattr(self, "strict_options_only", False) or d.get("strict_options_only"))
-        if strict and (not single or legs[0].get("side") != "BUY" or
-                       legs[0].get("kind") != ("CE" if strat == "long-call" else "PE")):
+        if strict and (
+                (not single and not structure) or
+                (single and (legs[0].get("side") != "BUY" or
+                             legs[0].get("kind") !=
+                             ("CE" if strat == "long-call" else "PE")))):
             return self._reject(strat, lots, 0.0, "strict mode requires one BUY CE/PE leg")
+        if (str(strat or "").strip().lower().replace("_", "-")
+                in _STRUCTURE_STRATEGIES and not structure):
+            return self._reject(strat, lots, 0.0,
+                                "long structure needs two BUY CE/PE legs")
         if len(legs) < 2 and not single:
             return self._reject(d.get("strategy", "?"), lots, 0.0,
                                 "spread needs 2 legs")
         longs = [l for l in legs if l.get("side") == "BUY"]
         shorts = [l for l in legs if l.get("side") == "SELL"]
-        if single:
+        if structure:
+            # Both CE and PE legs are BUYs; no SELL leg is needed here.
+            pass
+        elif single:
             if not longs:
                 return self._reject(d.get("strategy", "?"), lots, 0.0,
                                     "long needs a BUY leg")
@@ -205,21 +288,42 @@ class MegaBullOptionsBroker(BaseBroker):
                                      "contract lot size does not match broker")
             effective_lot = contract_lot_size
         if strict:
-            from src.options_intraday import _same_expiry
-            contract = d.get("validated_contract") or {}
-            symbol = str(d.get("trading_symbol") or "")
+            valid = (contract_lot_size is not None and
+                     not isinstance(lots, bool) and float(lots) > 0)
             try:
-                current = self.mega.instrument_for(symbol)
-                valid = (contract_lot_size is not None and isinstance(current, dict) and
-                         bool(current.get("instrumentToken") or current.get("instrument_token")) and
-                         bool(symbol) and not isinstance(lots, bool) and float(lots) > 0)
+                if structure:
+                    # Each structure leg carries its own validated contract;
+                    # the top-level symbol/metadata is only the CE fallback.
+                    for leg in legs:
+                        leg_symbol, contract = self._structure_leg_identity(
+                            leg, d)
+                        current = self.mega.instrument_for(leg_symbol)
+                        valid = valid and self._leg_contract_ok(
+                            leg_symbol, contract, current)
+                else:
+                    # Single-leg strict path is intentionally unchanged.
+                    symbol = str(d.get("trading_symbol") or "")
+                    current = self.mega.instrument_for(symbol)
+                    valid = valid and isinstance(current, dict) and bool(
+                        current.get("instrumentToken") or
+                        current.get("instrument_token")) and bool(symbol)
             except (AttributeError, TypeError, ValueError, KeyError):
                 valid = False
             if not valid:
                 return self._reject(strat, lots, net, "exact strict contract metadata is required")
         lots = max(1, int(lots or 1))
-        sid = (f"OPT_{d['trading_symbol']}" if strict else
-               self._spread_id(strat, expiry, long_k, short_k))
+        if strict and structure:
+            ce_leg = next(leg for leg in legs
+                          if str(leg.get("kind") or "").strip().upper() == "CE")
+            pe_leg = next(leg for leg in legs
+                          if str(leg.get("kind") or "").strip().upper() == "PE")
+            ce_symbol = self._structure_leg_identity(ce_leg, d)[0]
+            pe_symbol = self._structure_leg_identity(pe_leg, d)[0]
+            sid = f"OPT_{ce_symbol}_{pe_symbol}"
+        elif strict:
+            sid = f"OPT_{d['trading_symbol']}"
+        else:
+            sid = self._spread_id(strat, expiry, long_k, short_k)
         if sid in self.positions:
             return self._reject(sid, lots, net,
                                 "already holding this spread")
@@ -228,9 +332,16 @@ class MegaBullOptionsBroker(BaseBroker):
         opened: List[Dict[str, Any]] = []
         pending_statuses = {"PENDING", "SUBMITTED", "ACCEPTED", "OPEN", "UNKNOWN"}
         for leg in legs:
-            mega_symbol = d["trading_symbol"] if strict else option_symbol(underlying, expiry,
-                                        float(leg.get("strike") or 0),
-                                        str(leg.get("kind") or ""))
+            if strict and structure:
+                # Per-leg contract identity; strict single-legs keep the
+                # candidate's top-level trading symbol.
+                mega_symbol = self._structure_leg_identity(leg, d)[0]
+            elif strict:
+                mega_symbol = d["trading_symbol"]
+            else:
+                mega_symbol = option_symbol(underlying, expiry,
+                                            float(leg.get("strike") or 0),
+                                            str(leg.get("kind") or ""))
             try:
                 self.mega.token_for(mega_symbol)
             except Exception as exc:
@@ -291,6 +402,7 @@ class MegaBullOptionsBroker(BaseBroker):
             "strategy": strat, "expiry": expiry, "legs": legs,
             "remote_legs": [{"mega_symbol": l["mega_symbol"],
                              "side": l["side"], "lots": l["lots"],
+                             "units": l.get("units"),
                              "price": l["price"], "closed": False}
                             for l in opened],
             "underlying": underlying,
@@ -352,7 +464,7 @@ class MegaBullOptionsBroker(BaseBroker):
                         leg.get("mega_symbol", ""), exit_side,
                         int(leg.get("lots") or lots),
                         float(mid) or float(leg.get("price") or 0.0),
-                        reason):
+                        reason, leg.get("units")):
                     leg["closed"] = True
                 else:
                     remote_ok = False

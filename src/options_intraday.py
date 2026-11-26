@@ -29,6 +29,20 @@ COMBINED = "combined"
 DEFAULT_TRADING_MODE = "production"
 NOT_READY_FOR_OPTIONS_PNL = "NOT_READY_FOR_OPTIONS_PNL"
 
+# Two-leg, buy-only long-volatility payoffs.  Both spellings are accepted
+# because plan generators have emitted both the hyphenated and underscored
+# form; the validator does not distinguish straddle from strangle beyond the
+# CE/PE leg shape.
+_STRUCTURE_STRATEGIES = {
+    "long-straddle", "long-strangle", "long_straddle", "long_strangle",
+}
+# A long straddle/strangle is direction-neutral by construction.  A directional
+# signal may still precede it, so bullish/bearish are accepted too; only the
+# concrete order action is pinned to BUY.
+_STRUCTURE_DIRECTIONS = {
+    "any", "direction_neutral", "neutral", "bullish", "bearish",
+}
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _DEFAULTS: Dict[str, Any] = {
@@ -409,82 +423,23 @@ def _configured_lot_size(cfg: Dict[str, Any], settings: Dict[str, Any],
     return int(value)
 
 
-def validate_option_candidate(
-    candidate: Dict[str, Any],
-    plan: Optional[Dict[str, Any]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-    now: Optional[datetime] = None,
+def _validate_chain_leg(
+    leg: Dict[str, Any],
+    kind: str,
+    settings: Dict[str, Any],
+    chain: Any,
+    underlying: str,
+    expiry: str,
+    strike: Optional[float],
+    now: Optional[datetime],
 ) -> Tuple[bool, str]:
-    """Revalidate one concrete, long, single-leg candidate.
+    """Revalidate one BUY leg against the private exchange chain snapshot.
 
-    Validation intentionally requires ``plan['option_chain']``.  Archived
-    expiry diagnostics or a selector's ``premium`` are not enough to route a
-    remote order: the selected strike must still be listed and its bid/ask
-    must match the exchange quote in the in-memory chain snapshot.
+    This holds the listing/quote/spread/OI/volume/timestamp gate shared by the
+    legacy single-leg path and by each leg of a two-leg structure.  The checks
+    and rejection strings are copied verbatim so single-leg behaviour cannot
+    drift when a structure is validated.
     """
-    cfg = load_options_intraday_config(cfg) if cfg is not None else load_options_intraday_config()
-    settings = _option_settings(cfg)
-    candidate = candidate or {}
-    option = candidate.get("option_legs") or candidate
-    if not isinstance(option, dict):
-        return False, "missing option contract"
-    asset = str(candidate.get("asset", "")).strip().lower()
-    if asset != "options":
-        return False, "options_intraday accepts options candidates only"
-    strategy = str(option.get("strategy") or "").strip().lower()
-    if strategy not in {"long-call", "long-put"}:
-        return False, f"unsupported options strategy: {strategy or 'missing'}"
-    legs = option.get("legs") or []
-    if len(legs) != 1 or not isinstance(legs[0], dict):
-        return False, "options_intraday requires exactly one option leg"
-    leg = legs[0]
-    if str(leg.get("side", "")).strip().upper() != "BUY":
-        return False, "options_intraday permits one BUY leg only"
-    kind = str(leg.get("kind", "")).strip().upper()
-    wanted_kind = "CE" if strategy == "long-call" else "PE"
-    if kind != wanted_kind:
-        return False, f"strategy/type mismatch: {strategy} requires {wanted_kind}"
-
-    underlying = str(option.get("underlying") or
-                      candidate.get("option_underlying") or "").strip().upper()
-    if not underlying or underlying not in set(_configured_underlyings(settings)):
-        return False, f"unapproved option underlying: {underlying or '?'}"
-    for field in ("signal_underlying", "option_underlying", "symbol", "underlying"):
-        identity = candidate.get(field)
-        if identity and str(identity).strip().upper().removesuffix(".NS") != underlying:
-            return False, "signal/option underlying mismatch"
-    expected_exchange = str(settings.get("exchange", "NSE") or "NSE").upper()
-    exchange = str(option.get("exchange") or leg.get("exchange") or "").upper()
-    if exchange != expected_exchange:
-        return False, f"exchange mismatch: {exchange or '?'} != {expected_exchange}"
-
-    expiry = str(option.get("expiry") or leg.get("expiry") or "").strip()
-    if not expiry or str(leg.get("expiry") or expiry).strip() != expiry:
-        return False, "missing or inconsistent expiry"
-    strike = _finite(leg.get("strike"))
-    if strike is None or strike <= 0:
-        return False, "invalid strike"
-    exact = settings.get("exact_contract")
-    if exact is not None:
-        if (not isinstance(exact, dict) or exact.get("underlying_symbol") != underlying or
-                not _same_expiry(exact.get("expiry"), expiry) or
-                _finite(exact.get("strike")) != strike or exact.get("option_type") != kind or
-                not exact.get("instrument_token") or
-                exact.get("trading_symbol") != leg.get("trading_symbol")):
-            return False, "selected contract differs from current broker listing"
-    else:
-        step = _finite(settings.get("strike_step", 50))
-        if step is None or step <= 0 or abs(strike / step - round(strike / step)) > 1e-8:
-            return False, "strike does not match configured interval"
-
-    lot_size = option.get("lot_size", candidate.get("lot_size"))
-    if isinstance(lot_size, bool) or not isinstance(lot_size, int) or lot_size <= 0:
-        return False, "missing or invalid contract lot size"
-    configured_lot = _configured_lot_size(dict(cfg), settings, underlying)
-    if configured_lot is None or lot_size != configured_lot:
-        return False, "contract lot size mismatch"
-
-    chain = (plan or {}).get("option_chain")
     if not isinstance(chain, dict):
         return False, "missing private option chain snapshot"
     chain_symbol = str(chain.get("symbol") or chain.get("underlying_symbol") or
@@ -544,21 +499,170 @@ def validate_option_candidate(
     selected_at = parse_exchange_timestamp(selected_time)
     if selected_at is None or not 0 <= (current - selected_at).total_seconds() <= ttl * 60:
         return False, "stale selected option quote"
+    return True, ""
+
+
+def validate_option_candidate(
+    candidate: Dict[str, Any],
+    plan: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    """Revalidate one concrete, long option candidate.
+
+    Single-leg ``long-call`` / ``long-put`` candidates retain their historical
+    checks verbatim.  Two-leg long-volatility structures (long straddle and
+    long strangle) run every leg through the same chain quote gate and add
+    structure-only action/direction and net-debit checks.
+
+    Validation intentionally requires ``plan['option_chain']``.  Archived
+    expiry diagnostics or a selector's ``premium`` are not enough to route a
+    remote order: the selected strike must still be listed and its bid/ask
+    must match the exchange quote in the in-memory chain snapshot.
+    """
+    cfg = load_options_intraday_config(cfg) if cfg is not None else load_options_intraday_config()
+    settings = _option_settings(cfg)
+    candidate = candidate or {}
+    option = candidate.get("option_legs") or candidate
+    if not isinstance(option, dict):
+        return False, "missing option contract"
+    asset = str(candidate.get("asset", "")).strip().lower()
+    if asset != "options":
+        return False, "options_intraday accepts options candidates only"
+    strategy = str(option.get("strategy") or "").strip().lower()
+    is_structure = strategy in _STRUCTURE_STRATEGIES
+    if not is_structure and strategy not in {"long-call", "long-put"}:
+        return False, f"unsupported options strategy: {strategy or 'missing'}"
+    legs = option.get("legs") or []
+    if is_structure:
+        if (not isinstance(legs, (list, tuple)) or len(legs) != 2 or
+                not all(isinstance(item, dict) for item in legs)):
+            return False, "long-volatility structure requires exactly two option legs"
+        for item in legs:
+            if str(item.get("side", "")).strip().upper() != "BUY":
+                return False, "long-volatility structure requires two BUY legs"
+        kinds = {str(item.get("kind", "")).strip().upper() for item in legs}
+        if kinds != {"CE", "PE"}:
+            return False, "long-volatility structure requires one CE and one PE leg"
+    else:
+        if len(legs) != 1 or not isinstance(legs[0], dict):
+            return False, "options_intraday requires exactly one option leg"
+        leg = legs[0]
+        if str(leg.get("side", "")).strip().upper() != "BUY":
+            return False, "options_intraday permits one BUY leg only"
+        kind = str(leg.get("kind", "")).strip().upper()
+        wanted_kind = "CE" if strategy == "long-call" else "PE"
+        if kind != wanted_kind:
+            return False, f"strategy/type mismatch: {strategy} requires {wanted_kind}"
+
+    underlying = str(option.get("underlying") or
+                      candidate.get("option_underlying") or "").strip().upper()
+    if not underlying or underlying not in set(_configured_underlyings(settings)):
+        return False, f"unapproved option underlying: {underlying or '?'}"
+    for field in ("signal_underlying", "option_underlying", "symbol", "underlying"):
+        identity = candidate.get(field)
+        if identity and str(identity).strip().upper().removesuffix(".NS") != underlying:
+            return False, "signal/option underlying mismatch"
+    expected_exchange = str(settings.get("exchange", "NSE") or "NSE").upper()
+    exchange_value = option.get("exchange")
+    if not exchange_value and legs and isinstance(legs[0], dict):
+        exchange_value = legs[0].get("exchange")
+    exchange = str(exchange_value or "").upper()
+    if exchange != expected_exchange:
+        return False, f"exchange mismatch: {exchange or '?'} != {expected_exchange}"
+
+    expiry = str(option.get("expiry") or "").strip()
+    if not expiry and legs and isinstance(legs[0], dict):
+        expiry = str(legs[0].get("expiry") or "").strip()
+    if is_structure:
+        if not expiry or any(str(item.get("expiry") or "").strip() != expiry
+                             for item in legs):
+            return False, "missing or inconsistent expiry"
+    else:
+        if not expiry or str(leg.get("expiry") or expiry).strip() != expiry:
+            return False, "missing or inconsistent expiry"
+
+    if is_structure:
+        # ``exact_contract`` is a single-contract pin emitted by the live
+        # instrument-capture path; a two-leg payload has no matching per-leg
+        # identity (and a legacy dict pin could only describe one side).  Do
+        # not apply it here.  Both strikes still have to respect the configured
+        # interval and match a fresh exchange chain quote below, which keeps
+        # the entry boundary equally strict for structures.
+        for item in legs:
+            strike = _finite(item.get("strike"))
+            if strike is None or strike <= 0:
+                return False, "invalid strike"
+            step = _finite(settings.get("strike_step", 50))
+            if step is None or step <= 0 or abs(strike / step - round(strike / step)) > 1e-8:
+                return False, "strike does not match configured interval"
+    else:
+        strike = _finite(leg.get("strike"))
+        if strike is None or strike <= 0:
+            return False, "invalid strike"
+        exact = settings.get("exact_contract")
+        if exact is not None:
+            if (not isinstance(exact, dict) or exact.get("underlying_symbol") != underlying or
+                    not _same_expiry(exact.get("expiry"), expiry) or
+                    _finite(exact.get("strike")) != strike or exact.get("option_type") != kind or
+                    not exact.get("instrument_token") or
+                    exact.get("trading_symbol") != leg.get("trading_symbol")):
+                return False, "selected contract differs from current broker listing"
+        else:
+            step = _finite(settings.get("strike_step", 50))
+            if step is None or step <= 0 or abs(strike / step - round(strike / step)) > 1e-8:
+                return False, "strike does not match configured interval"
+
+    lot_size = option.get("lot_size", candidate.get("lot_size"))
+    if isinstance(lot_size, bool) or not isinstance(lot_size, int) or lot_size <= 0:
+        return False, "missing or invalid contract lot size"
+    configured_lot = _configured_lot_size(dict(cfg), settings, underlying)
+    if configured_lot is None or lot_size != configured_lot:
+        return False, "contract lot size mismatch"
+
+    chain = (plan or {}).get("option_chain")
+    if is_structure:
+        for item in legs:
+            item_kind = str(item.get("kind", "")).strip().upper()
+            item_strike = _finite(item.get("strike"))
+            valid, reason = _validate_chain_leg(
+                item, item_kind, settings, chain, underlying, expiry,
+                item_strike, now)
+            if not valid:
+                return False, reason
+        net_debit = _finite(option.get("net_debit"))
+        if net_debit is None or net_debit <= 0:
+            return False, "missing or invalid net debit"
+        if abs(net_debit - sum(_finite(item.get("premium")) or 0.0
+                               for item in legs)) > 0.01:
+            return False, "net debit does not match leg premiums"
+    else:
+        valid, reason = _validate_chain_leg(
+            leg, kind, settings, chain, underlying, expiry, strike, now)
+        if not valid:
+            return False, reason
 
     action = str(candidate.get("action", "")).strip().upper()
     direction = str(candidate.get("direction", "")).strip().lower()
-    if action not in {"BUY", "SELL"}:
-        return False, "missing signal action"
-    wanted_direction = "bullish" if action == "BUY" else "bearish"
-    if direction != wanted_direction:
-        return False, "signal direction/action mismatch"
-    if kind != ("CE" if action == "BUY" else "PE"):
-        return False, "signal action/option type mismatch"
+    if is_structure:
+        if action != "BUY":
+            return False, "long-volatility structure requires BUY action"
+        if direction not in _STRUCTURE_DIRECTIONS:
+            return False, "structure signal direction/action mismatch"
+    else:
+        if action not in {"BUY", "SELL"}:
+            return False, "missing signal action"
+        wanted_direction = "bullish" if action == "BUY" else "bearish"
+        if direction != wanted_direction:
+            return False, "signal direction/action mismatch"
+        if kind != ("CE" if action == "BUY" else "PE"):
+            return False, "signal action/option type mismatch"
     if demand_supply_enabled(cfg, context="options", timeframe="5m"):
         confirmation = (candidate.get("option_diagnostic", {}) or {}).get(
             "demand_supply")
         if not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True:
             return False, "missing demand/supply confirmation"
+    current = _now_utc(now)
     expiry_date = None
     for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
         try:

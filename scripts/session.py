@@ -46,12 +46,20 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # keeps its conservative two-slot policy.  Live can never inherit the values
 # below because the switch refuses to run outside remote paper.
 PAPER_ALL_STRATEGIES_ENV = "TRIO_PAPER_ALL_STRATEGIES"
+# Narrower paper-only switch: trade ONLY the two direction-neutral long-vol
+# structures.  It takes precedence over the broad paper-all switch so an old
+# launcher command cannot silently re-enable the single-leg sleeves.
+PAPER_LONG_STRUCTURES_ENV = "TRIO_PAPER_LONG_STRUCTURES_ONLY"
 
 _TRUTHY = {"1", "true", "yes", "on", "y"}
 
 
 def _paper_all_requested() -> bool:
     return str(os.environ.get(PAPER_ALL_STRATEGIES_ENV, "")).strip().lower() in _TRUTHY
+
+
+def _paper_long_structures_requested() -> bool:
+    return str(os.environ.get(PAPER_LONG_STRUCTURES_ENV, "")).strip().lower() in _TRUTHY
 
 
 def _paper_all_overrides() -> Dict[str, Any]:
@@ -63,7 +71,19 @@ def _paper_all_overrides() -> Dict[str, Any]:
     one lot and the daily budget is unchanged.
     """
     return {
-        # Promote mean_reversion / ORRS / SMC out of log-only mode.
+        # Promote mean_reversion / ORRS / SMC out of log-only mode and add the
+        # two direction-neutral long-volatility structures as tradable sleeves.
+        # Without this paper-only switch the YAML keeps its conservative
+        # single-leg default; live can never inherit these values.
+        "strategies": [
+            "orb",
+            "orb_retest",
+            "mean_reversion",
+            "opening_range_reversion",
+            "smc_liquidity",
+            "long_straddle",
+            "long_strangle",
+        ],
         "shadow_strategies": [],
         "max_open_positions": 5,
         "max_correlated_positions": 5,
@@ -79,10 +99,33 @@ def _paper_all_overrides() -> Dict[str, Any]:
     }
 
 
-def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
-    """Apply the paper-only five-sleeve policy to ``cfg`` in place.
+def _paper_long_structures_overrides() -> Dict[str, Any]:
+    """Effective remote-paper policy when only long structures are tradable.
 
-    Returns True when the overrides were applied.  Raises
+    Two umbrella positions (one straddle, one strangle) fit the existing
+    NIFTY correlation group, so the slot and exposure caps stay small.  All
+    single-leg sleeves are removed from both the tradable and shadow lists.
+    """
+    return {
+        "strategies": ["long_straddle", "long_strangle"],
+        "shadow_strategies": [],
+        "max_open_positions": 2,
+        "max_correlated_positions": 2,
+        # Two structures cost roughly Rs57,000 of premium on a Rs10,00,000
+        # base, so 9% still leaves headroom without loosening the daily cap.
+        "max_premium_exposure_pct": 9.00,
+        "max_consecutive_losses": 2,
+        # Long-volatility structures are CE+PE and are not VWAP-filtered.
+        "vwap_filter_strategies": [],
+    }
+
+
+def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
+    """Apply the active paper-only promotion policy to ``cfg`` in place.
+
+    ``TRIO_PAPER_LONG_STRUCTURES_ONLY`` wins over
+    ``TRIO_PAPER_ALL_STRATEGIES`` so an old launcher command cannot bring back
+    the single-leg sleeves.  Returns True when overrides were applied.  Raises
     ``OptionsIntradayPolicyError`` when the switch is set outside remote
     paper, which is a fail-closed refusal rather than a silent downgrade.
 
@@ -92,22 +135,25 @@ def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
     written into ``cfg["options_intraday"]``, which is merged last by
     :func:`load_options_intraday_config` and therefore wins over the file.
     """
-    if not _paper_all_requested():
+    long_only = _paper_long_structures_requested()
+    paper_all = _paper_all_requested()
+    if not (long_only or paper_all):
         return False
+    switch = PAPER_LONG_STRUCTURES_ENV if long_only else PAPER_ALL_STRATEGIES_ENV
     from src.options_intraday import options_intraday_config
     from src.options_intraday_runtime import OptionsIntradayPolicyError
 
     if not isinstance(cfg, dict):
         raise OptionsIntradayPolicyError(
-            f"{PAPER_ALL_STRATEGIES_ENV} requires a complete options config")
+            f"{switch} requires a complete options config")
     if str(os.environ.get("TRIO_OPTIONS_LIVE", "")).strip().lower() in _TRUTHY:
         raise OptionsIntradayPolicyError(
-            f"{PAPER_ALL_STRATEGIES_ENV} refuses to start with TRIO_OPTIONS_LIVE set")
+            f"{switch} refuses to start with TRIO_OPTIONS_LIVE set")
     try:
         effective = options_intraday_config(cfg)
     except ValueError as exc:
         raise OptionsIntradayPolicyError(
-            f"{PAPER_ALL_STRATEGIES_ENV} requires remote_paper mode with a "
+            f"{switch} requires remote_paper mode with a "
             f"valid options policy: {exc}") from exc
     paper_flag = effective.get("PAPER_TRADING")
     paper = (paper_flag is True or
@@ -115,7 +161,7 @@ def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
     execution_class = str(effective.get("execution_class") or "").strip().lower()
     if execution_class != "remote_paper" or not paper:
         raise OptionsIntradayPolicyError(
-            f"{PAPER_ALL_STRATEGIES_ENV} requires execution_class=remote_paper "
+            f"{switch} requires execution_class=remote_paper "
             f"and PAPER_TRADING=true (got execution_class={execution_class or '?'}, "
             f"PAPER_TRADING={paper_flag!r})")
 
@@ -123,11 +169,22 @@ def _apply_paper_all_strategies(cfg: Dict[str, Any]) -> bool:
     if not isinstance(section, dict):
         section = {}
         cfg["options_intraday"] = section
-    overrides = _paper_all_overrides()
+    overrides = (_paper_long_structures_overrides() if long_only
+                 else _paper_all_overrides())
     section.update(overrides)
-    logger.warning(
-        "Paper-all sleeves enabled (%s=1): %s", PAPER_ALL_STRATEGIES_ENV,
-        {key: section.get(key) for key in overrides})
+    if long_only:
+        logger.warning(
+            "Paper long-structures-only enabled (%s=1): %s",
+            PAPER_LONG_STRUCTURES_ENV,
+            {key: section.get(key) for key in overrides})
+        if paper_all:
+            logger.warning(
+                "Ignoring %s=1: %s takes precedence",
+                PAPER_ALL_STRATEGIES_ENV, PAPER_LONG_STRUCTURES_ENV)
+    else:
+        logger.warning(
+            "Paper-all sleeves enabled (%s=1): %s", PAPER_ALL_STRATEGIES_ENV,
+            {key: section.get(key) for key in overrides})
     return True
 
 
