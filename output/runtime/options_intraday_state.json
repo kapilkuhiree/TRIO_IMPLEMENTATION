@@ -6,13 +6,13 @@
   "last_mirror_error": "remote mirror refresh returned unhealthy",
   "last_reconciled_at": "2026-11-25T19:31:26.328737+00:00",
   "mark_cycle_ms": 1795635086130,
-  "mirror_failures": 2159,
+  "mirror_failures": 4317,
   "mirror_flatten_attempted_ms": 0,
   "mirror_flatten_since_ms": 1795698717114,
-  "mirror_last_alert_ms": 1795720260647,
+  "mirror_last_alert_ms": 1795806488462,
   "mirror_unhealthy_since_ms": 1795698717114,
   "positions": {},
   "schema_version": 1,
-  "session_date": "2026-11-27",
+  "session_date": "2026-11-28",
   "wallet_floor_checked_on": ""
 }
